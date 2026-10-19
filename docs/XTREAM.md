@@ -1,166 +1,192 @@
-# Xtream Codes integration (M01)
+# Xtream Codes integration (M01 foundation, M02 Live TV)
 
-Status: **foundation implemented and tested**, not yet wired into playback or the viewer UI.
-Milestone M01 delivers an isolated provider adapter, sealed credential storage, an
-administrator API and synthetic-fixture tests. It deliberately does not require a live
-IPTV subscription.
+Status: **M02 implemented.** Xtream provider accounts, Xtream-only application sign-in, Live TV
+channel import, EPG, playback and per-provider connection limits are wired into the existing
+guide, favourites, streaming and health paths. Verified against synthetic panels and a local
+MPEG-TS relay; no real provider subscription has been tested.
 
-## Why an adapter instead of a new source type yet
+## The shape of the integration
 
-The existing IPTV pipeline is built around two source kinds:
-
-- `m3u` — channels, groups, logos and stream addresses (`parseM3u`).
-- `xmltv` — guide channels and programmes (`parseXmltv`).
-
-`iptv_sources.kind` has `CHECK(kind IN ('m3u','xmltv'))`, and `IptvStore` assumes that
-shape throughout reconciliation, listing rules, guide mapping and numbering. Adding a
-third kind in M01 would mean a table rebuild plus changes to a large, well-tested store
-before a single Xtream response had been proven.
-
-Instead, M01 adds an independent adapter that produces exactly the same shapes the
-existing pipeline already consumes:
+Xtream is not a parallel pipeline. A refresh writes through the same tables the M3U path uses:
 
 ```
 Xtream panel ──player_api.php──▶ XtreamClient ──▶ XtreamCatalogue
-                xmltv.php                         ├─ categories
-                                                  ├─ channels: M3uChannel-like
-                                                  │  (streamUrl includes provider creds)
-                                                  └─ epg: XmlSnapshot
+                 xmltv.php /                      │
+                 get_short_epg                    ▼
+                                    xtream_accounts (sealed credentials + catalogue)
+                                                  │
+                                    iptv_sources  (kind='xtream', one per account)
+                                                  │
+                          iptv_channels · lineup_numbers · iptv_favorites
+                                                  │
+                                    iptv_sources.encrypted_guide (XMLTV snapshot)
+                                                  │
+                              guide · tuning · LiveTv relay · ChannelHealth
 ```
 
-M02 maps that catalogue into the existing source/channel/guide tables (see
-[`MILESTONES.md`](MILESTONES.md)), at which point the FFmpeg relay, health checks,
-listing rules, favourites and guide UI work unchanged.
+Consequences, all intentional:
 
-## Data model
+- The existing guide, favourites, listing rules, numbering, sports matching, health checks and
+  FFmpeg relay work on Xtream channels unchanged.
+- `IptvStore.tune()` already resolves the upstream URL server-side, so playback needed no
+  Xtream-specific transport; the relay still redacts URLs from its error log.
+- Channel identity is `xtream:{stream_id}`. A rename, re-category or reorder on the provider
+  updates the saved row instead of creating a new one, so curation survives.
+- The last successful catalogue is stored sealed on the provider account. A failed refresh
+  records the error code and publishes nothing, so the previous channels and guide stay live.
 
-Fork migration `1001` adds two tables. Nothing in the existing M3U/XMLTV tables changed.
-Fork migrations use the `1000+` range, leaving `1..999` to upstream so a future upstream
-migration cannot collide with ours when `upstream/main` is merged.
+## Data model (fork migration 1002)
 
-| Table | Purpose |
+| Table / column | Purpose |
 | --- | --- |
-| `xtream_accounts` | One row per provider account: display name, public `server_origin`, revision, sealed credentials, sealed catalogue, validation metadata (`last_validated`, `last_error`, `account_status`, `expires_at`, `max_connections`), `enabled`. |
-| `xtream_access` | `(xtream_id, account_id)` grants: which application account may use which provider account. Per-user authorisation, independent of who created the provider row. |
+| `iptv_sources.kind='xtream'` | Widened `CHECK` (table rebuilt); `xtream_account_id` points at the provider and `encrypted_guide` holds its XMLTV snapshot. |
+| `xtream_accounts` | Adds `active_connections`, `is_trial`, `owner_account_id` and `login_key` (origin + username digest, so one subscription maps to one row). Credentials and catalogue stay sealed. |
+| `xtream_identities` | Application accounts that exist only through a provider login: `account_id`, `login_key`, `role`. Their rows in `users` make sessions, favourites and grants work without Plex. |
 
-Provider accounts are **not** application users. See [`AUTH_MODEL.md`](AUTH_MODEL.md).
+`xtream_access` still decides who can watch a provider. Creating a provider grants its creator;
+an administrator can grant others. Disabling a provider or revoking a grant removes its channels
+from that viewer's guide immediately and ends their live session.
 
-## Adapter
+Upstream migrations (`1..999`) and fork migrations (`1000+`) execute independently: each version
+is checked and recorded separately, in ascending order, and migration 1002 preserves every
+`iptv_sources` id so child rows keep resolving. `tests/xtream-live.test.ts` re-applies upstream
+migrations 10 and 11 on a populated database that already has 1001 and 1002.
 
-`apps/server/src/providers/xtream.ts`
-
-- `xtreamCredentials` — server address, username, password, optional `allowInsecureHttp`.
-- `normalizeXtreamEndpoint` — normalises the origin/path; rejects embedded userinfo,
-  query strings, fragments, non-HTTP(S) schemes, plain HTTP unless explicitly allowed,
-  and addresses that already point at `player_api.php`, `panel_api.php`, `get.php` or
-  `xmltv.php`.
-- `XtreamClient` — authenticated `player_api.php` access with an injectable transport
-  (production: `RestrictedSourceFetcher`; tests: synthetic buffers).
-  - `authenticate()` → sanitised `XtreamAccount`
-  - `liveCategories()` / `liveStreams(categoryId?)`
-  - `epg()` → existing `parseXmltv`
-  - `vodCategories()` / `vodStreams()` / `series()` / `seriesInfo()` — typed entry points
-    for the later catalogue milestone; not surfaced yet
-  - `catalogue({includeEpg})` → `XtreamCatalogue`
-- `parseLiveCategories`, `parseLiveStreams`, `buildLiveSnapshot`, `cataloguePage` — pure
-  functions with synthetic tests.
-
-Endpoints used:
+## Adapter endpoints
 
 | Call | Purpose |
 | --- | --- |
-| `GET /player_api.php?username=&password=` | account validation (`user_info.auth`, `status`, `exp_date`, limits) |
-| `GET /player_api.php?...&action=get_live_categories` | Live TV categories |
-| `GET /player_api.php?...&action=get_live_streams[&category_id=]` | Live channels |
-| `GET /xmltv.php?username=&password=` | provider EPG (gzip or plain XML) |
-| `GET /player_api.php?...&action=get_vod_*`, `get_series*` | reserved for M03 |
+| `GET /player_api.php?username=&password=` | account validation: `auth`, `status`, `exp_date`, `max_connections`, `active_cons`, formats, timezone |
+| `GET /player_api.php?...&action=get_live_categories` | categories |
+| `GET /player_api.php?...&action=get_live_streams` | live channels, including `epg_channel_id` and container |
+| `GET /xmltv.php?username=&password=` | full provider guide (gzip or plain XML) |
+| `GET /player_api.php?...&action=get_short_epg&stream_id=` | per-channel fallback guide when `xmltv.php` is absent (bounded to 40 channels per refresh) |
 
-Live stream address built server-side:
-`{server}/live/{username}/{password}/{stream_id}.{ts|m3u8}`. It is stored inside the
-sealed catalogue and never returned by an API route — the same rule the existing
-`IptvStore.tune()` follows for M3U stream URLs.
+Stream addresses are built server-side as `{server}/live/{username}/{password}/{stream_id}.{ts|m3u8}`
+and stay inside the sealed catalogue and the relay. `get_vod_*` and `get_series*` remain reserved
+for M03.
 
-### Normalisation rules
+### Normalisation
 
-- IDs must be positive integers (`"101"` and `101` both accepted); invalid rows are
-  skipped and counted in `ignoredStreams` rather than failing the whole catalogue.
-- Names and categories: control characters replaced, whitespace collapsed, trimmed,
-  bounded (200 chars for names, 128 for EPG IDs, 2048 for logos).
-- Logos must be `http(s)` with no embedded userinfo; `javascript:`, `data:` and malformed
-  values are dropped.
-- Live containers: `m3u8` is preserved, anything else falls back to `ts`. No other
-  container is relayed as live TV.
-- Duplicate stream IDs keep the first occurrence.
-- Catalogue size is capped at 20,000 live channels, matching the existing import limit.
+IDs are positive integers; malformed rows are skipped and counted. Names and categories are
+control-stripped, collapsed and bounded. Logos must be `http(s)` without userinfo. Only `m3u8`
+and `ts` are relayed as live. Duplicate stream ids keep the first row. A catalogue is capped at
+20,000 channels, 2,000 categories.
 
-## Administrator API
+## Refresh and last-known-good
 
-All routes require an application administrator and the normal CSRF/content-type rules.
+`XtreamService.refresh`:
+
+1. authenticates (`XTREAM_AUTH_FAILED`, `XTREAM_ACCOUNT_INACTIVE`, `XTREAM_ACCOUNT_EXPIRED` fail closed),
+2. fetches categories, channels and (optionally) guide,
+3. rejects an empty channel list (`XTREAM_EMPTY_CATALOGUE`) rather than wiping a working lineup,
+4. seals the catalogue, updates account metadata, then publishes into `iptv_sources`.
+
+A failure at any step records the stable code on the account and leaves the previous catalogue,
+channels, guide, numbers and favourites untouched. Scheduled refreshes run every 12 hours through
+`SourceRefresh`, which routes `kind='xtream'` sources back to the account. Credential changes
+clear the catalogue, hide the old channels and stop their relays.
+
+## Application identity
+
+Two kinds of secrets stay separate (see [`AUTH_MODEL.md`](AUTH_MODEL.md)):
+
+| Secret | Proves | Stored as |
+| --- | --- | --- |
+| Application session | who is using tk.box | `sessions.hash`; Plex token or a sealed local marker |
+| Provider credentials | which subscription a stream comes from | `xtream_accounts.encrypted_credentials` |
+
+`POST /api/v1/auth/xtream/login` authenticates against the panel, then issues the same session
+cookie Plex sign-in uses. `IdentityService.authenticateHash` treats an account with an
+`xtream_identities` row as local: no Plex call, role from that row, revocation by session delete
+or `users.allowed`. Plex accounts keep their existing re-authorisation path.
+
+Roles: with Plex configured the existing owner stays the only administrator and a provider login
+is a viewer. On a Plex-less deployment the first provider identity bootstraps the administrator.
+Administrators reach every provider; everyone else only granted ones.
+
+## API
+
+Viewer routes (any signed-in account; provider access is checked on each call):
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/admin/xtream/accounts` | list accounts (no credentials, no stream URLs) |
-| `GET` | `/api/v1/admin/xtream/accounts/:id` | one account's status |
-| `POST` | `/api/v1/admin/xtream/accounts` | create; body `{name, credentials, validate?}`. A failed validation keeps the row so the address can be corrected |
-| `PATCH` | `/api/v1/admin/xtream/accounts/:id` | rename, enable/disable or replace credentials; new credentials clear the old validation and catalogue |
-| `DELETE` | `/api/v1/admin/xtream/accounts/:id` | body `{expectedRevision}`; cascades access grants |
-| `POST` | `/api/v1/admin/xtream/accounts/:id/validate` | re-run `player_api.php` account validation |
-| `POST` | `/api/v1/admin/xtream/accounts/:id/refresh` | fetch categories + live channels (+ optional EPG) and store the catalogue |
-| `GET` | `/api/v1/admin/xtream/accounts/:id/catalogue` | paged, URL-free catalogue (`offset`, `limit`, `categoryId`, `q`) |
-| `GET/PUT` | `/api/v1/admin/xtream/accounts/:id/access` | per-application-account grants |
+| `POST` | `/api/v1/auth/xtream/login` | provider sign-in; body `{serverUrl, username, password, allowInsecureHttp?}` |
+| `GET` | `/api/v1/xtream/accounts` | providers visible to the caller (administrators: all) |
+| `GET` | `/api/v1/xtream/accounts/:id` | status: enabled, account status, expiry, connections, channel count, last error |
+| `POST` | `/api/v1/xtream/accounts` | add a provider; body `{name, credentials, validate?}` |
+| `PATCH` | `/api/v1/xtream/accounts/:id` | rename, enable/disable or replace credentials (owner or administrator) |
+| `DELETE` | `/api/v1/xtream/accounts/:id` | remove provider, source, channels and curation (owner or administrator) |
+| `POST` | `/api/v1/xtream/accounts/:id/validate` | re-run account validation |
+| `POST` | `/api/v1/xtream/accounts/:id/refresh` | refresh channels and guide (defaults to `includeEpg: true`) |
+| `GET` | `/api/v1/xtream/accounts/:id/catalogue` | paged, URL-free catalogue |
 
-Example (administrator session cookie required):
+The M01 administrator routes under `/api/v1/admin/xtream/*` remain, including access grants.
+
+Example:
 
 ```sh
-curl -sS -X POST http://127.0.0.1:3000/api/v1/admin/xtream/accounts \
+curl -sS -X POST http://127.0.0.1:3000/api/v1/auth/xtream/login \
   -H "Origin: http://127.0.0.1:3000" -H 'Content-Type: application/json' \
-  -b 'tk.box_local=<session>' \
-  -d '{"name":"Primary","credentials":{"serverUrl":"https://provider.example:8443","username":"u","password":"p"},"validate":true}'
+  -d '{"serverUrl":"https://provider.example:8443","username":"u","password":"p"}'
 ```
+
+## Playback
+
+Xtream channels tune exactly like M3U channels:
+
+- `POST /api/v1/live/sessions {channelId}` checks the provider grant, then starts the shared relay.
+- The relay holds a `ProviderConnections` lease named by the provider, so a subscription's
+  `max_connections` caps its relays **and** channel checks together, under the server-wide limit.
+  Viewers take precedence; a check is reclaimed for a waiting viewer.
+- Background checks are off by default for Xtream sources (interval 0) because they would compete
+  with viewers on one- or two-connection plans. An administrator can opt in under Checks.
+- Disabling/deleting a provider, replacing credentials, revoking a grant or an expired account
+  ends live relays and refuses new tunes. Playlist requests also re-check visibility.
+
+Xtream channels list as soon as a refresh publishes them (`require_check=0` for the source), so
+they appear in the guide without waiting for a first passing probe.
 
 ## Security properties
 
-- **Encryption at rest** — credentials and catalogues use `Vault` (AES-256-GCM) with
-  context strings `xtream:credentials:{id}` and `xtream:catalogue:{id}`. Moving a
-  ciphertext to another row fails authentication.
-- **No credential exposure** — responses contain neither username, password nor stream
-  URL. Errors are mapped to stable codes; upstream exception text is discarded because
-  it can quote the request URL. Validation status is stored as a code only.
-- **SSRF** — every request goes through `RestrictedSourceFetcher`: DNS is resolved once
-  and pinned, private/loopback/link-local/documentation ranges are rejected, redirects
-  must stay on the approved origin, TLS verification is not relaxed, responses are
-  bounded to 16 MB and 30 s.
-- **Rate limits and provider limits** — one in-flight operation per provider account and
-  at most four server-wide (`XTREAM_CAPACITY`). `max_connections` is recorded from
-  `user_info` and will gate playback in M02 through the existing `ProviderConnections`
-  lease, so viewers and health checks share one budget.
-- **Authorisation** — every route is admin-only in M01. `xtream_access` and
-  `XtreamStore.canUse()` are implemented and tested for the viewer routes that follow.
-- **Scope** — only documented provider APIs are used. No DRM circumvention, no panel
-  scraping, no access-control bypass.
+- **Encryption at rest** — credentials and catalogues use `Vault` (AES-256-GCM) with per-row
+  contexts `xtream:credentials:{id}` and `xtream:catalogue:{id}`; guide snapshots use
+  `iptv:guide:{source}`. Moving a ciphertext to another row fails authentication.
+- **No credential exposure** — no route returns a username, password or stream URL; upstream
+  exception text is discarded and only stable codes persist. The relay redacts URLs from FFmpeg
+  output before logging.
+- **SSRF** — every provider call goes through `RestrictedSourceFetcher`: DNS resolved once and
+  pinned, private/loopback/documentation ranges rejected, redirects same-origin only, bounded
+  responses (16 MB / 30 s), TLS never relaxed.
+- **Authorisation** — provider routes answer 404 for a provider the caller cannot use; account
+  mutation needs ownership or administrator. Cross-account isolation is covered by tests.
+- **Provider limits** — one in-flight catalogue operation per account, four server-wide, plus the
+  playback/check leases described above.
+- **Scope** — documented provider APIs only. No DRM circumvention, no panel scraping.
 
-## Compatibility and risks
+## Configuration
 
-| Risk | Impact | Mitigation |
-| --- | --- | --- |
-| Real panels vary in `player_api.php` output | validation may reject an unusual but valid panel | tolerant parsers, fail-closed auth, fixtures modelled on the documented shape; M02 pilots a real panel |
-| Plain-HTTP panels | rejected by default | explicit `allowInsecureHttp` per account; SSRF guard still applies |
-| Provider is on a private LAN address | `RestrictedSourceFetcher` rejects private ranges | not supported in M01. A deliberate, per-account private-network opt-in is an M02 decision; do not weaken the shared fetcher |
-| Stream URLs embed credentials | leak through logs/UI | server-only, sealed at rest, never serialised; relay already redacts URLs |
-| Panel connection limits | failed tunes during refresh/playback | one catalogue fetch at a time; playback will reuse `ProviderConnections` |
-| `iptv_sources.kind` check constraint | blocks a third source kind | M02 migration; M01 keeps tables untouched |
-| Upstream refactors `IptvStore` | merge conflicts in M02 wiring | adapter is isolated; only `app.ts` gained a few lines in M01 |
+No new environment variables. Provider accounts are added in **Settings → Xtream** (or the API),
+and the optional per-provider checks are configured under the source's Checks tab.
 
 ## Tests
 
-`tests/xtream.test.ts` (9 tests) uses a synthetic transport, no network:
+- `tests/xtream.test.ts` (9): endpoint validation, account failures, parsing, catalogue, sealing,
+  service state, admin API.
+- `tests/xtream-live.test.ts` (7): publishing into source/guide, last-known-good, identity and
+  curation across renames, expiry/disabled/empty handling, Plex-less login and isolation,
+  credential redaction and access scoping, upstream migration compatibility.
+- `tests/xtream-playback.test.ts` (1): a synthetic Xtream panel with a real FFmpeg MPEG-TS stream;
+  remux, segment fetch, per-provider connection refusal, revocation and disabled-account
+  termination.
 
-- endpoint rejection: userinfo, HTTP by default, fragments, pre-built endpoints
-- account validation: success, `auth=0`, inactive, expired, HTML, non-JSON, missing
-  `auth`, transport failure — asserting no credential appears in results or messages
-- category/channel parsing and sanitisation, duplicate and malformed row handling
-- live URL construction and URL-free catalogue paging/filtering
-- catalogue assembly including EPG, and EPG failure not discarding live channels
-- sealed storage, context binding, multiple accounts, access grants, revision conflicts
-- service validation-state recording and admin API end-to-end (401 without a session,
-  201 create, refresh, catalogue without `/live/`, access grant, delete)
+## Limitations
+
+- Real panels vary. Validation is fail-closed and fixtures follow the documented shape; a pilot
+  against a real subscription is still outstanding.
+- The short-EPG fallback covers at most 40 channels per refresh.
+- Plain HTTP panels need the per-account opt-in; SSRF rules still apply and private LAN panels
+  are rejected.
+- VOD, series and catch-up are M03.
+- Hosted GitHub Actions execution remains unverified (runner allocation), separate from these
+  local results.
