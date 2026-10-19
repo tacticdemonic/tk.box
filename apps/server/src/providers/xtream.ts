@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { AppError } from '../errors.js';
 import { RestrictedSourceFetcher, type SourceEndpoint } from './source-fetch.js';
-import { parseXmltv, type M3uChannel, type M3uSnapshot, type XmlSnapshot } from './iptv.js';
+import { parseXmltv, xmltvTime, type M3uChannel, type M3uSnapshot, type Program, type XmlSnapshot } from './iptv.js';
 
 // Xtream Codes provider adapter. It speaks only the documented player_api.php and
 // xmltv.php interfaces: no DRM handling, no panel scraping and no provider-specific
@@ -65,6 +65,32 @@ export type XtreamCataloguePage = {
   categories: XtreamCategory[]; total: number; offset: number; limit: number; hasMore: boolean;
   channels: { streamId: string; name: string; group: string; tvgId: string; logo: string }[];
   fetchedAt: number; ignoredStreams: number; epgPrograms: number;
+};
+// get_short_epg returns a channel's listings as JSON, sometimes base64-encoded. Only the
+// documented fields are read; malformed rows are dropped rather than failing the refresh.
+const shortEpgSchema = z.object({ epg_listings: z.array(z.record(z.string(), z.unknown())) }).passthrough();
+export function parseShortEpg(input: unknown, channelId: string): Program[] {
+  const parsed = shortEpgSchema.safeParse(input);
+  ensure(parsed.success, 'XTREAM_INVALID_RESPONSE', 'The provider returned an unexpected guide response.');
+  const decode = (value: unknown) => {
+    const text = textOf(value, 4096);
+    if (!text) return undefined;
+    try { const bytes = Buffer.from(text, 'base64'); return /^[\x09\x0a\x0d\x20-\x7e\u00a0-\uffff]+$/.test(bytes.toString('utf8')) ? bytes.toString('utf8') : text; }
+    catch { return text; }
+  };
+  const programs: Program[] = [];
+  for (const row of parsed.data.epg_listings.slice(0, 2000)) {
+    const start = xmltvTimeOf(row.start), end = xmltvTimeOf(row.end), title = decode(row.title);
+    if (start === undefined || end === undefined || end <= start || !title) continue;
+    const description = decode(row.description);
+    programs.push({channelId, start, end, title: title.slice(0, 300), ...(description ? {description} : {})});
+  }
+  return programs;
+}
+const textOf = (value: unknown, max: number) => typeof value === 'string' || typeof value === 'number' ? text(value, max) : undefined;
+const xmltvTimeOf = (value: unknown) => {
+  if (typeof value !== 'string' || !/^\d{14}\s+[+-]\d{4}$/.test(value.trim())) return undefined;
+  try { return xmltvTime(value.trim()); } catch { return undefined; }
 };
 
 const numberish = (value: unknown) => {
@@ -236,8 +262,9 @@ export class XtreamClient {
       allowedFormats: Array.isArray(info.allowed_output_formats) ? info.allowed_output_formats.map(format => text(format, 20)).filter((format): format is string => !!format).slice(0, 8) : [],
       timezone: text(parsed.data.server_info?.timezone, 64) ?? null
     };
-    ensure(account.status === 'active', 'XTREAM_ACCOUNT_INACTIVE', 'The provider account is not active.', 422);
+    // Expiry is the more specific failure: a panel often marks an expired line inactive too.
     ensure(account.expiresAt === null || account.expiresAt > Date.now(), 'XTREAM_ACCOUNT_EXPIRED', 'The provider account has expired.', 422);
+    ensure(account.status === 'active', 'XTREAM_ACCOUNT_INACTIVE', 'The provider account is not active.', 422);
     return account;
   }
   async liveCategories(signal?: AbortSignal): Promise<XtreamCategory[]> {
@@ -266,6 +293,12 @@ export class XtreamClient {
     try { return parseXmltv(bytes); }
     catch (error) { throw error instanceof AppError ? error : new XtreamError('XTREAM_INVALID_RESPONSE', 'The provider guide could not be read.'); }
   }
+  // One channel's listings, for providers that publish no XMLTV feed. The channel id is the
+  // provider's own EPG id, so callers must never pass an arbitrary stream address.
+  async shortEpg(channelId: string, signal?: AbortSignal): Promise<Program[]> {
+    ensure(/^[\w.:-]{1,128}$/.test(channelId), 'XTREAM_INVALID_RESPONSE', 'Invalid guide channel identifier.');
+    return parseShortEpg(await this.json(this.endpointUrl('player_api.php', 'get_short_epg', {stream_id: channelId}), signal), channelId);
+  }
   async catalogue(options: { includeEpg?: boolean; signal?: AbortSignal; now?: number } = {}): Promise<XtreamCatalogue> {
     const account = await this.authenticate(options.signal);
     const categories = await this.liveCategories(options.signal);
@@ -278,6 +311,16 @@ export class XtreamClient {
     if (options.includeEpg) {
       try { catalogue.epg = await this.epg(options.signal); }
       catch (error) { catalogue.epgError = error instanceof AppError ? error.code : 'XTREAM_INVALID_RESPONSE'; }
+      // Some panels publish no XMLTV feed. For those, ask for each channel's short guide instead,
+      // bounded so a large lineup cannot turn one refresh into thousands of requests.
+      if (!catalogue.epg) {
+        const ids = [...new Set(catalogue.channels.map(channel => channel.tvgId).filter(Boolean))].slice(0, 40), programs: Program[] = [];
+        for (const id of ids) {
+          try { programs.push(...await this.shortEpg(id, options.signal)); }
+          catch { /* one channel's guide is optional */ }
+        }
+        if (programs.length) catalogue.epg = {channels: catalogue.channels.filter(channel => ids.includes(channel.tvgId)).map(channel => ({id: channel.tvgId, name: channel.name})), programs, quarantined: 0};
+      }
     }
     return catalogue;
   }
