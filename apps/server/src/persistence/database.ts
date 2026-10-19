@@ -149,6 +149,24 @@ export function openDatabase(path: string) {
       db.exec('ALTER TABLE custom_channels ADD COLUMN plex_logo TEXT');
       db.prepare('INSERT INTO migrations VALUES(15)').run();
     }
+    // Xtream provider accounts. Credentials and catalogues are sealed with the vault; the
+    // server origin and validation metadata stay readable for administration.
+    // Fork migrations use the 1000+ range: upstream owns 1..999, so its next migration
+    // cannot collide with this one when the fork merges upstream changes.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=1001').get()) {
+      db.exec(`CREATE TABLE IF NOT EXISTS xtream_accounts(
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, server_origin TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 0, encrypted_credentials TEXT NOT NULL,
+        encrypted_catalogue TEXT, catalogue_at INTEGER, catalogue_channels INTEGER,
+        account_status TEXT, expires_at INTEGER, max_connections INTEGER,
+        last_validated INTEGER, last_error TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS xtream_access(
+          xtream_id TEXT NOT NULL REFERENCES xtream_accounts(id) ON DELETE CASCADE,
+          account_id TEXT NOT NULL REFERENCES users(account_id) ON DELETE CASCADE,
+          PRIMARY KEY(xtream_id,account_id));`);
+      db.prepare('INSERT INTO migrations VALUES(1001)').run();
+    }
   })();
   return db;
 }
