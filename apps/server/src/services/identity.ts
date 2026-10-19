@@ -114,15 +114,6 @@ export class IdentityService {
     }
     return undefined;
   }
-  // An administrator session for background work: any live administrator session, local or Plex.
-  async anyAdmin(now = Date.now()) {
-    const rows = this.db.prepare('SELECT hash FROM sessions WHERE expires>? ORDER BY expires DESC LIMIT 5').all(now) as {hash: string}[];
-    for (const {hash} of rows) {
-      const grant = await this.authenticateHash(hash, now).then(r => r.grant, () => undefined);
-      if (grant?.role === 'admin') return grant;
-    }
-    return undefined;
-  }
   logout(cookie?: string) { if (cookie) this.db.prepare('DELETE FROM sessions WHERE hash=?').run(digest(cookie)); }
   reap(now = Date.now()) {
     this.db.prepare('DELETE FROM sessions WHERE expires<=?').run(now);
