@@ -15,6 +15,8 @@
 
 ### Baseline and verification notes
 
+- Fork migration `1001` verified on a fresh SQLite file and after reopening it: versions
+  `1..15` and `1001` present once, `xtream_accounts`/`xtream_access` created, rows preserved.
 - Baseline (upstream `1cff170`, before any fork change): `npm run typecheck` pass,
   `npm test` 178 pass / 0 fail, `npm run build` pass.
 - After M01: 187 tests (178 existing + 9 Xtream), typecheck and build clean.
