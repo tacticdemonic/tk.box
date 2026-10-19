@@ -9,7 +9,7 @@ import { requireThat } from './errors.js';
 type Access = (req: FastifyRequest) => Promise<{ grant: { accountId: string } }>;
 // Administrator-only: the event-driven source policy and which channel carries which event.
 export function registerSports(app: FastifyInstance, iptv: IptvStore, store: SportsStore, schedule: SportsSchedule, admin: Access) {
-  const params = (p: unknown) => { const id = z.object({ id: z.string().uuid() }).parse(p).id; requireThat(iptv.status(id).kind === 'm3u', 'INVALID_POLICY', 'Sports events apply to M3U sources only.'); return id; };
+  const params = (p: unknown) => { const id = z.object({ id: z.string().uuid() }).parse(p).id; requireThat(['m3u','xtream'].includes(iptv.status(id).kind), 'INVALID_POLICY', 'Sports events apply to M3U and Xtream sources only.'); return id; };
   const view = (id: string, now = Date.now()) => {
     const windows = store.windows(id), names = new Map(iptv.adminChannels(id).map(c => [c.id, c.name]));
     const channels = [...windows.values()].map(w => ({ channelId: w.channel_id, name: names.get(w.channel_id) ?? '', title: w.title, league: w.league, start: w.start, end: w.end, state: w.state, matchedBy: w.matched_by, airing: w.visible_from <= now && w.visible_until > now })).sort((a, b) => a.start - b.start);

@@ -95,9 +95,40 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   // Xtream providers are configured beside the existing M3U/XMLTV sources; playback still
   // goes through the same LiveTv relay once a later milestone maps their channels in.
   const xtream = new XtreamStore(db, vault);
-  const xtreamService = new XtreamService(xtream, xtreamTransport ? id => new XtreamClient(xtream.credentials(id), xtreamTransport) : undefined);
-  registerXtream(app, xtream, xtreamService, admin);
+  // A disabled, removed or re-keyed provider must stop its upstream streams immediately, not at
+  // the next playlist request. `live` is created later in this function.
+  let stopProviderStreams: (id: string) => void = () => {};
+  xtream.onChange = id => stopProviderStreams(id);
+  const xtreamService = new XtreamService(xtream, iptv, xtreamTransport ? (id: string) => new XtreamClient(xtream.credentials(id), xtreamTransport) : undefined);
+  registerXtream(app, xtream, xtreamService, admin, auth);
+  // Provider sign-in for accounts without Plex. Authentication and the session are issued by the
+  // identity service only after the Xtream panel accepted the credentials.
+  app.post('/api/v1/auth/xtream/login', {config: {rateLimit: {max: 10, timeWindow: 60000}}}, async (req, reply) => {
+    const input = z.object({serverUrl: z.string().trim().min(1).max(2048), username: z.string().min(1).max(128), password: z.string().min(1).max(128),
+      allowInsecureHttp: z.boolean().default(false), name: z.string().trim().min(1).max(120).optional()}).strict().parse(req.body);
+    const credentials = {serverUrl: input.serverUrl, username: input.username, password: input.password, allowInsecureHttp: input.allowInsecureHttp};
+    // The panel must accept the credentials before a session or a provider row exists.
+    const login = await identity.xtreamLogin(credentials, () => new XtreamClient(credentials, xtreamTransport).authenticate(), !config.plexConfigured);
+    let account = xtream.findByLogin(credentials.serverUrl, credentials.username);
+    if (!account) account = xtream.create(login.accountId, {name: input.name ?? new URL(credentials.serverUrl).hostname, credentials});
+    else {
+      xtream.grant(login.accountId, account.id);
+      // Replacing credentials revokes streams; only do that when they actually changed.
+      if (!xtream.credentialsMatch(account.id, credentials)) xtream.update(login.accountId, account.id, {expectedRevision: account.revision, credentials});
+    }
+    // A provider that authenticates but fails its first refresh still signs in; the account view
+    // reports the stable error code.
+    try { await xtreamService.refresh(login.accountId, account.id, {includeEpg: true}); } catch { /* recorded on the account */ }
+    reply.setCookie(sessionCookie, login.cookie, {...cookieOpts, maxAge: 43200});
+    return {status: 'authenticated', accountId: login.accountId, role: login.role, account: xtream.status(account.id)};
+  });
   const refresh = new SourceRefresh(iptv), custom = new CustomChannelStore(db);
+  // Scheduled and manual source refreshes for Xtream sources go through their account.
+  refresh.xtream = (actor, sourceId) => {
+    const accountId = iptv.xtreamAccountFor(sourceId);
+    requireThat(accountId, 'SOURCE_NOT_FOUND', 'Xtream account not found.', 404);
+    return xtreamService.refresh(actor, accountId, {includeEpg: true});
+  };
   registerIptv(app,iptv,refresh,auth,admin,undefined,undefined,custom,async (req,id,kind) => plex.artwork((await auth(req)).grant,id,kind));
   const episodes = new EpisodeSync(custom, plex, () => identity.adminGrant(config.PLEX_OWNER_ACCOUNT_ID ? [config.PLEX_OWNER_ACCOUNT_ID] : []), (message, detail) => app.log.info(detail, message));
   registerCustomChannels(app,custom,plex,admin,episodes);
@@ -105,9 +136,11 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   const live = new LiveTv(iptv, budget, config.CACHE_DIR, config.FFMPEG_PATH, config.FFPROBE_PATH, (message, detail) => app.log.warn(detail, message));
   // Channel checks hide channels that fail to play or show a provider's offline screen.
   const healthStore = new HealthStore(db), health = new ChannelHealth(iptv, healthStore, config.CACHE_DIR, config.FFMPEG_PATH, (message, detail) => app.log.info(detail, message));
-  // Every viewer and check, on any source, draws from one server-wide connection limit; viewers always come first.
-  const iptvConfig = new IptvSettingsStore(db), connections = new ProviderConnections(() => iptvConfig.get().maxConnections);
+  // Every viewer and check, on any source, draws from one server-wide connection limit; viewers
+  // always come first. An Xtream provider's own `max_connections` caps that account's total.
+  const iptvConfig = new IptvSettingsStore(db), connections = new ProviderConnections(() => iptvConfig.get().maxConnections, 15000, id => xtream.limit(id));
   live.connections = connections; health.connections = connections;
+  stopProviderStreams = id => live.stopProvider(id);
   app.get('/api/v1/admin/iptv/settings', async req => { await admin(req); return {...iptvConfig.get(), connections: connections.usage()}; });
   app.put('/api/v1/admin/iptv/settings', async req => {
     const {grant} = await admin(req), {expectedRevision, ...value} = iptvSettings.extend({expectedRevision: z.number().int().nonnegative()}).strict().parse(req.body);
@@ -149,7 +182,7 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   });
   app.post('/api/v1/live/sessions', {config: {rateLimit: {max: 30, timeWindow: 60000}}}, async req => {
     const input = z.object({channelId: z.string().uuid()}).strict().parse(req.body), {hash, grant} = await auth(req);
-    return custom.exists(input.channelId) ? customTv.start(hash, grant, input.channelId) : live.start(hash, input.channelId);
+    return custom.exists(input.channelId) ? customTv.start(hash, grant, input.channelId) : live.start(hash, input.channelId, grant.accountId);
   });
   // Playlists reauthorize fully, like VOD; segments use the local session check.
   app.get<{Params: {id: string; file: string}}>('/api/v1/live/sessions/:id/:file', {config: {rateLimit: {max: 1200, timeWindow: 60000}}}, async (req, reply) => {

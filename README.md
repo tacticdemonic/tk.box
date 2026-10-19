@@ -15,7 +15,8 @@ A self-hosted media app for your Plex library and IPTV channels. One web UI for 
 - **Plex sign-in** with the official Plex PIN flow
 - **Library browsing** — Home with featured titles and promoted collections, grid/list views, filters, sorting and an A–Z jump rail
 - **Playback with resume** — Direct Play when the browser supports the file, otherwise Plex-transcoded HLS
-- **Live TV** — import M3U/XMLTV sources, approve channels and watch through an FFmpeg relay, with a searchable guide and favorites
+- **Live TV** — import M3U/XMLTV sources or Xtream subscriptions, approve channels and watch through an FFmpeg relay, with a searchable guide and favorites
+- **Xtream** — connect a provider with or without Plex; channels, EPG, favourites and playback join the existing guide and relay
 - **Plex Channels** — looping channels made from Plex movies, shows and collections, shared on one wall clock, with Pause, Resume and Go Live
 
 ## Requirements

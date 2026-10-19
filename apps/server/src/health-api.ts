@@ -11,24 +11,24 @@ type Access = (req: FastifyRequest) => Promise<{ grant: { accountId: string } }>
 // Administrator-only. Responses carry verdicts and reason codes, never stream URIs or FFmpeg output.
 export function registerChannelHealth(app: FastifyInstance, iptv: IptvStore, store: HealthStore, service: ChannelHealth, admin: Access) {
   const params = (p: unknown) => z.object({ id: z.string().uuid() }).parse(p).id;
-  const m3u = (id: string) => { requireThat(iptv.status(id).kind === 'm3u', 'INVALID_POLICY', 'Channel checks apply to M3U sources only.'); return id; };
+  const checked = (id: string) => { requireThat(['m3u','xtream'].includes(iptv.status(id).kind), 'INVALID_POLICY', 'Channel checks apply to M3U and Xtream sources only.'); return id; };
   const view = (id: string) => ({ policy: store.policy(id), summary: store.summary(id), checking: service.active(id) });
   app.get('/api/v1/admin/iptv/sources/:id/health', async req => {
-    await admin(req); const id = m3u(params(req.params)), health = store.forSource(id);
+    await admin(req); const id = checked(params(req.params)), health = store.forSource(id);
     return { ...view(id), channels: Object.fromEntries([...health].map(([channel, h]) => [channel, { ...h, checking: service.checking(channel) }])) };
   });
   app.put('/api/v1/admin/iptv/sources/:id/health', async req => {
-    const { grant } = await admin(req), id = m3u(params(req.params)); store.setPolicy(grant.accountId, id, healthPolicy.parse(req.body)); service.pump(); return view(id);
+    const { grant } = await admin(req), id = checked(params(req.params)); store.setPolicy(grant.accountId, id, healthPolicy.parse(req.body)); service.pump(); return view(id);
   });
   app.post('/api/v1/admin/iptv/sources/:id/health/check', async req => {
-    await admin(req); z.object({}).strict().parse(req.body); const id = m3u(params(req.params)); return { queued: service.queueSource(id), ...view(id) };
+    await admin(req); z.object({}).strict().parse(req.body); const id = checked(params(req.params)); return { queued: service.queueSource(id), ...view(id) };
   });
   app.post('/api/v1/admin/iptv/sources/:id/health/check-channels', async req => {
-    await admin(req); const { ids } = z.object({ ids: z.array(z.string().uuid()).min(1).max(500) }).strict().parse(req.body), id = m3u(params(req.params));
+    await admin(req); const { ids } = z.object({ ids: z.array(z.string().uuid()).min(1).max(500) }).strict().parse(req.body), id = checked(params(req.params));
     return { queued: service.queueChannels(id, [...new Set(ids)]), ...view(id) };
   });
   app.delete('/api/v1/admin/iptv/sources/:id/health/slates', async req => {
-    const { grant } = await admin(req); z.object({}).strict().parse(req.body); const id = m3u(params(req.params)); store.clearSlates(grant.accountId, id); service.pump(); return view(id);
+    const { grant } = await admin(req); z.object({}).strict().parse(req.body); const id = checked(params(req.params)); store.clearSlates(grant.accountId, id); service.pump(); return view(id);
   });
   app.post('/api/v1/admin/iptv/channels/:id/health/check', async req => { await admin(req); z.object({}).strict().parse(req.body); service.queueChannel(params(req.params)); return { status: 'queued' }; });
   app.post('/api/v1/admin/iptv/channels/:id/health/slate', async req => {

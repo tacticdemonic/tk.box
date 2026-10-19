@@ -5,6 +5,7 @@ import { openDatabase } from '../apps/server/src/persistence/database.js';
 import { Vault } from '../apps/server/src/security/vault.js';
 import { XtreamClient, XtreamError, buildLiveSnapshot, cataloguePage, normalizeXtreamEndpoint, parseLiveCategories, parseLiveStreams } from '../apps/server/src/providers/xtream.js';
 import { XtreamStore } from '../apps/server/src/persistence/xtream-store.js';
+import { IptvStore } from '../apps/server/src/persistence/iptv-store.js';
 import { XtreamService } from '../apps/server/src/services/xtream-service.js';
 import type { SourceEndpoint } from '../apps/server/src/providers/source-fetch.js';
 import { PlexAdapter } from '../apps/server/src/providers/plex.js';
@@ -187,18 +188,18 @@ test('credentials and catalogues are sealed at rest and multiple providers stay 
 });
 
 test('service records sanitised validation state and refuses to run two operations for one account', async () => {
-  const db = openDatabase(':memory:'), vault = new Vault(randomBytes(32)), store = new XtreamStore(db, vault);
+  const db = openDatabase(':memory:'), vault = new Vault(randomBytes(32)), store = new XtreamStore(db, vault), iptv = new IptvStore(db, vault);
   try {
     const account = store.create('admin', {name: 'Primary', credentials});
     const {transport} = mock({auth: authBody(), get_live_categories: categoriesBody, get_live_streams: streamsBody});
-    const service = new XtreamService(store, () => new XtreamClient(credentials, transport));
+    const service = new XtreamService(store, iptv, () => new XtreamClient(credentials, transport));
     const result = await service.refresh('admin', account.id, {now: 5});
     assert.equal(result.channels, 2); assert.equal(result.categories, 2); assert.equal(result.ignoredStreams, 3);
     const status = store.status(account.id);
     assert.equal(status.catalogueChannels, 2); assert.equal(status.accountStatus, 'active'); assert.equal(status.lastError, null);
     assert.equal(store.catalogue(account.id)?.channels.length, 2);
 
-    const failing = new XtreamService(store, () => new XtreamClient(credentials, mock({auth: {user_info: {auth: 0}}}).transport));
+    const failing = new XtreamService(store, iptv, () => new XtreamClient(credentials, mock({auth: {user_info: {auth: 0}}}).transport));
     await assert.rejects(failing.validate('admin', account.id), {code: 'XTREAM_AUTH_FAILED'});
     assert.equal(store.status(account.id).lastError, 'XTREAM_AUTH_FAILED');
     assert.ok(!JSON.stringify(store.list()).includes('secret-pass'));

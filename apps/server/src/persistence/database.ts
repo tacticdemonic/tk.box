@@ -7,8 +7,11 @@ import { AppError } from '../errors.js';
 export function openDatabase(path: string) {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const db = new Database(path);
-  db.pragma('foreign_keys = ON'); db.pragma('journal_mode = WAL'); db.pragma('busy_timeout = 5000');
-  db.transaction(() => {
+  // Migrations rebuild one parent table (iptv_sources in 1002), which is only safe while child
+  // references are not enforced. They are re-enabled before the database is used.
+  db.pragma('foreign_keys = OFF'); db.pragma('journal_mode = WAL'); db.pragma('busy_timeout = 5000');
+  try {
+    db.transaction(() => {
     db.exec(`CREATE TABLE IF NOT EXISTS migrations(version INTEGER PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, actor TEXT NOT NULL, event TEXT NOT NULL, at INTEGER NOT NULL, detail TEXT NOT NULL);
@@ -167,7 +170,40 @@ export function openDatabase(path: string) {
           PRIMARY KEY(xtream_id,account_id));`);
       db.prepare('INSERT INTO migrations VALUES(1001)').run();
     }
+    // Fork migration 1002 adds the `xtream` source kind. SQLite cannot widen a CHECK in place, so
+    // iptv_sources is rebuilt; ids are preserved, so every child row still resolves. Dropping the
+    // parent would cascade under foreign keys, so enforcement is lifted for the rebuild only.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=1002').get()) {
+      db.exec(`CREATE TABLE iptv_sources_v1002(
+            id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('m3u','xmltv','xtream')), name TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0, interval_hours INTEGER NOT NULL CHECK(interval_hours BETWEEN 1 AND 168),
+            auto_add INTEGER NOT NULL DEFAULT 0, encrypted_endpoint TEXT, encrypted_snapshot TEXT,
+            encrypted_candidate TEXT, candidate_digest TEXT, last_attempt INTEGER, last_success INTEGER,
+            next_due INTEGER, last_error TEXT, retry_after INTEGER, sort_order INTEGER NOT NULL DEFAULT 0,
+            xtream_account_id TEXT REFERENCES xtream_accounts(id), encrypted_guide TEXT);
+          INSERT INTO iptv_sources_v1002(id,kind,name,revision,interval_hours,auto_add,encrypted_endpoint,encrypted_snapshot,
+            encrypted_candidate,candidate_digest,last_attempt,last_success,next_due,last_error,retry_after,sort_order)
+            SELECT id,kind,name,revision,interval_hours,auto_add,encrypted_endpoint,encrypted_snapshot,
+            encrypted_candidate,candidate_digest,last_attempt,last_success,next_due,last_error,retry_after,sort_order FROM iptv_sources;
+          DROP TABLE iptv_sources;
+          ALTER TABLE iptv_sources_v1002 RENAME TO iptv_sources;
+          ALTER TABLE xtream_accounts ADD COLUMN active_connections INTEGER;
+          ALTER TABLE xtream_accounts ADD COLUMN is_trial INTEGER;
+          ALTER TABLE xtream_accounts ADD COLUMN owner_account_id TEXT REFERENCES users(account_id);
+          ALTER TABLE xtream_accounts ADD COLUMN login_key TEXT;
+          CREATE UNIQUE INDEX IF NOT EXISTS xtream_accounts_login_key ON xtream_accounts(login_key) WHERE login_key IS NOT NULL;
+          CREATE TABLE IF NOT EXISTS xtream_identities(
+            account_id TEXT PRIMARY KEY REFERENCES users(account_id) ON DELETE CASCADE,
+            login_key TEXT NOT NULL UNIQUE,
+            role TEXT NOT NULL CHECK(role IN ('admin','viewer')),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL);`);
+        db.prepare('INSERT INTO migrations VALUES(1002)').run();
+    }
   })();
+  } finally {
+    db.pragma('foreign_keys = ON');
+  }
   return db;
 }
 export type Db = ReturnType<typeof openDatabase>;

@@ -5,22 +5,32 @@ import { requireThat } from '../errors.js';
 // One application process owns the SQLite state and this registry. No detached
 // work survives shutdown, and scheduled/manual requests share the same promise.
 export class SourceRefresh {
-  private running=new Map<string,Promise<ReturnType<IptvStore['ingest']>>>();
+  private running=new Map<string,Promise<unknown>>();
   private controllers=new Map<string,AbortController>();
   private abort=new AbortController();
   // Told about every successful import, e.g. to rematch sports events against the new channels.
   published:(id:string)=>void=()=>{};
+  // Xtream sources have no uploaded endpoint: their account owns the refresh.
+  xtream:(actor:string,id:string)=>Promise<unknown>=async()=>{ throw new Error('Xtream refresh is not configured'); };
   constructor(private store:IptvStore,private fetcher:Pick<RestrictedSourceFetcher,'fetch'>=new RestrictedSourceFetcher()) {}
   refresh(actor:string,id:string) {
     const active=this.running.get(id);if(active)return active;
     requireThat(!this.abort.signal.aborted,'REFRESH_STOPPED','Refresh service is stopped.',503);
     requireThat(this.running.size<4,'REFRESH_CAPACITY','Too many source refreshes are active.',429);
-    const revision=this.store.begin(id),endpoint=this.store.endpoint(id);
+    const xtream=this.store.status(id).kind==='xtream';
+    const revision=this.store.begin(id),endpoint=xtream?undefined:this.store.endpoint(id);
     const controller=new AbortController(),signal=AbortSignal.any([this.abort.signal,controller.signal]);
     this.controllers.set(id,controller);
     // Defer the worker so the map exists even when a test transport resolves immediately.
     const work=Promise.resolve().then(async()=>{
-      try {signal.throwIfAborted();const bytes=await this.fetcher.fetch(endpoint,signal);signal.throwIfAborted();const result=this.store.ingest(actor,id,revision,bytes);this.published(id);return result;}
+      try {
+        signal.throwIfAborted();
+        if(xtream) {
+          const result=await this.xtream(actor,id);
+          signal.throwIfAborted();this.published(id);return result;
+        }
+        const bytes=await this.fetcher.fetch(endpoint!,signal);signal.throwIfAborted();const result=this.store.ingest(actor,id,revision,bytes);this.published(id);return result;
+      }
       catch(error) {if(!signal.aborted)this.store.failed(id,revision,error instanceof SourceFetchError?error.retryAt:undefined);throw error;}
     }).finally(()=>{this.running.delete(id);this.controllers.delete(id);});
     this.running.set(id,work);return work;

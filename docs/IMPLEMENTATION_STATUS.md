@@ -1,8 +1,16 @@
 # tk.box implementation status
 
-Updated October 17, 2026. **Milestone 0 foundations implemented; integration acceptance remains OPEN.** Live remote Plex owner setup is verified; production deployment and real media/provider streaming acceptance remain open.
+Updated October 19, 2026. **M02 implemented and locally verified; real-provider and hosted-CI verification remain open.**
 
-## Latest pass: custom channels, phase 4 (automatic new episodes)
+## Latest pass: M02 — Xtream authentication and Live TV
+
+- Xtream subscriptions now load into the existing Live TV pipeline. A refresh publishes categories and channels into `iptv_sources`/`iptv_channels` with stable identity `xtream:{stream_id}`, so renames, re-categories and reordering keep the saved row, number, listing, stack and favourites. The provider XMLTV snapshot is stored per source and read by the existing guide; `get_short_epg` is a bounded fallback. A failed or empty refresh keeps the last known channels and guide.
+- Accounts without Plex can sign in with a provider (`/api/v1/auth/xtream/login`). `xtream_identities` gives them a local role on the same session table; Plex accounts keep their existing re-authorisation. Administrators reach every provider; other accounts only granted ones, enforced on the catalogue, guide, tuning and playlist paths.
+- Playback reuses `LiveTv` and the FFmpeg relay. `ProviderConnections` now enforces each Xtream account's `max_connections` in addition to the server-wide limit, sharing the budget with channel checks (which are off by default for Xtream). Disabling, removing or re-keying a provider, revoking a grant or an expired account ends live relays immediately.
+- Settings → Xtream lists providers with status, expiry and connection limits; the sign-in screen offers the provider login. Fork migration 1002 widens `iptv_sources.kind`, adds `xtream_account_id`/`encrypted_guide`, and creates `xtream_identities`; upstream migrations continue to apply independently.
+- **195 tests pass** (including 8 new Xtream integration/playback tests), typecheck and the production build are clean. Playback was verified against a synthetic Xtream panel streaming a locally generated H.264/MP2 MPEG-TS. Not verified: a real provider subscription, a Fire TV device, an APK build and hosted GitHub Actions execution. Details: [Xtream](XTREAM.md), [auth model](AUTH_MODEL.md).
+
+## Previous pass: custom channels, phase 4 (automatic new episodes)
 
 - Each show or season on a custom channel can automatically add new episodes (off by default, toggled per selection in the Shows tab). New episodes take their place in season and episode order, or follow the show's last entry if the list was rearranged. Removed episodes never come back. Each addition goes on air at the end of the current program and merges with any publish already waiting. Episodes with no runtime or that can't be played are held back. Checks run hourly and on demand, as a signed-in administrator; no Plex token is stored for this.
 

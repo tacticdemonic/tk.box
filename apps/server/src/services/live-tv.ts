@@ -13,12 +13,12 @@ import type { IptvStore } from '../persistence/iptv-store.js';
 export type LiveDelivery = 'remux' | 'transcode';
 export type LiveSource = { videoCodec?: string; audioCodec?: string; width?: number; height?: number };
 type Relay = {
-  key: string; channelId: string; sourceId: string; url: string; dir: string; viewers: Set<string>; child?: ChildProcess; exited: boolean;
+  key: string; channelId: string; sourceId: string; accountId?: string; providerId?: string; url: string; dir: string; viewers: Set<string>; child?: ChildProcess; exited: boolean;
   encode: boolean; release: () => void; restarts: number; live: boolean; stopped: boolean; ready: Promise<void>; source?: LiveSource; stderr: string;
   lease?: ConnectionLease; cancel: AbortController;
 };
 export type LiveObserver = { tuned?: (channelId: string) => void; tuneFailed?: (channelId: string) => void };
-type Viewer = { id: string; hash: string; channelId: string; seen: number };
+type Viewer = { id: string; hash: string; channelId: string; accountId: string; seen: number };
 const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const probeSchema = z.object({ streams: z.array(z.object({ codec_type: z.string(), codec_name: z.string().optional(), width: z.number().optional(), height: z.number().optional(), pix_fmt: z.string().optional() })) });
 const segmentName = /^seg-\d{6}\.ts$/;
@@ -45,14 +45,14 @@ export class LiveTv {
     void this.reapStale(join(cacheDir, 'live'));
     this.timer = setInterval(() => this.sweep(), 10000); this.timer.unref();
   }
-  async start(hash: string, channelId: string) {
-    const channel = this.store.tune(channelId);
+  async start(hash: string, channelId: string, accountId = '') {
+    const channel = this.store.tune(channelId, accountId), providerId = this.store.xtreamAccountFor(channel.sourceId);
     requireThat([...this.viewers.values()].filter(v => v.hash === hash).length < this.options.maxPerViewer, 'PLAYBACK_SESSION_LIMIT', 'Too many live channels are open. Stop one first.', 429);
     let relay = this.relays.get(channelId);
     if (!relay) {
       requireThat(this.relays.size < this.options.maxRelays, 'LIVE_CAPACITY_REACHED', 'Too many channels are being watched right now. Please try again shortly.', 503);
       const key = opaque().slice(0, 16);
-      relay = { key, channelId, sourceId: channel.sourceId, url: channel.streamUrl, dir: join(this.root, key), viewers: new Set(), exited: true, encode: false, release: () => {}, restarts: 0, live: false, stopped: false, ready: Promise.resolve(), stderr: '', cancel: new AbortController() };
+      relay = { key, channelId, sourceId: channel.sourceId, accountId, providerId, url: channel.streamUrl, dir: join(this.root, key), viewers: new Set(), exited: true, encode: false, release: () => {}, restarts: 0, live: false, stopped: false, ready: Promise.resolve(), stderr: '', cancel: new AbortController() };
       this.relays.set(channelId, relay);
       const created = relay;
       created.ready = this.prepare(created);
@@ -61,7 +61,9 @@ export class LiveTv {
         if (error instanceof AppError && ['LIVE_TUNE_FAILED', 'LIVE_TUNE_TIMEOUT'].includes(error.code)) this.observer.tuneFailed?.(channelId);
       });
     }
-    const viewer: Viewer = { id: opaque(), hash, channelId, seen: Date.now() };
+    // A relay shared by several viewers is opened once; `tune` above already verified that this
+    // viewer may watch the channel, including any Xtream provider grant.
+    const viewer: Viewer = { id: opaque(), hash, channelId, accountId, seen: Date.now() };
     this.viewers.set(viewer.id, viewer); relay.viewers.add(viewer.id);
     try { await relay.ready; } catch (e) { this.stop(viewer.id, hash); throw e; }
     requireThat(this.viewers.has(viewer.id), 'SESSION_NOT_FOUND', 'Live session was stopped.', 409);
@@ -75,8 +77,9 @@ export class LiveTv {
   }
   async playlist(id: string, hash: string) {
     const viewer = this.owned(id, hash), relay = this.relays.get(viewer.channelId);
-    // An administrator disabling or removing a channel ends its delivery.
-    if (!relay || !this.store.isVisible(viewer.channelId)) { this.stop(id, hash); throw new AppError('CHANNEL_NOT_FOUND', 'Channel is no longer available.', 404); }
+    // An administrator disabling or removing a channel, or revoking access to its provider,
+    // ends its delivery.
+    if (!relay || !this.store.isVisible(viewer.channelId, viewer.accountId)) { this.stop(id, hash); throw new AppError('CHANNEL_NOT_FOUND', 'Channel is no longer available.', 404); }
     viewer.seen = Date.now();
     let text: string;
     try { text = await readFile(join(relay.dir, 'index.m3u8'), 'utf8'); } catch { throw new AppError('LIVE_UNAVAILABLE', 'The channel stream is restarting.', 503, true); }
@@ -101,13 +104,16 @@ export class LiveTv {
     if (relay && !relay.viewers.size) this.destroy(relay);
   }
   stopWhere(matches: (v: { id: string; hash: string }) => boolean) { for (const v of [...this.viewers.values()]) if (matches(v)) this.stop(v.id, v.hash); }
+  // Provider account changed, was disabled or removed: its upstream streams must end now, not at
+  // the next playlist request.
+  stopProvider(providerId: string) { for (const relay of [...this.relays.values()]) if (relay.providerId === providerId) this.destroy(relay); }
   close() { clearInterval(this.timer); for (const relay of [...this.relays.values()]) this.destroy(relay); void rm(this.root, { recursive: true, force: true, maxRetries: 5 }).catch(() => {}); }
   get count() { return this.relays.size; }
   isLive(channelId: string) { return !!this.relays.get(channelId)?.live; }
   sweep(now = Date.now()) { for (const v of [...this.viewers.values()]) if (now - v.seen > this.options.idleMs) this.stop(v.id, v.hash); }
 
   private async prepare(relay: Relay) {
-    relay.lease = await this.connections.viewer(relay.cancel.signal);
+    relay.lease = await this.connections.viewer(relay.cancel.signal, relay.providerId);
     if (relay.stopped) { relay.lease.release(); throw new AppError('MEDIA_CANCELLED', 'Live session was stopped.', 409); }
     await mkdir(relay.dir, { recursive: true, mode: 0o700 });
     this.spawn(relay, false); await this.waitReady(relay);

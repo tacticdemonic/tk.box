@@ -1,106 +1,90 @@
 # Milestones and acceptance criteria
 
-## M01 — Project bootstrap and Xtream foundation (this milestone)
+## M01 — Project bootstrap and Xtream foundation
 
 | # | Criterion | Status | Evidence |
 | --- | --- | --- | --- |
 | 1 | Working fork and development branch | met | `tacticdemonic/tk.box`, `develop`, `feature/xtream-firetv` |
-| 2 | Upstream update management configured and verified | met for configuration and git logic; hosted-runner execution blocked by GitHub's queue | workflows on `main` (`f192ed8`, PR #2), both registered active; manual dispatch accepted; behind/merge/conflict logic verified by a local two-repository simulation. Every run stayed queued with no runner assigned, so no hosted run completed — see `docs/UPSTREAM_SYNC.md` |
-| 3 | Existing application builds; baseline tests pass; pre-existing failures recorded | met | `npm run typecheck` clean, `npm test` 178/178 before changes, `npm run build` succeeds. One timing-sensitive test (`channel-health` scheduler) was made deterministic; see below |
+| 2 | Upstream update management configured and verified | met for configuration and git logic; hosted-runner execution blocked by GitHub's queue | workflows on `main`, behind/merge/conflict logic verified by a local two-repository simulation; see `docs/UPSTREAM_SYNC.md` |
+| 3 | Existing application builds; baseline tests pass | met | typecheck, `npm test`, `npm run build` clean |
 | 4 | Isolated Xtream adapter validates mock accounts and retrieves mock live categories/channels | met | `apps/server/src/providers/xtream.ts`, `tests/xtream.test.ts` |
-| 5 | Automated tests cover the adapter and failure conditions | met | 9 tests: auth rejection, inactive, expired, malformed JSON/HTML, sanitisation, URL-free paging, sealed storage, service and admin API |
-| 6 | Existing M3U, Plex and authentication behaviour unchanged | met | no changes to `IptvStore`, `IdentityService`, `LiveTv` or Plex code; full suite 187/187 after the addition |
+| 5 | Automated tests cover the adapter and failure conditions | met | auth rejection, inactive, expired, malformed JSON/HTML, sanitisation, sealed storage, admin API |
+| 6 | Existing M3U, Plex and authentication behaviour unchanged | met | M01 changed no `IptvStore`, `IdentityService`, `LiveTv` or Plex code |
 | 7 | Android/Fire TV strategy documented | met | `docs/ANDROID_FIRE_TV.md` |
 | 8 | Next milestone defined | met | M02 below |
 
-### Baseline and verification notes
+## M02 — Functional Xtream Live TV end to end
 
-- Fork migration `1001` verified on a fresh SQLite file and after reopening it: versions
-  `1..15` and `1001` present once, `xtream_accounts`/`xtream_access` created, rows preserved.
-- Baseline (upstream `1cff170`, before any fork change): `npm run typecheck` pass,
-  `npm test` 178 pass / 0 fail, `npm run build` pass.
-- After M01: 187 tests (178 existing + 9 Xtream), typecheck and build clean.
-- **Pre-existing flake fixed:** `tests/channel-health.test.ts` waited a fixed 20 ms for
-  the scheduler to settle. Under full-suite parallel load it failed roughly half the
-  time. Replaced with bounded polling; it passed three consecutive full runs afterwards.
-  No production code changed for this.
-- Not verified: a real Xtream panel (no subscription available, by design), a real Fire TV
-  device, an APK build (no Android SDK/JDK 17 in this environment), and hosted GitHub
-  Actions execution (runs queued with no runner assigned; workflow logic simulated locally).
+**Goal:** an account adds an Xtream subscription (with or without Plex), refreshes it, and its
+Live TV channels appear in the existing guide and play through the existing FFmpeg relay —
+with EPG, per-account access and provider connection limits.
 
-### Deliberate non-goals in M01
+| # | Criterion | Status | Evidence |
+| --- | --- | --- | --- |
+| 1 | Xtream accounts authenticate without Plex | met | `POST /api/v1/auth/xtream/login`, `xtream_identities`, `identity.xtreamLogin`; `tests/xtream-live.test.ts` |
+| 2 | Provider categories and channels load into tk.box | met | `XtreamService.refresh` → `IptvStore.publishXtream`; guide and `/api/v1/iptv/channels` |
+| 3 | EPG information is available through the existing guide | met | `xmltv.php` snapshot stored per source; short-EPG fallback; guide window test |
+| 4 | Live channel playback works with controlled test sources | met | `tests/xtream-playback.test.ts` with a synthetic panel and real FFmpeg MPEG-TS |
+| 5 | Multiple providers are supported | met | independent accounts, catalogues, sources and grants |
+| 6 | Credentials and sessions remain secure | met | sealed at rest, redacted, SSRF-guarded, scoped sessions |
+| 7 | Existing Plex and IPTV functionality is preserved | met | full suite green (see below) |
+| 8 | Automated tests, typecheck and build pass locally | met | 195 tests, typecheck, production build |
+| 9 | Database migration compatibility is verified | met | migration 1002 rebuild plus upstream re-apply test |
+| 10 | Documentation and evidence accurately reflect the implementation | met | `docs/XTREAM.md`, `docs/AUTH_MODEL.md`, this file |
 
-- No viewer UI for Xtream accounts and no channel import into the guide.
-- No VOD/series catalogue.
-- No local (non-Plex) application users.
+### Work completed
+
+1. **Source model.** Fork migration 1002 widens `iptv_sources.kind` to include `xtream`, adds
+   `xtream_account_id` and `encrypted_guide`, and rebuilds the table with ids preserved.
+2. **Refresh path.** `SourceRefresh` routes Xtream sources to `XtreamService`, which publishes
+   through `IptvStore.publishXtream` with stable identity `xtream:{stream_id}`. Renames keep the
+   saved row, number, listing, stack and favourites. Empty responses are rejected; failures keep
+   the last known catalogue.
+3. **Guide.** The provider XMLTV snapshot is stored per source and resolved by `feedFor` /
+   `guideData` without a fabricated XMLTV row, reusing `resolveGuideMapping`, `guideWindow` and
+   the existing guide API. `get_short_epg` is a bounded fallback.
+4. **Playback.** `IptvStore.tune` still resolves the URL server-side; `LiveTv` needed only an
+   account-aware visibility check and a per-provider connection lease. `ProviderConnections` now
+   enforces both the server-wide and per-provider limits.
+5. **Identity.** `xtream_identities` and `IdentityService.xtreamLogin` give Plex-less users a
+   session; `authenticateHash` branches on the namespace. Roles: Plex owner stays administrator
+   when Plex is configured; first provider identity bootstraps it otherwise.
+6. **Access.** Viewer routes under `/api/v1/xtream/*`; provider visibility scoped by
+   `xtream_access`; disabling/removing/re-keying a provider stops its relays.
+7. **UI.** Settings → Xtream (list, add, edit, enable/disable, refresh, remove, status, expiry,
+   connection counts) and an Xtream sign-in option on the login screen.
+8. **Tests.** `tests/xtream-live.test.ts` (7) and `tests/xtream-playback.test.ts` (1) added; the
+   M01 Xtream suite still passes.
+
+### Verification notes
+
+- `npm run typecheck` clean; `npm test` 195 pass / 0 fail; `npm run build` succeeds.
+- Playback was exercised with a locally generated H.264/MP2 MPEG-TS stream served by a synthetic
+  Xtream panel: tune, playlist, segment, provider-limit refusal, grant revocation and disabled
+  account termination.
+- Not verified: a real Xtream subscription, a real Fire TV device, an APK build (no Android
+  SDK/JDK 17 here), and hosted GitHub Actions execution (runs stayed queued; workflow logic is
+  separate from these local results).
+
+### Deliberate non-goals in M02
+
+- No VOD, series or catch-up.
+- No password-based local accounts or public sign-up (provider login covers Plex-less use).
 - No Android project code or APK.
-
-## M02 — Functional Xtream Live TV end to end (recommended next)
-
-**Goal:** an administrator adds an Xtream account, refreshes it, and its Live TV channels
-appear in the existing guide and play through the existing FFmpeg relay, alongside M3U
-sources — with EPG, per-user access, and provider connection limits.
-
-### Work
-
-1. **Source model.** Fork migration `1002`: allow `iptv_sources.kind='xtream'` (SQLite table
-   rebuild; copy existing rows, recreate indexes/foreign keys) and add
-   `xtream_account_id TEXT REFERENCES xtream_accounts(id)`. Keep `m3u`/`xmltv` rows
-   byte-identical. Test the migration against a populated pre-M02 database.
-2. **Refresh path.** Branch `SourceRefresh.refresh` on source kind: Xtream sources call
-   `XtreamService.refresh`, then publish through the existing `IptvStore.publish` path with
-   stable channel identity `xtream:{stream_id}`. Curation (renames, numbers, favourites,
-   listing overrides) must survive provider renames and reordering.
-3. **Guide.** Store the provider EPG snapshot with the Xtream catalogue and resolve it in
-   `IptvStore.guideData()` using `epg_channel_id` as the XMLTV id, instead of fabricating an
-   `xmltv` source row. Reuse `resolveGuideMapping`, `guideWindow` and the existing guide API.
-4. **Playback.** `IptvStore.tune()` already returns a server-side stream URL; the relay needs
-   no change. Add a per-provider connection budget to `ProviderConnections` from
-   `xtream_accounts.max_connections`, while keeping the server-wide ceiling.
-5. **Administrator UI.** Settings screen: list/add/edit/delete accounts, validate, refresh,
-   show channel counts and last error. No new viewer screens: Xtream channels enter the
-   existing Live TV guide as another source.
-6. **Access.** Viewer catalogue and playback routes check `xtream_access`; an application
-   user only sees channels from providers granted to them. Admin routes stay admin-only.
-7. **Tests.** Fixture-driven import → guide → tune → relay-start path; identity stability
-   across a renamed stream; per-user visibility; migration round-trip; connection-limit
-   denial; no credentials in any response or log line.
-8. **Pilot.** Validate against one real provider (outside CI) and record sanitised results:
-   category count, channel count, EPG coverage, tune success rate.
-
-### Acceptance criteria
-
-- An Xtream account can be added, validated, refreshed and disabled without a server restart.
-- Its channels appear in `/api/v1/iptv/channels` and `/api/v1/guide` for granted users only,
-  with EPG listings where the provider supplies them.
-- Tuning an Xtream channel plays through `LiveTv` with the same behaviour as M3U (HLS
-  output, health checks, failover across feeds).
-- Provider `max_connections` is enforced for playback plus health checks.
-- Re-running a refresh does not duplicate channels or lose curation.
-- All existing M3U/Plex tests stay green; no credentials in API responses or logs.
-- Documentation updated (`docs/XTREAM.md`, `docs/AUTH_MODEL.md`) with the final wiring.
-
-### Stretch (only if M02 core is green)
-
-- Local (Xtream-only) application users per `docs/AUTH_MODEL.md`: Argon2id credentials,
-  `local:` account namespace, login route, admin bootstrap CLI. Acceptance: a user with no
-  Plex account can sign in and watch a granted Xtream provider.
+- No DRM handling or panel scraping.
 
 ## M03 — Xtream VOD, series and catch-up
 
-- Normalise `get_vod_streams`, `get_series`, `get_series_info` (seasons/episodes) into the
-  catalogue model.
-- Reuse Plex-style VOD playback policy and the existing transcoder budget; container/codec
-  compatibility decides direct play vs HLS.
-- Movies/series browse UI; resume position; no DRM bypass, no catch-up unless the provider
-  documents it.
+- Normalise `get_vod_streams`, `get_series`, `get_series_info` into the catalogue model.
+- Reuse Plex-style VOD playback policy and the transcoder budget; direct play vs HLS by codec.
+- Movies/series browse UI, resume position; no DRM bypass, no catch-up unless documented.
 
 ## M04 — Android / Fire TV MVP
 
 - Implement phase 1 from `docs/ANDROID_FIRE_TV.md`: TV-only `android/` module, WebView shell,
   server URL entry, Media3 HLS/TS player, cookie sharing, leanback launcher, banner.
-- Acceptance on a Fire TV Stick 4K (Fire OS 7) and a 2nd-gen Stick (Fire OS 5): sign in,
-  browse, tune, zap, Back stops the relay, session survives relaunch.
+- Acceptance on a Fire TV Stick 4K (Fire OS 7) and a 2nd-gen Stick (Fire OS 5): sign in, browse,
+  tune, zap, Back stops the relay, session survives relaunch.
 
 ## M05 — Release hardening
 
