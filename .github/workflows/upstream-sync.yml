@@ -1,0 +1,140 @@
+name: Upstream sync
+
+# Checks Enkiduke/tk.box every day and on demand. When upstream has new commits this
+# opens a reviewable pull request against fork main. It never merges and never pushes
+# to main directly: a human decides whether upstream changes are accepted.
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: Enkiduke/tk.box
+
+jobs:
+  check:
+    name: Compare, test and propose
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Compare with upstream
+        id: compare
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git" 2>/dev/null || true
+          git fetch --no-tags upstream main
+          behind="$(git rev-list --count HEAD..upstream/main)"
+          ahead="$(git rev-list --count upstream/main..HEAD)"
+          echo "behind=${behind}" >> "$GITHUB_OUTPUT"
+          echo "ahead=${ahead}" >> "$GITHUB_OUTPUT"
+          echo "Fork main is ${ahead} commit(s) ahead and ${behind} behind upstream/main."
+
+      - name: Merge upstream into a review branch
+        if: steps.compare.outputs.behind != '0'
+        id: merge
+        run: |
+          branch="sync/upstream-$(date -u +%Y%m%d-%H%M%S)"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          git checkout -B "${branch}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge --no-edit upstream/main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U | sort -u > /tmp/conflicts.txt || true
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify the merged tree
+        if: steps.compare.outputs.behind != '0' && steps.merge.outputs.conflict == 'false'
+        id: verify
+        run: |
+          set +e
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          fi
+          npm ci && npm run typecheck && npm test && npm run build
+          status=$?
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          if [ "${status}" = "0" ]; then echo "result=passed" >> "$GITHUB_OUTPUT"; else echo "result=failed" >> "$GITHUB_OUTPUT"; fi
+          exit 0
+
+      - name: Push review branch
+        if: steps.compare.outputs.behind != '0' && steps.merge.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git push origin "HEAD:refs/heads/${{ steps.merge.outputs.branch }}"
+
+      - name: Open or update the synchronisation pull request
+        if: steps.compare.outputs.behind != '0' && steps.merge.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          RESULT: ${{ steps.verify.outputs.result }}
+        run: |
+          {
+            echo "Automated check of \`${UPSTREAM_REPOSITORY}\` found new commits on \`upstream/main\`."
+            echo
+            echo "### Upstream commits"
+            echo '```'
+            git log --oneline --no-decorate "main..upstream/main" | head -50
+            echo '```'
+            echo
+            echo "### Verification"
+            echo "- \`npm run typecheck\`, \`npm test\` and \`npm run build\` on the merged tree: **${RESULT}**"
+            echo
+            echo "### Review checklist"
+            echo "- [ ] Read the upstream diff and its release notes"
+            echo "- [ ] Confirm CI is green on this pull request"
+            echo "- [ ] Check for conflicts with tk.box fork changes (Xtream adapter, Android shell, workflows)"
+            echo "- [ ] Merge intentionally; nothing is auto-merged"
+            echo
+            echo "This pull request was created by the upstream sync workflow. It is never merged automatically."
+          } > /tmp/pr-body.md
+          draft=""
+          if [ "${RESULT}" != "passed" ]; then draft="--draft"; fi
+          if gh pr view "${BRANCH}" --json number >/dev/null 2>&1; then
+            gh pr edit "${BRANCH}" --body-file /tmp/pr-body.md
+          else
+            gh pr create --base main --head "${BRANCH}" ${draft} \
+              --title "Upstream sync: $(date -u +%Y-%m-%d)" \
+              --body-file /tmp/pr-body.md
+          fi
+
+      - name: Report merge conflicts
+        if: steps.compare.outputs.behind != '0' && steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="Upstream sync conflict: $(date -u +%Y-%m-%d)"
+          {
+            echo "Merging \`upstream/main\` into fork \`main\` produced conflicts, so no pull request was created."
+            echo
+            echo "Conflicting files:"
+            echo '```'
+            cat /tmp/conflicts.txt
+            echo '```'
+            echo
+            echo "Resolve locally with:"
+            echo '```sh'
+            echo "git fetch upstream && git checkout -b sync/upstream-manual main && git merge upstream/main"
+            echo '```'
+          } > /tmp/issue-body.md
+          existing="$(gh issue list --state open --search "${title} in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "${existing}" ]; then gh issue comment "${existing}" --body-file /tmp/issue-body.md
+          else gh issue create --title "${title}" --body-file /tmp/issue-body.md; fi
