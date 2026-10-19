@@ -5,7 +5,7 @@
 | # | Criterion | Status | Evidence |
 | --- | --- | --- | --- |
 | 1 | Working fork and development branch | met | `tacticdemonic/tk.box`, `develop`, `feature/xtream-firetv` |
-| 2 | Upstream update management configured and verified | met for the workflow; daily schedule needs the workflow files on `main` | `.github/workflows/upstream-sync.yml`, manual dispatch run, `docs/UPSTREAM_SYNC.md` |
+| 2 | Upstream update management configured and verified | met for configuration and git logic; hosted-runner execution blocked by GitHub's queue | workflows on `main` (`f192ed8`, PR #2), both registered active; manual dispatch accepted; behind/merge/conflict logic verified by a local two-repository simulation. Every run stayed queued with no runner assigned, so no hosted run completed — see `docs/UPSTREAM_SYNC.md` |
 | 3 | Existing application builds; baseline tests pass; pre-existing failures recorded | met | `npm run typecheck` clean, `npm test` 178/178 before changes, `npm run build` succeeds. One timing-sensitive test (`channel-health` scheduler) was made deterministic; see below |
 | 4 | Isolated Xtream adapter validates mock accounts and retrieves mock live categories/channels | met | `apps/server/src/providers/xtream.ts`, `tests/xtream.test.ts` |
 | 5 | Automated tests cover the adapter and failure conditions | met | 9 tests: auth rejection, inactive, expired, malformed JSON/HTML, sanitisation, URL-free paging, sealed storage, service and admin API |
@@ -23,7 +23,8 @@
   time. Replaced with bounded polling; it passed three consecutive full runs afterwards.
   No production code changed for this.
 - Not verified: a real Xtream panel (no subscription available, by design), a real Fire TV
-  device, and an APK build (no Android SDK/JDK 17 in this environment).
+  device, an APK build (no Android SDK/JDK 17 in this environment), and hosted GitHub
+  Actions execution (runs queued with no runner assigned; workflow logic simulated locally).
 
 ### Deliberate non-goals in M01
 

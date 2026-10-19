@@ -93,10 +93,23 @@ gh pr create --base main --head sync/upstream-manual --fill
 
 ## Scheduling prerequisite
 
-GitHub runs scheduled workflows only from the **default branch**. The first time the
-workflow files are introduced they must reach `main` (a small automation-only commit or
-PR). Until then, `workflow_dispatch` still works from any branch, which is how M01
-verified the pipeline.
+GitHub runs scheduled workflows only from the **default branch**. The workflow files are
+therefore on `main` as a two-file automation-only commit (`f192ed8`, PR #2) and nothing
+else; all feature work stays on `develop` and `feature/*`. Both workflows are registered as
+active, which also confirms the YAML parses.
+
+`workflow_dispatch` remains available for an immediate check:
+
+```sh
+gh workflow run upstream-sync.yml --ref main
+gh run watch
+```
+
+M01 verified the workflow's git logic (behind detection, merge branch, push, conflict
+reporting and merge abort) with a local two-repository simulation. Hosted-runner execution
+could not be observed: every dispatched run stayed queued with no runner assigned, an
+external GitHub Actions capacity condition rather than a workflow error. The first real run
+should be checked with `gh run list` once runners are available.
 
 ## Releases (Android/Fire TV)
 
