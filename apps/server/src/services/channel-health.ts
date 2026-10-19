@@ -8,7 +8,7 @@ import { probeStream, type Prober } from './stream-probe.js';
 // What the live relay layer tells the checker. Connections themselves are shared through
 // ProviderConnections: a check only starts on a free one, and a new viewer cancels checks.
 export type RelayUsage = { live: (channelId: string) => boolean };
-type Check = { sourceId: string; abort: AbortController };
+type Check = { sourceId: string; providerId?: string; abort: AbortController };
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Background channel checks. Work is persisted as per-channel due times, so a restart resumes
@@ -45,8 +45,8 @@ export class ChannelHealth {
       for (const channelId of this.health.due(sourceId, this.options.maxChecks * 3, new Set(this.checks.keys()), now)) {
         if (this.relays.live(channelId)) { this.health.relayOnline(channelId, now); continue; }
         if (this.options.maxChecks - this.active() <= 0) break;
-        const check: Check = { sourceId, abort: new AbortController() };
-        const lease = this.connections.tryCheck(() => check.abort.abort());
+        const check: Check = { sourceId, providerId: this.store.xtreamAccountFor(sourceId), abort: new AbortController() };
+        const lease = this.connections.tryCheck(() => check.abort.abort(), check.providerId);
         if (!lease) break;
         this.start(channelId, check, lease);
       }

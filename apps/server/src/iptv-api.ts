@@ -65,16 +65,15 @@ export function registerIptv(app:FastifyInstance,store:IptvStore,refresh:SourceR
     const {grant}=await admin(req),input=z.object({feedId:id,xmlId:z.string().min(1).max(1024),expectedRevision:revision}).strict().parse(req.body);
     return store.map(grant.accountId,channelParams(req.params),input.feedId,input.xmlId,input.expectedRevision);
   });
-  app.get('/api/v1/iptv/channels',async req=>{const {grant}=await auth(req);return {channels:store.stacks(),favorites:store.favorites(grant.accountId).map(c=>c.id)};});
+  app.get('/api/v1/iptv/channels',async req=>{const {grant}=await auth(req);return {channels:store.stacks(grant.accountId),favorites:store.favorites(grant.accountId).map(c=>c.id)};});
   app.get('/api/v1/guide',async req=>{
     const {grant}=await auth(req),input=z.object({start:z.coerce.number().int(),end:z.coerce.number().int(),filter:z.enum(['all','iptv','custom','favorites']).default('all'),q:z.string().trim().max(120).default(''),channel:z.string().uuid().optional(),offset:z.coerce.number().int().min(0).max(1000000).default(0),limit:z.coerce.number().int().min(1).max(60).default(30)}).strict().refine(v=>v.end>v.start&&v.end-v.start<=48*3600000).parse(req.query);
     return store.guidePage(grant.accountId,input.filter,input.start,input.end,input.offset,input.limit,input.q,input.channel,custom);
   });
   // Guide routes are shared by every channel kind; custom channel IDs are answered by the custom store.
   app.get('/api/v1/iptv/channels/:id/logo',async(req,reply)=>{
-    await auth(req);
-    if(custom?.exists(channelParams(req.params))){
-      // The logo address, else the Plex title's logo, else its poster.
+    const {grant}=await auth(req);
+    if(custom?.exists(channelParams(req.params))){      // The logo address, else the Plex title's logo, else its poster.
       const key=z.object({v:z.string().regex(/^\d{1,20}$/).optional()}).parse(req.query).v;
       const {url,plexId,keyed}=custom.logo(channelParams(req.params),Date.now(),key);
       let image:Image|undefined=url?await logos.get(url).catch(()=>undefined):undefined;
@@ -83,7 +82,7 @@ export function registerIptv(app:FastifyInstance,store:IptvStore,refresh:SourceR
       // A keyed address always means the same title; otherwise shorter for Plex logos, as the main show can change.
       return reply.type(image.type).header('Cache-Control',`private, max-age=${url||keyed?3600:600}`).send(image.bytes);
     }
-    const hints=store.logo(channelParams(req.params));
+    const hints=store.logo(channelParams(req.params),grant.accountId);
     // Standardized library logo first, then the playlist logo, then the guide's channel icon.
     const urls=[await library.match(hints.name,hints.tvgId).catch(()=>undefined),...hints.urls].filter((u):u is string=>!!u);
     let image:{type:string;bytes:Buffer}|undefined;
@@ -100,11 +99,11 @@ export function registerIptv(app:FastifyInstance,store:IptvStore,refresh:SourceR
     return {status:'saved'};
   });
   app.get('/api/v1/iptv/channels/:id/guide',async req=>{
-    await auth(req);const channel=channelParams(req.params),input=z.object({start:z.coerce.number().int(),end:z.coerce.number().int()}).strict().refine(v=>v.end>v.start&&v.end-v.start<=48*3600000).parse(req.query);
+    const {grant}=await auth(req);const channel=channelParams(req.params),input=z.object({start:z.coerce.number().int(),end:z.coerce.number().int()}).strict().refine(v=>v.end>v.start&&v.end-v.start<=48*3600000).parse(req.query);
     // Validate visibility even if this source has no feed yet.
-    const visible=store.isVisible(channel);
+    const visible=store.isVisible(channel,grant.accountId);
     if(!visible)throw new AppError('CHANNEL_NOT_FOUND','Channel not found.',404);
-    return {rows:store.guide(channel,store.feedFor(channel),input.start,input.end)};
+    return {rows:store.guide(channel,store.feedFor(channel),input.start,input.end,grant.accountId)};
   });
   const timer=setInterval(()=>{void refresh.tick().catch(()=>{});},15000);timer.unref();
   app.addHook('onReady',async()=>{store.relistAll();await refresh.tick();});

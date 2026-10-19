@@ -53,7 +53,7 @@ export class SportsStore {
   }
   setPolicy(actor: string, sourceId: string, input: z.input<typeof sportsPolicy>, now = Date.now()) {
     const v = sportsPolicy.parse(input), source = this.db.prepare('SELECT kind FROM iptv_sources WHERE id=?').get(sourceId) as { kind: string } | undefined;
-    requireThat(source, 'SOURCE_NOT_FOUND', 'Source not found.', 404); requireThat(source.kind === 'm3u', 'INVALID_POLICY', 'Sports events apply to M3U sources only.');
+    requireThat(source, 'SOURCE_NOT_FOUND', 'Source not found.', 404); requireThat(['m3u','xtream'].includes(source.kind), 'INVALID_POLICY', 'Sports events apply to M3U and Xtream sources only.');
     this.db.transaction(() => {
       this.db.prepare('INSERT INTO sports_policies VALUES(?,?,?) ON CONFLICT(source_id) DO UPDATE SET enabled=excluded.enabled,lead_minutes=excluded.lead_minutes').run(sourceId, Number(v.enabled), v.leadMinutes);
       // Turned off, every group is regular again: its channels list by the regular rules.
@@ -79,7 +79,7 @@ export class SportsStore {
   leagues(from: number) {
     return this.db.prepare('SELECT league_key AS key,MAX(league) AS name,MAX(sport) AS sport,SUM(end>=?) AS upcoming FROM sports_events WHERE league_key IS NOT NULL GROUP BY league_key').all(from) as { key: string; name: string; sport: string; upcoming: number }[];
   }
-  sources() { return (this.db.prepare("SELECT p.source_id AS id,p.lead_minutes FROM sports_policies p JOIN iptv_sources s ON s.id=p.source_id WHERE p.enabled=1 AND s.kind='m3u'").all() as { id: string; lead_minutes: number }[]); }
+  sources() { return (this.db.prepare("SELECT p.source_id AS id,p.lead_minutes FROM sports_policies p JOIN iptv_sources s ON s.id=p.source_id WHERE p.enabled=1 AND s.kind IN ('m3u','xtream')").all() as { id: string; lead_minutes: number }[]); }
   // A live status only moves forward; the end follows it: still playing extends, finished closes.
   upsert(events: SportsEvent[], now = Date.now()) {
     const get = this.db.prepare('SELECT state,ended_at FROM sports_events WHERE id=?');

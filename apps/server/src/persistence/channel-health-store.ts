@@ -33,11 +33,14 @@ export class HealthStore {
   }
   policy(sourceId: string): HealthPolicy {
     const row = this.db.prepare('SELECT interval_hours,hide_failing FROM iptv_health_policies WHERE source_id=?').get(sourceId) as { interval_hours: number; hide_failing: number } | undefined;
-    return row ? { intervalHours: row.interval_hours, hideFailing: !!row.hide_failing } : { ...DEFAULT_POLICY };
+    // Xtream subscriptions often allow one or two streams: background checks stay off until an
+    // administrator opts in, so they never compete with a viewer for the provider's connections.
+    const off = this.db.prepare("SELECT 1 FROM iptv_sources WHERE id=? AND kind='xtream'").get(sourceId);
+    return row ? { intervalHours: row.interval_hours, hideFailing: !!row.hide_failing } : off ? { intervalHours: 0, hideFailing: DEFAULT_POLICY.hideFailing } : { ...DEFAULT_POLICY };
   }
   setPolicy(actor: string, sourceId: string, input: z.input<typeof healthPolicy>, now = Date.now()) {
     const v = healthPolicy.parse(input), source = this.db.prepare('SELECT kind FROM iptv_sources WHERE id=?').get(sourceId) as { kind: string } | undefined;
-    requireThat(source, 'SOURCE_NOT_FOUND', 'Source not found.', 404); requireThat(source.kind === 'm3u', 'INVALID_POLICY', 'Channel checks apply to M3U sources only.');
+    requireThat(source, 'SOURCE_NOT_FOUND', 'Source not found.', 404); requireThat(['m3u','xtream'].includes(source.kind), 'INVALID_POLICY', 'Channel checks apply to M3U and Xtream sources only.');
     this.db.transaction(() => {
       this.db.prepare('INSERT INTO iptv_health_policies(source_id,interval_hours,connections,hide_failing) VALUES(?,?,1,?) ON CONFLICT(source_id) DO UPDATE SET interval_hours=excluded.interval_hours,hide_failing=excluded.hide_failing').run(sourceId, v.intervalHours, Number(v.hideFailing));
       this.audit(actor, 'iptv_health_policy_changed', sourceId, now);
