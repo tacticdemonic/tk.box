@@ -138,19 +138,22 @@ test('The scheduler respects provider connections, yields to viewers and trusts 
     running.set(url, done); signal?.addEventListener('abort', () => { aborted.push(url); running.delete(url); done(result('inconclusive', { reason: 'CANCELLED' })); });
   }));
   const settle = () => new Promise(done => setTimeout(done, 20));
+  // Polling beats a fixed nap: the full suite runs files in parallel, and 20ms is not
+  // enough for pump() to settle on a loaded machine.
+  const until = async (check: () => boolean) => { for (let i = 0; i < 300 && !check(); i++) await new Promise(done => setTimeout(done, 10)); };
   try {
     let limit = 1;
     service.connections = new ProviderConnections(() => limit);
     service.relays = { live: id => id === ids[4] };
-    service.pump(); await settle();
+    service.pump(); await until(() => running.size === 1);
     assert.equal(running.size, 1, 'one provider connection');
     // A viewer tuning on this source takes the connection back once the check has exited.
     const viewer = await service.connections.viewer();
     assert.equal(aborted.length, 1); assert.equal(service.active(source), 0);
-    service.pump(); await settle(); assert.equal(running.size, 0, 'no check while the viewer holds the only connection');
+    service.pump(); await until(() => running.size === 0); assert.equal(running.size, 0, 'no check while the viewer holds the only connection');
     viewer.release();
     limit = 3;
-    service.pump(); await settle();
+    service.pump(); await until(() => running.size === 3);
     assert.equal(running.size, 3);
     for (const done of [...running.values()]) done(result('online')); running.clear(); await settle();
     // The live channel was marked online from its relay without spending a connection.

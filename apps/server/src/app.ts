@@ -38,8 +38,12 @@ import { registerCustomChannels } from './custom-api.js';
 import { CustomTv } from './services/custom-tv.js';
 import { PartProxy } from './providers/part-proxy.js';
 import { EpisodeSync } from './services/episode-sync.js';
+import { XtreamStore } from './persistence/xtream-store.js';
+import { XtreamService } from './services/xtream-service.js';
+import { XtreamClient, type XtreamTransport } from './providers/xtream.js';
+import { registerXtream } from './xtream-api.js';
 
-export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexAdapter, logging = true, cookieNamespace = 'tk.box') {
+export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexAdapter, logging = true, cookieNamespace = 'tk.box', xtreamTransport?: XtreamTransport) {
   const app = Fastify({ logger: logging ? {level: 'info'} : false, logController: new LogController({disableRequestLogging: true}), bodyLimit: 65536, trustProxy: config.trustedProxies.length ? config.trustedProxies : false });
   const identity = new IdentityService(db, vault, plex), playback = new PlaybackService(db, plex), settings = new SettingsStore(db);
   const budget = new EncoderBudget(() => settings.get().maxConcurrentCpuVideoTranscodes);
@@ -88,6 +92,11 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   const auth = (req: {cookies: Record<string, string | undefined>}) => identity.authenticate(req.cookies[sessionCookie]);
   const admin = async (req: {cookies: Record<string, string | undefined>}) => { const a = await auth(req); requireThat(a.grant.role === 'admin', 'FORBIDDEN', 'Administrator access required.', 403); return a; };
   const iptv = new IptvStore(db,vault);
+  // Xtream providers are configured beside the existing M3U/XMLTV sources; playback still
+  // goes through the same LiveTv relay once a later milestone maps their channels in.
+  const xtream = new XtreamStore(db, vault);
+  const xtreamService = new XtreamService(xtream, xtreamTransport ? id => new XtreamClient(xtream.credentials(id), xtreamTransport) : undefined);
+  registerXtream(app, xtream, xtreamService, admin);
   const refresh = new SourceRefresh(iptv), custom = new CustomChannelStore(db);
   registerIptv(app,iptv,refresh,auth,admin,undefined,undefined,custom,async (req,id,kind) => plex.artwork((await auth(req)).grant,id,kind));
   const episodes = new EpisodeSync(custom, plex, () => identity.adminGrant(config.PLEX_OWNER_ACCOUNT_ID ? [config.PLEX_OWNER_ACCOUNT_ID] : []), (message, detail) => app.log.info(detail, message));

@@ -20,7 +20,7 @@ try {
   const html=await fetch(`http://127.0.0.1:${port}/`);assert.equal(html.status,200);assert.ok((await html.text()).includes('id="root"'));
   const setup=await fetch(`http://127.0.0.1:${port}/api/v1/setup`);assert.equal((await setup.json() as {plexConfigured:boolean}).plexConfigured,false);
   const protectedRoute=await fetch(`http://127.0.0.1:${port}/api/v1/libraries`);assert.equal(protectedRoute.status,401);
-  for(const route of ['/api/v1/iptv/channels','/api/v1/admin/iptv/sources'])assert.equal((await fetch(`http://127.0.0.1:${port}${route}`)).status,401);
+  for(const route of ['/api/v1/iptv/channels','/api/v1/admin/iptv/sources','/api/v1/admin/xtream/accounts'])assert.equal((await fetch(`http://127.0.0.1:${port}${route}`)).status,401);
   const second=launch();let logs='';second.stdout.on('data',b=>{logs+=String(b);});second.stderr.on('data',b=>{logs+=String(b);});
   const secondExit=once(second,'exit');const timeout=setTimeout(()=>second.kill('SIGKILL'),10000);
   const [code]=await secondExit;clearTimeout(timeout);assert.equal(code,1);assert.ok(logs.includes('EADDRINUSE'));
