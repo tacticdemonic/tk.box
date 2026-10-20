@@ -77,18 +77,25 @@ its provider, which is the smallest architecture that satisfies the milestone. T
 | Cross-user provider access | `xtream_access` checked on every provider, guide, tune and playlist request |
 | Provider connection exhaustion | one in-flight catalogue operation per account; relays and checks share a per-provider lease |
 | Provider login brute force | per-IP rate limit (10/min), generic failure message, panel-side lockout |
+| First-user administrator race | `INITIAL_ADMIN_TOKEN` on any deployment reachable beyond loopback, checked before the provider panel is contacted |
 | Session theft | opaque HttpOnly cookie, hashed at rest, 12-hour expiry, CSRF origin check |
+| Cross-origin CSRF via the old WebView | exact `com.tkbox.tv` marker only with `Origin: null`, no CORS headers answered, cookie defaulting to `Lax` |
+| Session cookie leaking to a foreign host | native client follows no redirects and refuses every off-origin request |
 
-## First-user administrator bootstrap (M03)
+## First-user administrator bootstrap (M03, hardened in M03.1)
 
 On a Plex-less deployment the first provider identity becomes the administrator. That is safe
-only on a private LAN. On a public origin any visitor could win the race, so:
+only when nothing but the local machine can reach the listener, so:
 
 - `INITIAL_ADMIN_TOKEN` (16–256 characters) is set by the operator. `loadConfig` refuses to
-  start when `PUBLIC_BASE_URL` or `DEPLOYMENT_MODE=remote` is used without Plex configuration
-  and without this token.
+  start when the deployment is reachable from another device without this token:
+  `PUBLIC_BASE_URL` set, `DEPLOYMENT_MODE=remote`, **or** an `APP_HOST` that is not a loopback
+  address (`127.0.0.0/8`, `::1`, `localhost`). `0.0.0.0`, `::` and any LAN IP count as
+  reachable even under `DEPLOYMENT_MODE=local`; the label does not stop a LAN client.
 - The first Xtream login must send `bootstrapToken` matching it. The check happens before the
   provider panel is contacted and compares SHA-256 digests in constant time.
 - Once an administrator exists the token is ignored; later logins are viewers, and the setup
   endpoint reports `bootstrapTokenRequired: false`.
-- A local (`DEPLOYMENT_MODE=local`) Plex-less deployment keeps the zero-configuration flow.
+- A strictly loopback-only Plex-less deployment keeps the zero-configuration flow.
+- The token lives in configuration only: it is never logged, persisted in SQLite, or echoed in a
+  response.

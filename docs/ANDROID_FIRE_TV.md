@@ -92,10 +92,22 @@ sequenceDiagram
 ## 4. Authentication and cookies
 
 WebView's `android.webkit.CookieManager` and OkHttp's cookie store do not share data.
-`WebViewCookies` takes a snapshot of `CookieManager.getCookie(origin)` on page load, before a
-handoff, and on resume, and `OriginCookieInterceptor` adds that snapshot as a `Cookie` header
-**only** to requests whose scheme, host and port match the configured origin. Cookie values are
-never logged, returned to JavaScript or written anywhere else.
+`WebViewCookies` snapshots `CookieManager.getCookie(origin)` on page load, before a handoff, and
+on resume, and `OriginCookieInterceptor` adds that snapshot as a `Cookie` header **only** to
+requests whose scheme, host and port match the configured origin. Cookie values are never
+logged, returned to JavaScript or written anywhere else.
+
+WebView 66's `getCookie()` **omits SameSite cookies** — measured on the API 28 image, where a
+`p_lax` cookie was invisible while `p_plain` and `p_httponly` were returned. Because the session
+cookie used to be `SameSite=Lax`, the snapshot was empty and every native playlist request
+answered 401. Two changes fix that:
+
+- The server sets no `SameSite` attribute on the session cookie (browsers default it to `Lax`),
+  so `getCookie()` returns it. `httpOnly` and `Secure` on a public origin are unchanged.
+- `WebViewCookies.observe()` records the `Cookie` header of any same-origin request the WebView
+  itself makes (`shouldInterceptRequest`), so the native player reuses exactly what the page
+  sent even on a WebView that hides some cookies from `getCookie()`. Sign-out clears the
+  snapshot before reloading.
 
 - The session cookie stays `httpOnly`: page JavaScript cannot read it. The bridge exposes
   only `playLiveStream`, `stopLiveStream`, `isTv`, `logout`.
@@ -119,19 +131,27 @@ never logged, returned to JavaScript or written anywhere else.
 ## 5. First-user administrator safeguard (server)
 
 M02 let the first Xtream identity bootstrap the administrator on any Plex-less deployment.
-That is a race on a public host: whoever signs in first owns the instance. M03 adds:
+That is a race on a public host: whoever signs in first owns the instance. M03 adds
+`INITIAL_ADMIN_TOKEN`; M03.1 also applies it to a LAN listener:
 
-- `INITIAL_ADMIN_TOKEN` (16–256 chars, optional). `loadConfig` refuses to start a public or
-  remote deployment (`PUBLIC_BASE_URL` or `DEPLOYMENT_MODE=remote`) without Plex configuration
-  unless the token is set.
+- `INITIAL_ADMIN_TOKEN` (16–256 chars, optional). `loadConfig` refuses to start a Plex-less
+  deployment without it when **anything other than loopback** can reach the listener:
+  `PUBLIC_BASE_URL`, `DEPLOYMENT_MODE=remote`, or an `APP_HOST` that is not a loopback address.
+  `0.0.0.0`, `::`, and any LAN IP count as reachable even with `DEPLOYMENT_MODE=local`, because
+  the label does not stop another device connecting.
+- Loopback-only development (`127.0.0.0/8`, `::1`, `localhost`) keeps the zero-configuration
+  first-user flow.
 - The first Xtream login on an empty installation must present `bootstrapToken` matching the
   configured token (constant-time comparison of SHA-256 digests). A wrong or missing token is
   rejected **before** the provider panel is contacted.
 - After an administrator exists, the token is ignored: later logins need no token and are
-  viewers, exactly as in M02. Plex-configured deployments are unchanged; a local
-  (`DEPLOYMENT_MODE=local`) Plex-less deployment keeps the zero-configuration first-user flow.
-- `GET /api/v1/setup` returns `bootstrapTokenRequired` so the login screen can show the field
-  only when it is needed. Tests: `tests/xtream-live.test.ts` ("the first provider identity
+  viewers, exactly as in M02. Plex-configured deployments are unchanged.
+- The token is read from configuration only. It is never logged, never written to SQLite, and
+  never echoed in an error or the `/api/v1/setup` answer; only the boolean
+  `bootstrapTokenRequired` is exposed.
+- `GET /api/v1/setup` returns that boolean so the login screen shows the field only when needed.
+  Tests: `tests/security.test.ts` ("a Plex-less deployment reachable from another device always
+  needs the bootstrap token") and `tests/xtream-live.test.ts` ("the first provider identity
   becomes administrator only with an owner-controlled bootstrapping rule").
 
 ## 6. Fire TV remote and WebView compatibility
@@ -176,10 +196,46 @@ without any credential.
 Chromium 66 replaces the page's `Origin` header with the literal `null` on `fetch`, and adds
 `X-Requested-With: <package>`. `WebSettingsCompat.setRequestedWithHeaderOriginAllowList`
 (WebView 83+) fixes that but is unavailable here, so the server accepts
-`Origin: null` **plus** a well-formed `X-Requested-With` from the shell as an equivalent CSRF
-signal: a cross-origin page cannot set a custom header without a preflight this server never
-allows. Browsers are still checked on `Origin` alone
-(`tests/security.test.ts`, "the Fire TV shell CSRF marker…").
+`Origin: null` **plus** the shell's exact `X-Requested-With: com.tkbox.tv` as an equivalent CSRF
+signal. The marker is a literal package match (no pattern, no `XMLHttpRequest`), and any
+`Sec-Fetch-Site: cross-site` request carrying it is rejected.
+
+Why a hostile page cannot use it:
+
+- Setting a custom request header forces a CORS preflight, and this server answers no preflight
+  with `Access-Control-Allow-Origin`, `-Headers` or `-Methods`, so the browser never sends the
+  actual request.
+- The exception accepts only the literal `null` origin; a real foreign origin, even with the
+  marker, is rejected.
+- The session cookie omits `SameSite`, and modern browsers default that to `Lax`, so it is not
+  attached to a cross-site request. (The attribute is omitted deliberately: WebView 66's
+  `CookieManager.getCookie()` hides SameSite cookies, which stopped the shell handing the session
+  to the native player. See §4.)
+
+**Revisit these assumptions if CORS changes.** Any future `Access-Control-Allow-Origin: null`,
+wildcard origin with credentials, or `Access-Control-Allow-Headers: x-requested-with` would let a
+sandboxed iframe or foreign page satisfy the marker itself; at that point the exception must be
+removed, or gated on something a page cannot forge. The same applies if `cookieOpts.sameSite`
+ever weakens from `lax`. Tests: `tests/security.test.ts`, "the Fire TV shell CSRF marker…",
+including preflight assertions.
+
+### Redirects and off-origin media
+
+`SessionClient.client` builds the one OkHttp stack used for `/health`, session release, and
+Media3's HLS data source. It sets `followRedirects(false)` and `followSslRedirects(false)`.
+This is deliberate: `OriginCookieInterceptor` attaches the WebView's live session cookie as a
+request header *after* OkHttp's own policy runs, so a followed 301/302/307/308 would replay that
+header at the redirect target — including another origin, or HTTPS to HTTP. Before M03.1 that
+happened: the regression test with two `MockWebServer` instances observed the cookie arriving at
+the second, foreign server.
+
+Now a redirect is surfaced as its own status instead of being followed, and the interceptor
+throws for any request outside the configured origin, so an HLS manifest that names an absolute
+foreign segment or key cannot be fetched either. Fail closed means a legitimate CDN redirect
+also fails; the relay does not issue them. Tests: `SessionClientTest`
+(`aCrossOriginRedirectIsNotFollowedAndKeepsTheCookieHome`, `anOffOriginMediaRequestIsRefusedOutright`,
+`anOffOriginRedirectFromHttpsToHttpIsNotFollowed`,
+`anHlsManifestThatNamesAForeignHostCannotBeFetched`) and `HlsAuthenticationTest`.
 
 ## 7. Build and test commands
 
@@ -199,129 +255,155 @@ cd android
 
 The APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
 
-### Emulator run (M03 evidence)
+### Emulator run (M03 and M03.1 evidence)
 
-`android-34;android-tv;x86` under KVM, WebView 66.0.3359.158, 960×540 CSS viewport:
+`android-28;android-tv;x86` under KVM, WebView 66.0.3359.158:
 
 ```bash
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
-adb reverse tcp:3000 tcp:3000          # the server stays on loopback
+adb reverse tcp:<server-port> tcp:<server-port>   # server and synthetic panel stay on loopback
 adb shell am start -n com.tkbox.tv/.MainActivity
 ```
 
-Verified on that device:
+Verified on that device **in M03.1** (synthetic Xtream panel, loopback server):
 
-- the app appears in the **Android TV launcher** with its banner and starts from it;
-- first-run server entry, connection test, and the persisted origin surviving a restart;
-- a server that is down shows the "Server unavailable" screen with Retry, and Retry recovers;
-- React sign-in and guide rendering on WebView 66;
-- D-pad focus with a visible ring across header, filters and guide row;
-- a successful tune handing off to `PlayerActivity`;
-- H.264/MPEG-TS playback with the picture advancing and the overlay auto-hiding;
-- Back returning to the guide, with the server-side FFmpeg relay **and its segment directory**
-  gone;
-- the session cookie surviving two full force-stop/relaunch cycles.
+- first-run server entry with the IME, **Test connection** answering "Connected to …", then
+  **Save and continue** loading the React app;
+- Xtream sign-in on WebView 66 (the `Origin: null` + `X-Requested-With` CSRF path), then the
+  Live TV guide with both channels, D-pad focus ring moving across header, filters and rows;
+- tune handing off to `PlayerActivity`, H.264/MPEG-TS playback with the picture advancing
+  (timestamp and frame counter moving), overlay hiding itself;
+- the native playlist, every segment and the session `DELETE` carrying the session cookie —
+  this is what failed before the SameSite/`observe` fix (§4);
+- Back returning to the guide with the relay released, and a second channel tuning afterwards;
+- the session surviving a force-stop/relaunch, with no re-login;
+- a stopped server showing "Server unavailable" with Retry and Change address;
+- an invalidated session returning to the sign-in screen instead of retrying the stream.
 
-Not covered by that run: a physical Stick, Fire OS 5 specifically, HEVC, a real provider, and
+Verified in M03 (same image): launch from the Android TV launcher with its banner, offline
+recovery, and the session surviving two relaunch cycles.
+
+Not covered by either run: a physical Stick, Fire OS 5 specifically, HEVC, a real provider, and
 12 h session expiry (the cookie's own expiry was simulated, not waited out).
 
-## 8. Sideloading and UAT procedure
+## 8. Physical Fire TV Stick UAT
 
-### 8.1 Identify the device
+This checklist is for Astra/user testing on a real Stick. **Nothing below is claimed as passed**;
+the emulator evidence in §7 is separate and does not cover a physical device (§9).
 
-Settings → My Fire TV → About → Fire TV Stick. Note the model (e.g. "Fire TV Stick 4K") and
-Fire OS version (e.g. Fire OS 7.6.x). Devices on Fire OS 5 (API 22) are the compatibility
-floor for M03.
+### 8.1 Record the device
 
-### 8.2 Enable ADB
+Settings → My Fire TV → About → Fire TV Stick. Write down, for the UAT record:
 
-Settings → My Fire TV → About → click the device name 7 times → Developer Options →
-ADB debugging **on**. Note the device IP under Settings → My Fire TV → About → Network.
+| Field | Example |
+|---|---|
+| Model | Fire TV Stick (2nd gen) / 4K / 4K Max |
+| Fire OS version | 5.2.9.x / 6.7.x / 7.6.x |
+| Android API | 22 / 25 / 28 |
+| WebView version | `adb shell dumpsys package com.amazon.webview \| grep versionName` |
+| tk.box commit | the pushed M03.1 hash |
+| APK SHA-256 | from `sha256sum`, must match the PR value |
+
+Devices on Fire OS 5 (API 22) are the compatibility floor; a 1st/2nd-gen Stick is the most
+useful test because it is the slowest.
+
+### 8.2 Enable ADB and install
+
+Settings → My Fire TV → About → click the device name **7 times** → Developer Options →
+**ADB debugging on**, and **Apps from Unknown Sources on**. Find the address under
+Settings → My Fire TV → About → Network.
 
 ```bash
 adb connect 192.168.1.50:5555
-adb devices          # expect "device", not "unauthorized"
+adb devices                       # must say "device"; "unauthorized" = accept the prompt on screen
+
+# Install the exact artifact whose checksum is recorded in the PR.
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+adb shell dumpsys package com.tkbox.tv | grep -E 'versionName|versionCode'   # expect 1.0.0 / 10000
+
+# The server on the LAN: no adb reverse on a physical device.
+# Confirm the Stick can reach it before blaming the app:
+adb shell 'toybox nc -z -w 3 192.168.1.10 3000 && echo reachable || echo unreachable'
 ```
 
-### 8.3 Install
+If a previous build is installed and behaves oddly, remove it first (`adb uninstall com.tkbox.tv`)
+so the WebView cookie store and saved origin start clean.
+
+### 8.3 Acceptance checklist
+
+Run each row on the device and record Pass/Fail plus what was seen. Any Fail: capture the log
+(§8.4) before changing anything.
+
+| # | Test | Steps | Pass condition |
+|---|---|---|---|
+| 1 | Launcher | Home → Apps → Your Apps → tk.box | Banner and name present; starts from the TV launcher row |
+| 2 | Server entry | First run: type `http://192.168.1.10:3000` with the remote/IME | Text appears correctly; no overscan clipping of the field or buttons |
+| 3 | Connection test | **Test connection** | "Connected to …" within a few seconds |
+| 4 | Bad address | Enter a wrong host, **Test connection** | Clear failure message, app stays usable |
+| 5 | Sign-in | Xtream provider, username, password | Signs in; guide appears without a blank screen |
+| 6 | Bootstrap token | First sign-in on a fresh LAN server | Token field shown, wrong token refused, correct token grants admin |
+| 7 | Remote navigation | D-pad over header, filters, channel rows | Focus ring always visible and moves in the pressed direction; no focus traps |
+| 8 | Keyboard | Focus the search box, press OK | IME opens; typed text lands in the field; Back closes the IME only |
+| 9 | Programme guide | Open Live TV guide, move across the row | Programme times/now marker render; scrolling stays smooth on slow hardware |
+| 10 | Channel tune | OK on a channel | Picture and sound within a few seconds |
+| 11 | Audio/video | Watch ≥60 s | A/V in sync, no stutter loops, no green/black frames, overlay hides itself |
+| 12 | Pause/Play | Media keys or the overlay button | Pauses and resumes cleanly |
+| 13 | Back from playback | Press Back | Returns to the guide with focus restored; server relay stops |
+| 14 | Channel switching | Tune channel A, Back, tune channel B | B plays; only one relay exists at any time |
+| 15 | Session persistence | Force-stop (`adb shell am force-stop com.tkbox.tv`), relaunch | No re-login; server address and session survive |
+| 16 | Network failure | Stop the server (or pull Wi-Fi), relaunch | "Server unavailable" with Retry and Change address; Retry recovers after the server returns |
+| 17 | Auth failure | Revoke the session server-side, then tune | Returns to sign-in instead of retrying every feed |
+| 18 | Sleep/wake | Home, wait 2 min, reopen | App resumes without a stale player or a leaked relay |
+
+Verify the relay side while testing 13/14/16 — on the server host, the session's segment
+directory should disappear after Back:
 
 ```bash
-cd android
-./gradlew assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+ls "$CACHE_DIR/live" 2>/dev/null    # or: ls /var/cache/tk.box/live
 ```
 
-Fire OS 5/6 also needs Settings → Applications → Unknown sources for sideloaded updates;
-the first `adb install` is enough for a fresh install.
-
-### 8.4 First launch
-
-1. The app opens directly on the server screen (no browser).
-2. Enter the tk.box address with the remote and the on-screen keyboard, e.g.
-   `https://tv.example.com` or, in a debug build on a LAN, `http://192.168.1.10:3000`.
-3. Select **Test connection** — expect "Connected to …".
-4. Select **Save and continue** — the tk.box sign-in screen loads inside the app.
-
-### 8.5 Sign in
-
-- **Xtream:** expand "Sign in with an Xtream provider", enter the panel address, username and
-  password. If the server requires an initial administrator token, the field appears; enter
-  the operator's `INITIAL_ADMIN_TOKEN`.
-- **Plex:** if the backend has Plex configured, use the Plex button and complete the PIN on a
-  phone or computer; the app polls and signs in automatically.
-
-### 8.6 Browse and tune
-
-Live TV → D-pad to a channel (the accent ring follows) → **OK** to tune. The WebView shows
-"Playback is running in the TV player" while the native activity plays the channel. Channel
-up/down on the remote changes channels through the existing lineup order.
-
-### 8.7 Verify the acceptance points
-
-| Check | Expected |
-|---|---|
-| Playback | Picture and sound within a few seconds; "Buffering…" only briefly |
-| D-pad | Focus moves between nav, filters, channel rows and player controls |
-| OK | Opens details or starts the channel; opens the IME on text fields |
-| Back in a dialog | Closes the dialog, stays on the page |
-| Back in playback | Returns to the channel list; the server relay stops |
-| Channel switch | Back to the guide, then tune another channel: the old relay stops before the new player starts |
-| Relaunch | Server address and session persist; no re-login within 12 h |
-| Server down | "Server unavailable" screen with Retry and Change address |
-| Logout | Returns to sign-in; cookies cleared |
-
-### 8.8 Capture logs without credentials
+### 8.4 Capture diagnostics without credentials
 
 ```bash
 adb logcat -c
 # reproduce the issue, then:
-adb logcat -d | grep -iE 'tkbox|AndroidRuntime|Media3|ExoPlayer' > tkbox-firetv.log
+adb logcat -d | grep -iE 'TkBox|tkbox|AndroidRuntime|Media3|ExoPlayer|chromium' > tkbox-firetv.log
+adb shell dumpsys package com.tkbox.tv | grep -E 'versionName|versionCode' >> tkbox-firetv.log
 ```
 
-The app never logs cookies, provider passwords or stream URLs. Review the file before sharing;
-WebView and Media3 may still include URLs in framework logs, so scrub any `Cookie:` or
-`password=` values.
+The app logs no cookies, provider passwords or stream URLs, but WebView/Media3 framework lines
+can contain URLs and query strings. Scrub `Cookie:`, `password=`, `token=` and provider
+usernames before sharing. Useful facts to include: device model, Fire OS version, WebView
+version, the failing checklist row, and whether the server was reachable.
+
+### 8.5 What to report back
+
+For each failing row: checklist number, what happened, what was expected, the log file, the
+exact APK SHA-256, and the tk.box commit. Physical acceptance stays **open** until these rows
+are recorded by the tester.
 
 ## 9. Evidence, limitations and pending work
 
-Implemented and verified here:
+Implemented and verified in M03.1 on `feature/m03-firetv-hardening`:
 
-- Android project builds with `./gradlew testDebugUnitTest` and `assembleDebug`; 16 unit tests
-  for origin/URL rules, bridge input validation, cookie scoping, authenticated playlist and
-  segment requests, and one-time session release pass.
+- Android unit tests cover origin/URL rules, bridge input validation, cookie scoping,
+  authenticated playlist and segment requests, one-time session release, and the redirect /
+  off-origin refusal described in §6. `./gradlew testDebugUnitTest` and `assembleDebug` pass.
 - Node tests cover the native bridge contract, browser fallback, TV navigation geometry, build
-  target/polyfills and the bootstrap safeguard; typecheck and production build pass.
+  target/polyfills, the bootstrap safeguard for loopback/LAN/remote, and the CSRF marker and
+  preflight behaviour; typecheck and production build pass.
 
-**Verified on the API 28 TV emulator (WebView 66):** launch, setup, connection test, sign-in,
-guide, D-pad focus, native HLS playback, Back, relay release. See §7.
+**Verified on the Android TV API 28 / WebView 66 emulator:** see §7, which records the exact
+run. Automated test results and emulator observations are separate evidence; neither is a
+physical-device result.
 
-**Not verified — pending hardware UAT:**
+**Not verified — pending hardware UAT (§8):**
 
 - Launch from the Fire TV launcher, D-pad feel, IME, and overscan on an actual Stick.
 - Real HLS playback, buffering behaviour and codec compatibility on Fire OS 5 hardware.
 - Session persistence across a real app restart and after a 12 h expiry.
 - No claim of hardware compatibility is made until Astra/user testing on a physical device
-  completes. Record device model, Fire OS version and the outcome in this section.
+  completes. Record device model, Fire OS version and the outcome in §8.1.
 
 Known limitations:
 
@@ -331,6 +413,8 @@ Known limitations:
 - Feed failover (`LiveFailover`) runs at tune time and on a WebView playback error. In native
   playback a failed stream returns to the guide with a message; automatic backup-feed retry
   inside `PlayerActivity` is deferred to M04, as is a stall watchdog.
+- A redirect from the tk.box origin fails playback rather than being followed (§6). The relay
+  does not redirect today; a future CDN hop would need an origin-restricted follow.
 - Live TV only; VOD and custom-channel pause/resume stay in the WebView player (M04).
 - No in-app update manifest or signed release pipeline yet (M05).
 - Force-stop during playback skips the `DELETE`; the server's idle reaper is the fallback.

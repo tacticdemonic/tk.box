@@ -1,11 +1,13 @@
 package com.tkbox.tv
 
+import java.io.IOException
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import okhttp3.mockwebserver.MockResponse
@@ -65,6 +67,84 @@ class SessionClientTest {
     }
 
     @Test
+    fun aCrossOriginRedirectIsNotFollowedAndKeepsTheCookieHome() {
+        for (code in listOf(301, 302, 307, 308)) {
+            MockWebServer().use { server ->
+                MockWebServer().use { foreign ->
+                    val origin = server.url("/").toString().trimEnd('/')
+                    val playlist = "$origin/api/v1/live/sessions/$session/index.m3u8"
+                    server.enqueue(MockResponse().setResponseCode(code).setHeader("Location", foreign.url("/seg-1.ts").toString()))
+                    foreign.enqueue(MockResponse().setBody("TS"))
+                    val client = SessionClient.client(CookieSource { "tk.box_local=synthetic-cookie" }, origin)
+
+                    client.newCall(Request.Builder().url(playlist).build()).execute().use { response ->
+                        // Fail closed: the redirect is surfaced, never followed.
+                        assertEquals(code, response.code)
+                    }
+                    assertEquals("HTTP $code reached the other origin", 0, foreign.requestCount)
+                    assertEquals("tk.box_local=synthetic-cookie", server.takeRequest().getHeader("Cookie"))
+                }
+            }
+        }
+    }
+
+    @Test
+    fun anOffOriginMediaRequestIsRefusedOutright() {
+        MockWebServer().use { server ->
+            MockWebServer().use { foreign ->
+                val origin = server.url("/").toString().trimEnd('/')
+                // What Media3 would request if a playlist named an absolute foreign segment.
+                val client = SessionClient.client(CookieSource { "tk.box_local=synthetic-cookie" }, origin)
+                assertThrows(IOException::class.java) {
+                    client.newCall(Request.Builder().url(foreign.url("/seg-1.ts").toString()).build()).execute().close()
+                }
+                assertEquals(0, foreign.requestCount)
+            }
+        }
+    }
+
+    @Test
+    fun anOffOriginRedirectFromHttpsToHttpIsNotFollowed() {
+        MockWebServer().use { server ->
+            MockWebServer().use { foreign ->
+                // A real TLS server would be needed to model the origin side; what matters here is
+                // that the client is the one SessionClient builds and it neither follows nor leaks.
+                val origin = server.url("/").toString().trimEnd('/')
+                server.enqueue(MockResponse().setResponseCode(302).setHeader("Location", foreign.url("/seg-1.ts").toString()))
+                foreign.enqueue(MockResponse().setBody("TS"))
+                val client = SessionClient.client(CookieSource { "tk.box_local=synthetic-cookie" }, origin)
+                client.newCall(Request.Builder().url("$origin/api/v1/live/sessions/$session/index.m3u8").build())
+                    .execute().use { response ->
+                        assertEquals(302, response.code)
+                        assertNull("a downgrade target must not be fetched", response.priorResponse)
+                    }
+                assertEquals(0, foreign.requestCount)
+            }
+        }
+    }
+
+    @Test
+    fun anHlsManifestThatNamesAForeignHostCannotBeFetched() {
+        MockWebServer().use { server ->
+            MockWebServer().use { foreign ->
+                val origin = server.url("/").toString().trimEnd('/')
+                val playlist = "$origin/api/v1/live/sessions/$session/index.m3u8"
+                server.enqueue(MockResponse().setBody("#EXTM3U\n#EXTINF:2,\n${foreign.url("/seg-1.ts")}\n"))
+                val client = SessionClient.client(CookieSource { "tk.box_local=synthetic-cookie" }, origin)
+                val manifest = client.newCall(Request.Builder().url(playlist).build()).execute().use { it.body?.string() }
+                val segment = manifest!!.lineSequence().first { it.startsWith("http") }
+                // Media3 resolves the URI and asks this same client for it; the interceptor refuses.
+                assertEquals(false, OriginPolicy.isTrusted(segment, origin))
+                assertThrows(IOException::class.java) {
+                    client.newCall(Request.Builder().url(segment).build()).execute().close()
+                }
+                assertEquals(0, foreign.requestCount)
+                assertEquals("tk.box_local=synthetic-cookie", server.takeRequest().getHeader("Cookie"))
+            }
+        }
+    }
+
+    @Test
     fun cookiesAreSentOnlyToTheConfiguredOrigin() {
         val asked = mutableListOf<String>()
         val cookies = CookieSource { url -> asked.add(url); "tk.box_local=token" }
@@ -74,10 +154,10 @@ class SessionClientTest {
             server.enqueue(MockResponse().setBody("ok"))
             client.newCall(Request.Builder().url("$origin/api/v1/live/sessions/$session/index.m3u8").build()).execute().close()
             assertEquals("tk.box_local=token", server.takeRequest().getHeader("Cookie"))
-            // Another host is passed through untouched, and its cookie store is never consulted.
+            // Another host is refused before the chain runs, and its cookie store is never consulted.
             val foreign = RecordingChain(Request.Builder().url("https://evil.example/segment.ts").build())
-            OriginCookieInterceptor(origin, cookies).intercept(foreign)
-            assertNull(foreign.forwarded!!.header("Cookie"))
+            assertThrows(IOException::class.java) { OriginCookieInterceptor(origin, cookies).intercept(foreign) }
+            assertNull(foreign.forwarded)
             assertEquals(1, asked.size)
         }
     }

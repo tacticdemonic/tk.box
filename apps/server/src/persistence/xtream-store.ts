@@ -174,8 +174,8 @@ export class XtreamStore {
   access(id: string) { this.row(id); return (this.db.prepare('SELECT account_id FROM xtream_access WHERE xtream_id=? ORDER BY account_id').all(id) as { account_id: string }[]).map(row => row.account_id); }
   // The provider row for an origin and username, so a viewer logging in with the same
   // subscription resumes one provider account rather than creating duplicates.
-  findByLogin(serverUrl: string, username: string) {
-    const key = digest(JSON.stringify([normalizeXtreamEndpoint({serverUrl}).serverUrl, username]));
+  findByLogin(serverUrl: string, username: string, allowInsecureHttp = false) {
+    const key = digest(JSON.stringify([normalizeXtreamEndpoint({serverUrl, allowInsecureHttp}).serverUrl, username]));
     const row = this.db.prepare('SELECT * FROM xtream_accounts WHERE login_key=? ORDER BY created_at,rowid LIMIT 1').get(key) as AccountRow | undefined;
     return row ? this.statusOf(row) : undefined;
   }

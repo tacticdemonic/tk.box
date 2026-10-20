@@ -5,7 +5,7 @@ import { Vault, opaque, digest } from '../security/vault.js';
 import { normalizeXtreamEndpoint } from '../providers/xtream.js';
 import { requireThat } from '../errors.js';
 
-export type BootstrapGuard = boolean | { enabled: boolean; requiredToken?: string; suppliedToken?: string; publicDeployment?: boolean };
+export type BootstrapGuard = boolean | { enabled: boolean; requiredToken?: string; suppliedToken?: string; reachable?: boolean };
 export class IdentityService {
   private authorizing = new Map<string,Promise<PlexGrant>>();
   constructor(private db: Db, private vault: Vault, private plex: PlexAdapter) {}
@@ -25,7 +25,7 @@ export class IdentityService {
   async xtreamLogin(input: {serverUrl: string; username: string; password: string; allowInsecureHttp?: boolean}, authenticate: () => Promise<unknown>, bootstrap: BootstrapGuard = false, now = Date.now()) {
     const boot = typeof bootstrap === 'boolean' ? { enabled: bootstrap } : bootstrap;
     if (boot.enabled && !this.hasLocalAdmin()) {
-      requireThat(!boot.publicDeployment || !!boot.requiredToken, 'BOOTSTRAP_LOCKED', 'Public deployment without Plex requires INITIAL_ADMIN_TOKEN.', 403);
+      requireThat(!boot.reachable || !!boot.requiredToken, 'BOOTSTRAP_LOCKED', 'A deployment reachable from another device requires INITIAL_ADMIN_TOKEN.', 403);
       if (boot.requiredToken) {
         const ok = !!boot.suppliedToken && timingSafeEqual(Buffer.from(digest(boot.suppliedToken)), Buffer.from(digest(boot.requiredToken)));
         requireThat(ok, 'BOOTSTRAP_TOKEN_REQUIRED', 'Valid initial administrator token is required to initialize this server.', 403);

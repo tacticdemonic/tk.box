@@ -53,6 +53,12 @@ class SessionClient(private val origin: String, private val client: OkHttpClient
             OkHttpClient.Builder()
                 .connectTimeout(10, TimeUnit.SECONDS)
                 .readTimeout(20, TimeUnit.SECONDS)
+                // The interceptor attaches a live session cookie after OkHttp's own policy runs,
+                // so OkHttp would replay that header to a redirect target on another origin or
+                // from HTTPS to HTTP. Refuse to follow instead; a redirect is surfaced as its
+                // own status (or a playback error), never as a cross-origin authenticated GET.
+                .followRedirects(false)
+                .followSslRedirects(false)
                 .addInterceptor(OriginCookieInterceptor(origin, cookies))
                 .build()
     }

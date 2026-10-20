@@ -43,6 +43,9 @@ import { XtreamService } from './services/xtream-service.js';
 import { XtreamClient, type XtreamTransport } from './providers/xtream.js';
 import { registerXtream } from './xtream-api.js';
 
+// The only X-Requested-With value the pre-83 Android WebView shell sends.
+const SHELL_PACKAGE = 'com.tkbox.tv';
+
 export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexAdapter, logging = true, cookieNamespace = 'tk.box', xtreamTransport?: XtreamTransport) {
   const app = Fastify({ logger: logging ? {level: 'info'} : false, logController: new LogController({disableRequestLogging: true}), bodyLimit: 65536, trustProxy: config.trustedProxies.length ? config.trustedProxies : false });
   const identity = new IdentityService(db, vault, plex), playback = new PlaybackService(db, plex), settings = new SettingsStore(db);
@@ -55,7 +58,11 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   // Cookie scope does not include the port. Development harnesses on another
   // loopback port must use their own namespace to preserve real app sessions.
   const sessionCookie = config.secureCookies ? `__Host-${cookieNamespace}` : `${cookieNamespace}_local`, linkCookie = `${cookieNamespace}_link`;
-  const cookieOpts = { httpOnly: true, secure: config.secureCookies, sameSite: 'lax' as const, path: '/' };
+  // No SameSite attribute (`false` stops @fastify/cookie adding its Lax default). WebView 66's
+  // CookieManager.getCookie() hides Lax/Strict cookies, which left the native player with no
+  // session; modern browsers treat an absent attribute as Lax, and the Origin + JSON check on
+  // every mutation remains the CSRF control.
+  const cookieOpts = { httpOnly: true, secure: config.secureCookies, sameSite: false as const, path: '/' };
   // Preserve existing browser sessions and in-progress Plex links during the rebrand.
   const legacyNamespace = cookieNamespace.replace(/^tk\.box(?=_|$)/, 'enki');
   const legacyCookies = legacyNamespace === cookieNamespace ? [] : [
@@ -70,10 +77,16 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
     if (config.secureCookies) reply.header('Strict-Transport-Security', 'max-age=31536000');
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       // Chromium WebView before 83 replaces the page Origin with "null" and marks the request
-      // X-Requested-With: <package>. That marker is set by the shell only, and a cross-origin page
-      // cannot send a custom header without a preflight this server never allows, so it is an
-      // equally strong CSRF signal. Browsers continue to be checked on Origin alone.
-      const shellRequest = req.headers.origin === 'null' && /^[\w.]+$/.test(String(req.headers['x-requested-with'] ?? ''));
+      // X-Requested-With: <package>. That marker is only accepted for the shell's exact package,
+      // and a cross-origin page cannot set a custom header without a preflight this server never
+      // answers with CORS headers, so it is an equally strong CSRF signal. Browsers continue to
+      // be checked on Origin alone.
+      // Revisit if a CORS policy is ever added: allowing Access-Control-Allow-Headers for
+      // X-Requested-With, or Access-Control-Allow-Origin for "null", would let a hostile origin
+      // satisfy this marker itself.
+      const marker = req.headers['x-requested-with'];
+      const shellRequest = req.headers.origin === 'null' && marker === SHELL_PACKAGE
+        && req.headers['sec-fetch-site'] !== 'cross-site';
       requireThat(req.headers.origin === config.browserOrigin || shellRequest, 'CSRF_REJECTED', 'Request origin is not permitted.', 403);
       requireThat(req.headers['content-type']?.split(';')[0] === 'application/json', 'INVALID_CONTENT_TYPE', 'Use application/json.', 415);
     }
@@ -114,8 +127,9 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
     const credentials = {serverUrl: input.serverUrl, username: input.username, password: input.password, allowInsecureHttp: input.allowInsecureHttp};
     // The panel must accept the credentials before a session or a provider row exists.
     const login = await identity.xtreamLogin(credentials, () => new XtreamClient(credentials, xtreamTransport).authenticate(),
-      {enabled: !config.plexConfigured, requiredToken: config.INITIAL_ADMIN_TOKEN, suppliedToken: input.bootstrapToken, publicDeployment: config.DEPLOYMENT_MODE === 'remote' || !!config.PUBLIC_BASE_URL});
-    let account = xtream.findByLogin(credentials.serverUrl, credentials.username);
+      {enabled: !config.plexConfigured, requiredToken: config.INITIAL_ADMIN_TOKEN, suppliedToken: input.bootstrapToken,
+        reachable: !config.loopbackOnly || config.DEPLOYMENT_MODE === 'remote' || !!config.PUBLIC_BASE_URL});
+    let account = xtream.findByLogin(credentials.serverUrl, credentials.username, credentials.allowInsecureHttp);
     if (!account) account = xtream.create(login.accountId, {name: input.name ?? new URL(credentials.serverUrl).hostname, credentials});
     else {
       xtream.grant(login.accountId, account.id);

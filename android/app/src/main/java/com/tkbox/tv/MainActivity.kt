@@ -146,7 +146,11 @@ class MainActivity : ComponentActivity() {
 
         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
             val server = origin ?: return blocked()
-            return if (OriginPolicy.isTrusted(request.url.toString(), server)) null else blocked()
+            if (!OriginPolicy.isTrusted(request.url.toString(), server)) return blocked()
+            // The session cookie is not reliably visible to CookieManager.getCookie() on older
+            // WebViews; the same header the WebView sends is the one the native player reuses.
+            WebViewCookies.observe(request.url.toString(), request.requestHeaders["Cookie"])
+            return null
         }
 
         override fun onPageFinished(view: WebView, url: String) {
@@ -207,6 +211,7 @@ class MainActivity : ComponentActivity() {
 
         @android.webkit.JavascriptInterface
         fun logout() = runOnUiThread {
+            WebViewCookies.clear()
             CookieManager.getInstance().removeAllCookies(null)
             CookieManager.getInstance().flush()
             webView?.reload()
