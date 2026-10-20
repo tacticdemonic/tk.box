@@ -35,20 +35,42 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val server = intent.getStringExtra(EXTRA_ORIGIN)?.takeIf { OriginPolicy.normalize(it, BuildConfig.ALLOW_CLEARTEXT) != null } ?: run { finish(); return }
-        val session = intent.getStringExtra(EXTRA_SESSION_ID) ?: run { finish(); return }
-        val stream = intent.getStringExtra(EXTRA_STREAM_URL) ?: run { finish(); return }
-        val resolved = OriginPolicy.resolveStream(stream, session, server, BuildConfig.ALLOW_CLEARTEXT) ?: run { finish(); return }
-        origin = server
-        sessionId = session
-        lifetime = PlaybackLifetime(session)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        setContentView(buildLayout(intent.getStringExtra(EXTRA_TITLE), intent.getStringExtra(EXTRA_SUBTITLE)))
+        val target = validatedTarget(intent) ?: run { finish(); return }
+        setContentView(buildLayout(target.title, target.subtitle))
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() = close("ended", null)
         })
         listenForStop()
-        startPlayback(server, resolved)
+        play(target)
+    }
+
+    /**
+     * A repeated handoff for the session already playing is ignored. The page always stops the
+     * previous session before tuning another channel, so a different session here would mean two
+     * live relays and an untracked player; refusing keeps exactly one.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (validatedTarget(intent)?.sessionId == sessionId) setIntent(intent)
+    }
+
+    private data class Target(val origin: String, val sessionId: String, val streamUrl: String, val title: String?, val subtitle: String?)
+
+    private fun validatedTarget(intent: Intent?): Target? {
+        if (intent == null) return null
+        val server = intent.getStringExtra(EXTRA_ORIGIN)?.takeIf { OriginPolicy.normalize(it, BuildConfig.ALLOW_CLEARTEXT) != null } ?: return null
+        val session = intent.getStringExtra(EXTRA_SESSION_ID)?.takeIf(BridgeValidator::isSessionId) ?: return null
+        val stream = intent.getStringExtra(EXTRA_STREAM_URL) ?: return null
+        val resolved = OriginPolicy.resolveStream(stream, session, server, BuildConfig.ALLOW_CLEARTEXT) ?: return null
+        return Target(server, session, resolved, intent.getStringExtra(EXTRA_TITLE), intent.getStringExtra(EXTRA_SUBTITLE))
+    }
+
+    private fun play(target: Target) {
+        origin = target.origin
+        sessionId = target.sessionId
+        lifetime = PlaybackLifetime(target.sessionId)
+        startPlayback(target.origin, target.streamUrl)
     }
 
     private fun buildLayout(title: String?, subtitle: String?): ViewGroup {
