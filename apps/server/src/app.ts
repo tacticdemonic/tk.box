@@ -43,8 +43,71 @@ import { XtreamService } from './services/xtream-service.js';
 import { XtreamClient, type XtreamTransport } from './providers/xtream.js';
 import { registerXtream } from './xtream-api.js';
 
-// The only X-Requested-With value the pre-83 Android WebView shell sends.
+// The only X-Requested-With value the Android TV WebView shell sends.
 const SHELL_PACKAGE = 'com.tkbox.tv';
+
+export function hasShellMarker(value: string | string[] | undefined): boolean {
+  const raw = Array.isArray(value) ? value.join(',') : (value ?? '');
+  const parts = raw.split(',').map(part => part.trim()).filter(Boolean);
+  return parts.length > 0 && parts.every(part => part === SHELL_PACKAGE);
+}
+
+export function classifyCsrfRejection(
+  req: { id: string; method: string; url: string; routeOptions?: { url?: string }; headers: Record<string, string | string[] | undefined> },
+  config: Pick<Config, 'browserOrigin'> & { unconfiguredWildcardOrigin?: boolean }
+) {
+  const rawOrigin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+  let originClass: 'missing' | 'null' | 'matched' | 'mismatched' | 'malformed' = 'missing';
+  let requestOrigin: string | null = null;
+  if (rawOrigin === undefined || rawOrigin === '') {
+    originClass = 'missing';
+  } else if (rawOrigin === 'null') {
+    originClass = 'null';
+    requestOrigin = 'null';
+  } else {
+    try {
+      const parsed = new URL(rawOrigin);
+      if ((parsed.protocol === 'http:' || parsed.protocol === 'https:') && !parsed.username && !parsed.password && parsed.pathname === '/' && !parsed.search && !parsed.hash && parsed.origin === rawOrigin) {
+        requestOrigin = parsed.origin;
+        originClass = parsed.origin === config.browserOrigin ? 'matched' : 'mismatched';
+      } else {
+        originClass = 'malformed';
+      }
+    } catch {
+      originClass = 'malformed';
+    }
+  }
+  const rawMarker = req.headers['x-requested-with'];
+  const markerPresent = rawMarker !== undefined && String(rawMarker).trim() !== '';
+  const xRequestedWith: 'shell_package' | 'absent' | 'other' = hasShellMarker(rawMarker) ? 'shell_package' : markerPresent ? 'other' : 'absent';
+  const rawFetchSite = typeof req.headers['sec-fetch-site'] === 'string' ? req.headers['sec-fetch-site'].trim().toLowerCase() : undefined;
+  const secFetchSite: 'same-origin' | 'same-site' | 'cross-site' | 'none' | 'absent' | 'other' =
+    !rawFetchSite ? 'absent'
+    : (rawFetchSite === 'same-origin' || rawFetchSite === 'same-site' || rawFetchSite === 'cross-site' || rawFetchSite === 'none') ? rawFetchSite
+    : 'other';
+  const ua = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
+  const androidShell = xRequestedWith === 'shell_package' || /\bTkBoxTV\/[\w.-]+/.test(ua);
+  const reason =
+    (secFetchSite === 'cross-site' || secFetchSite === 'same-site' || secFetchSite === 'other') ? 'cross_site_fetch_metadata'
+    : originClass === 'missing' ? (xRequestedWith === 'shell_package' ? 'missing_origin_marker_but_rejected' : 'missing_origin')
+    : originClass === 'malformed' ? 'malformed_origin'
+    : originClass === 'null' ? (xRequestedWith === 'absent' ? 'null_origin_missing_marker' : 'null_origin_invalid_marker')
+    : config.unconfiguredWildcardOrigin ? 'wildcard_bind_without_app_origin'
+    : 'origin_mismatch';
+  const route = (req.routeOptions?.url || req.url.split('?')[0] || '/').slice(0, 200);
+  return {
+    requestId: req.id,
+    method: req.method,
+    route,
+    originClass,
+    requestOrigin,
+    expectedOrigin: config.browserOrigin,
+    xRequestedWith,
+    secFetchSite,
+    androidShell,
+    reason
+  };
+}
 
 export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexAdapter, logging = true, cookieNamespace = 'tk.box', xtreamTransport?: XtreamTransport) {
   const app = Fastify({ logger: logging ? {level: 'info'} : false, logController: new LogController({disableRequestLogging: true}), bodyLimit: 65536, trustProxy: config.trustedProxies.length ? config.trustedProxies : false });
@@ -76,19 +139,27 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
     reply.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self'; connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'");
     if (config.secureCookies) reply.header('Strict-Transport-Security', 'max-age=31536000');
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-      // Chromium WebView before 83 replaces the page Origin with "null" and marks the request
-      // X-Requested-With: <package>. That marker is only accepted for the shell's exact package,
-      // and a cross-origin page cannot set a custom header without a preflight this server never
-      // answers with CORS headers, so it is an equally strong CSRF signal. Browsers continue to
-      // be checked on Origin alone.
+      // Chromium WebView before 83 replaces the page Origin with "null" (some builds omit it
+      // entirely on same-origin fetch). The page also sets X-Requested-With: com.tkbox.tv via
+      // api.ts, and pre-83 WebViews add the same package themselves; duplicates are accepted.
+      // That marker is only accepted for the shell's exact package with JSON and no cross-site
+      // fetch metadata. A cross-origin page cannot set a custom header without a preflight this
+      // server never answers with CORS headers, so it is an equally strong CSRF signal.
       // Revisit if a CORS policy is ever added: allowing Access-Control-Allow-Headers for
       // X-Requested-With, or Access-Control-Allow-Origin for "null", would let a hostile origin
       // satisfy this marker itself.
-      const marker = req.headers['x-requested-with'];
-      const shellRequest = req.headers.origin === 'null' && marker === SHELL_PACKAGE
-        && req.headers['sec-fetch-site'] !== 'cross-site';
-      requireThat(req.headers.origin === config.browserOrigin || shellRequest, 'CSRF_REJECTED', 'Request origin is not permitted.', 403);
-      requireThat(req.headers['content-type']?.split(';')[0] === 'application/json', 'INVALID_CONTENT_TYPE', 'Use application/json.', 415);
+      const marker = hasShellMarker(req.headers['x-requested-with']);
+      const fetchSite = typeof req.headers['sec-fetch-site'] === 'string' ? req.headers['sec-fetch-site'].trim().toLowerCase() : undefined;
+      // An exact Origin match is authoritative on its own; the fetch-metadata gate only guards
+      // the marker exception, where the browser-supplied Origin is unusable.
+      const fetchSitePermitted = fetchSite === undefined || fetchSite === 'same-origin' || fetchSite === 'none';
+      const shellRequest = req.headers.origin === 'null' && marker && fetchSitePermitted;
+      const originPermitted = req.headers.origin === config.browserOrigin || shellRequest;
+      if (!originPermitted) {
+        if (config.CSRF_DIAGNOSTICS) app.log.warn(classifyCsrfRejection(req, config), 'csrf origin rejected');
+        throw new AppError('CSRF_REJECTED', 'Request origin is not permitted.', 403);
+      }
+      requireThat(req.headers['content-type']?.split(';')[0]?.trim().toLowerCase() === 'application/json', 'INVALID_CONTENT_TYPE', 'Use application/json.', 415);
     }
     for (const migration of legacyCookies) {
       const value = req.cookies[migration.old];

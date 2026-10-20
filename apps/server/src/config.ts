@@ -6,8 +6,10 @@ const optionalText = (value: z.ZodString) => z.preprocess(input => typeof input 
 const schema = z.object({
   APP_HOST: z.string().default('127.0.0.1').refine(v => isIP(v) !== 0 || v === 'localhost', 'Use an IP address or localhost'),
   APP_PORT: z.coerce.number().int().min(1024).max(65535).default(3000),
+  APP_ORIGIN: optionalText(z.string().url()),
   DEPLOYMENT_MODE: z.enum(['local', 'remote']).default('local'),
   PUBLIC_BASE_URL: optionalText(z.string().url()),
+  CSRF_DIAGNOSTICS: z.string().default('false').transform(value => value === 'true' || value === '1'),
   DATA_DIR: z.string().default('./data'),
   CACHE_DIR: z.string().default('./data/cache'),
   SECRET_KEY_FILE: optionalText(z.string()),
@@ -32,11 +34,10 @@ const schema = z.object({
 });
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const c = schema.parse(env);
-  if (c.PUBLIC_BASE_URL) {
-    const u = new URL(c.PUBLIC_BASE_URL);
-    if (u.protocol !== 'https:' || u.username || u.password || u.pathname !== '/' || u.search || u.hash) throw new Error('PUBLIC_BASE_URL must be an HTTPS origin');
-  }
-  if (c.DEPLOYMENT_MODE === 'remote' && !c.PUBLIC_BASE_URL) throw new Error('Remote deployment requires PUBLIC_BASE_URL');
+  const publicUrl = c.PUBLIC_BASE_URL ? parseOrigin(c.PUBLIC_BASE_URL, 'PUBLIC_BASE_URL', true) : undefined;
+  const appUrl = c.APP_ORIGIN ? parseOrigin(c.APP_ORIGIN, 'APP_ORIGIN', false) : undefined;
+  if (publicUrl && appUrl && publicUrl.origin !== appUrl.origin) throw new Error('APP_ORIGIN and PUBLIC_BASE_URL must match when both are set');
+  if (c.DEPLOYMENT_MODE === 'remote' && !publicUrl) throw new Error('Remote deployment requires PUBLIC_BASE_URL');
   const p = new URL(c.PLEX_URL);
   if (!['http:', 'https:'].includes(p.protocol) || p.username || p.password || p.pathname !== '/' || p.search || p.hash) throw new Error('PLEX_URL must be an HTTP(S) origin without credentials');
   const trustedProxies = c.TRUSTED_PROXY_CIDRS.split(',').map(s => s.trim()).filter(Boolean);
@@ -56,16 +57,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const plexConfigured = !!(c.PLEX_MACHINE_ID && c.PLEX_OWNER_ACCOUNT_ID && c.PLEX_REQUIRED_LIBRARY_IDS.trim());
   // A listener on a LAN address is reachable from other devices whatever DEPLOYMENT_MODE says,
   // so that, not the label, decides whether the first administrator needs an owner token.
-  const loopbackOnly = isLoopbackHost(c.APP_HOST);
-  const exposed = c.DEPLOYMENT_MODE === 'remote' || !!c.PUBLIC_BASE_URL || !loopbackOnly;
+  const listenOrigin = new URL(`http://${c.APP_HOST.includes(':') ? `[${c.APP_HOST}]` : c.APP_HOST}:${c.APP_PORT}`).origin;
+  const browserOrigin = publicUrl?.origin ?? appUrl?.origin ?? listenOrigin;
+  const wildcardBind = isWildcardHost(c.APP_HOST);
+  const unconfiguredWildcardOrigin = wildcardBind && !publicUrl && !appUrl;
+  const loopbackOnly = isLoopbackHost(c.APP_HOST) && (!appUrl || isLoopbackHost(appUrl.hostname)) && !publicUrl;
+  const exposed = c.DEPLOYMENT_MODE === 'remote' || !!publicUrl || !loopbackOnly;
   if (!plexConfigured && exposed && !c.INITIAL_ADMIN_TOKEN) throw new Error('Public, remote or non-loopback deployment without Plex requires INITIAL_ADMIN_TOKEN');
-  return { ...c, DATA_DIR: resolve(c.DATA_DIR), CACHE_DIR: resolve(c.CACHE_DIR), trustedProxies,
+  return { ...c,
+    PUBLIC_BASE_URL: publicUrl?.origin,
+    APP_ORIGIN: appUrl?.origin,
+    DATA_DIR: resolve(c.DATA_DIR), CACHE_DIR: resolve(c.CACHE_DIR), trustedProxies,
     requiredLibraries: c.PLEX_REQUIRED_LIBRARY_IDS.split(',').map(v => v.trim()).filter(Boolean),
-    secureCookies: !!c.PUBLIC_BASE_URL,
+    secureCookies: !!publicUrl || !!appUrl?.https,
     localMedia: mediaRoots.length ? { roots: mediaRoots.map(root => resolve(root)), pathMap } : undefined,
     plexConfigured,
     loopbackOnly,
-    browserOrigin: c.PUBLIC_BASE_URL ?? `http://${c.APP_HOST.includes(':') ? `[${c.APP_HOST}]` : c.APP_HOST}:${c.APP_PORT}`
+    wildcardBind,
+    unconfiguredWildcardOrigin,
+    listenHost: c.APP_HOST,
+    listenPort: c.APP_PORT,
+    publicOrigin: publicUrl?.origin,
+    appOrigin: appUrl?.origin,
+    browserOrigin
   };
 }
 export type Config = ReturnType<typeof loadConfig>;
@@ -76,4 +90,19 @@ export function isLoopbackHost(host: string) {
   if (name === 'localhost' || name === '::1') return true;
   const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(name);
   return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(mapped?.[1] ?? name);
+}
+
+/** True for 0.0.0.0 / :: wildcard bind addresses, which are never valid browser Origins. */
+export function isWildcardHost(host: string) {
+  const name = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return name === '0.0.0.0' || name === '::' || name === '::ffff:0.0.0.0' || /^0(?::0){7}$/.test(name);
+}
+
+function parseOrigin(raw: string, label: string, httpsOnly: boolean) {
+  const u = new URL(raw);
+  const allowed = httpsOnly ? ['https:'] : ['http:', 'https:'];
+  if (!allowed.includes(u.protocol) || u.username || u.password || u.pathname !== '/' || u.search || u.hash || isWildcardHost(u.hostname)) {
+    throw new Error(`${label} must be ${httpsOnly ? 'an HTTPS' : 'a specific HTTP(S)'} origin`);
+  }
+  return { origin: u.origin, hostname: u.hostname.replace(/^\[|\]$/g, ''), https: u.protocol === 'https:' };
 }

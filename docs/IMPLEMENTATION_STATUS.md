@@ -1,6 +1,39 @@
 # tk.box implementation status
 
-Updated October 20, 2026. **M03.1 hardening implemented and locally verified (Node + Android build); real-device Fire TV UAT and hosted-CI verification remain open.**
+Updated October 20, 2026. **M03.2 closes the physical Fire TV Stick CSRF rejection; Node tests,
+Android tests, typecheck, build and APK packaging are locally verified. Hosted CI and physical
+Stick acceptance remain open.**
+
+## Latest pass: M03.2 — physical Fire Stick CSRF rejection
+
+- **Root cause: server origin configuration, not WebView behaviour.** `loadConfig` used
+  `APP_HOST` for both the listen address and the expected browser origin. With the documented
+  LAN setup (`APP_HOST=0.0.0.0`), the expected origin became `http://0.0.0.0:3000`, which no
+  client ever sends, so every state change from the Stick's `Origin: http://<lan-ip>:3000` was
+  refused with `CSRF_REJECTED`. The emulator passed only because `adb reverse` reached the server
+  on loopback, where the two happened to agree.
+- **Listen address and browser origin are now separate.** `APP_ORIGIN` (`http://` or `https://`,
+  no path/query/credentials) sets the browser-facing origin for LAN HTTP and any non-standard
+  host; `PUBLIC_BASE_URL` remains the HTTPS public origin and takes precedence. Both are
+  normalized to the RFC 6454 origin (`https://tv.example.com/` → `https://tv.example.com`),
+  must agree when both are set, reject wildcard hosts, and are validated at startup. A wildcard
+  bind without either emits an explicit warning. No wildcard, dynamic or CORS-permissive origin
+  was introduced.
+- **Fire TV compatibility is belt-and-braces, not a relaxation.** The page now sets
+  `X-Requested-With: com.tkbox.tv` on non-GET `api()` calls when `TkBoxNative` is present, so
+  older/newer Fire OS WebViews that omit the header still satisfy the existing `Origin: null`
+  exception; duplicate header values are matched as one package. `SessionClient.stop` sends the
+  same marker. The exception still requires a literal `null` Origin, JSON, and no cross-site
+  fetch metadata; a real foreign origin is never accepted with the marker.
+- **Opt-in diagnostics.** `CSRF_DIAGNOSTICS=true` logs request id, method, route template,
+  origin classification/normalized value, expected origin, marker classification,
+  `Sec-Fetch-Site`, shell detection and a reason code. No cookies, tokens, bodies, query strings
+  or provider URLs.
+- **Tests:** `tests/csrf-origin.test.ts` covers LAN/wildcard/loopback/remote origin rules,
+  host/port/scheme mismatches, missing/malformed/`null` Origin, accepted and rejected markers,
+  CORS preflight, "CSRF accepted but credentials rejected" separation, and secret-free
+  diagnostics. `docs/ANDROID_FIRE_TV.md` §8 is now a focused ten-step physical retest with the
+  server-origin check and a reason-code table. Physical acceptance is **not** claimed.
 
 ## Latest pass: M03.1 — Fire TV security and UAT readiness
 

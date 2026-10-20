@@ -40,7 +40,10 @@ node --env-file=.env dist/apps/server/src/index.js
 
 `setup:plex` verifies your server and writes its owner, machine and library IDs to `.env`. Your Plex token is never saved. `doctor` checks your configuration and FFmpeg.
 
-Then open the configured address (`APP_HOST`:`APP_PORT`) and sign in with Plex.
+Then open the configured address (`APP_HOST`:`APP_PORT`) and sign in with Plex. When the server
+binds a wildcard (`APP_HOST=0.0.0.0` or `::`) or clients reach it by a LAN name/IP, also set
+`APP_ORIGIN` to the address they type (e.g. `APP_ORIGIN=http://192.168.1.10:3000`): the listen
+address is not a browser origin, and CSRF rejects state changes from any other origin.
 
 ## Development
 
