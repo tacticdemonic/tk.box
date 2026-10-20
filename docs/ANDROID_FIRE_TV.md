@@ -209,14 +209,21 @@ adb reverse tcp:3000 tcp:3000          # the server stays on loopback
 adb shell am start -n com.tkbox.tv/.MainActivity
 ```
 
-Verified on that device: first-run server entry and connection test; the React sign-in and
-guide rendering; D-pad focus with a visible ring across header, filters and guide row; a
-successful tune handing off to `PlayerActivity`; H.264/MPEG-TS playback with the picture
-advancing and the overlay auto-hiding; Back returning to the guide; and the server-side FFmpeg
-relay and its segment directory disappearing once Back is pressed.
+Verified on that device:
+
+- the app appears in the **Android TV launcher** with its banner and starts from it;
+- first-run server entry, connection test, and the persisted origin surviving a restart;
+- a server that is down shows the "Server unavailable" screen with Retry, and Retry recovers;
+- React sign-in and guide rendering on WebView 66;
+- D-pad focus with a visible ring across header, filters and guide row;
+- a successful tune handing off to `PlayerActivity`;
+- H.264/MPEG-TS playback with the picture advancing and the overlay auto-hiding;
+- Back returning to the guide, with the server-side FFmpeg relay **and its segment directory**
+  gone;
+- the session cookie surviving two full force-stop/relaunch cycles.
 
 Not covered by that run: a physical Stick, Fire OS 5 specifically, HEVC, a real provider, and
-12 h session expiry.
+12 h session expiry (the cookie's own expiry was simulated, not waited out).
 
 ## 8. Sideloading and UAT procedure
 

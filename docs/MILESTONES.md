@@ -89,7 +89,7 @@ playing in native Media3/ExoPlayer and the remote driving the whole flow.
 | 7 | First-user administrator bootstrap is owner-controlled on public deployments | met | `INITIAL_ADMIN_TOKEN`, `IdentityService.hasLocalAdmin`; `tests/xtream-live.test.ts` |
 | 8 | Debug APK builds with a real SDK and Gradle; unit tests pass | met | `./gradlew testDebugUnitTest assembleDebug`, JDK 17 / SDK 34 / Gradle 8.9 |
 | 9 | Node tests, typecheck and production build stay green | met | see §Verification notes |
-| 10 | End-to-end flow on a TV-class WebView | met (emulator) | Android TV API 28 / WebView 66: setup, sign-in, guide, D-pad, native playback, Back releasing the relay |
+| 10 | End-to-end flow on a TV-class WebView | met (emulator) | Android TV API 28 / WebView 66: launcher start, setup, offline recovery, sign-in, guide, D-pad, native playback, Back releasing the relay, session across two restarts |
 | 11 | Real Fire TV device acceptance (launch, playback, remote, relaunch) | **pending** | requires Astra/user testing on physical hardware; procedure in `docs/ANDROID_FIRE_TV.md` §8 |
 
 Deliberate non-goals: VOD, series, catch-up, custom-channel pause/resume in the native player,
