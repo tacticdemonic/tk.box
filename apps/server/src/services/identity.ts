@@ -1,9 +1,11 @@
+import { timingSafeEqual } from 'node:crypto';
 import type { Db } from '../persistence/database.js';
 import type { PlexAdapter, PlexGrant } from '../providers/plex.js';
 import { Vault, opaque, digest } from '../security/vault.js';
 import { normalizeXtreamEndpoint } from '../providers/xtream.js';
 import { requireThat } from '../errors.js';
 
+export type BootstrapGuard = boolean | { enabled: boolean; requiredToken?: string; suppliedToken?: string; publicDeployment?: boolean };
 export class IdentityService {
   private authorizing = new Map<string,Promise<PlexGrant>>();
   constructor(private db: Db, private vault: Vault, private plex: PlexAdapter) {}
@@ -19,7 +21,16 @@ export class IdentityService {
   // Xtream-only sign-in: the application account is derived from the provider origin and
   // username, so the same subscription always resumes the same local identity. A provider
   // password never becomes an application credential and is never stored in a session.
-  async xtreamLogin(input: {serverUrl: string; username: string; password: string; allowInsecureHttp?: boolean}, authenticate: () => Promise<unknown>, bootstrapAdmin = false, now = Date.now()) {
+  hasLocalAdmin() { return !!this.db.prepare("SELECT 1 FROM xtream_identities WHERE role='admin'").get(); }
+  async xtreamLogin(input: {serverUrl: string; username: string; password: string; allowInsecureHttp?: boolean}, authenticate: () => Promise<unknown>, bootstrap: BootstrapGuard = false, now = Date.now()) {
+    const boot = typeof bootstrap === 'boolean' ? { enabled: bootstrap } : bootstrap;
+    if (boot.enabled && !this.hasLocalAdmin()) {
+      requireThat(!boot.publicDeployment || !!boot.requiredToken, 'BOOTSTRAP_LOCKED', 'Public deployment without Plex requires INITIAL_ADMIN_TOKEN.', 403);
+      if (boot.requiredToken) {
+        const ok = !!boot.suppliedToken && timingSafeEqual(Buffer.from(digest(boot.suppliedToken)), Buffer.from(digest(boot.requiredToken)));
+        requireThat(ok, 'BOOTSTRAP_TOKEN_REQUIRED', 'Valid initial administrator token is required to initialize this server.', 403);
+      }
+    }
     const account = await authenticate();
     const origin = normalizeXtreamEndpoint(input).serverUrl;
     const loginKey = digest(JSON.stringify([origin, input.username]));
@@ -28,10 +39,11 @@ export class IdentityService {
     // On a deployment with no Plex owner, the first identity bootstraps the administrator; every
     // later identity is a viewer unless an administrator promotes it. With Plex configured there
     // is already an administrator, so a provider login never grants that role.
-    const admin = existing ? existing.role === 'admin' : bootstrapAdmin && !this.db.prepare('SELECT 1 FROM xtream_identities').get();
+    let admin = false;
     // The identity row must exist before a session is issued, or authentication would fall
     // through to Plex; both writes are idempotent for a repeated login.
     this.db.transaction(() => {
+      admin = existing ? existing.role === 'admin' : boot.enabled && !this.hasLocalAdmin() && !this.db.prepare('SELECT 1 FROM xtream_identities').get();
       this.db.prepare('INSERT OR IGNORE INTO users(account_id) VALUES(?)').run(accountId);
       this.db.prepare('INSERT INTO xtream_identities(account_id,login_key,role,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET login_key=excluded.login_key,updated_at=excluded.updated_at')
         .run(accountId, loginKey, admin ? 'admin' : 'viewer', now, now);

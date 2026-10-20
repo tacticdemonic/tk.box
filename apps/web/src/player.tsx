@@ -7,7 +7,8 @@ import {readPreference} from './storage.js';
 import {CaptionCue,subtitleScale,subtitleSizes,updateSubtitleStyle,useSubtitleStyle,type SubtitleStyle} from './subtitle-style.js';
 import {LivePlaybackWatchdog} from './live-failover.js';
 import {StallMeter} from './stall-meter.js';
-import {qualityTiers,type Quality,type QualityOption} from '../../../packages/contracts/src/index.js';
+import type {Quality,QualityOption} from '../../../packages/contracts/src/index.js';
+import {qualityTiers} from '../../../packages/contracts/src/quality-tiers.js';
 export type PlayerHandle={stop:()=>{timeMs:number;started:boolean}};
 // Custom channels only: the viewer's own position behind the shared broadcast (IPTV stays strictly live).
 export type TimeshiftState={state:'LIVE'|'PAUSED'|'PLAYING_DELAYED'|'EXPIRED'|'STOPPED';behindLiveMs:number;viewerCursorUtc:number;broadcastNowUtc:number};

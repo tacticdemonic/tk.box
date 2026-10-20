@@ -1,3 +1,4 @@
+import './compat.js';
 import {lazy,Suspense,useCallback,useEffect,useRef,useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import type {Principal,Library,CatalogItem,CatalogPage,Quality,QualityOption} from '../../../packages/contracts/src/index.js';
@@ -13,18 +14,23 @@ import {HeaderSearch} from './header-search.js';
 const Settings=lazy(()=>import('./settings.js').then(m=>({default:m.Settings})));
 import {Live,ChannelPanel,rememberFeed,tuneTarget,hasFeed,stationName,type WatchChannel,type StationFeed} from './live.js';
 import {XtreamLogin} from './xtream-login.js';
+import {beginNativePlayback,endNativePlayback,nativePlaybackOutcome,onNativePlaybackEvent,type NativePlayback} from './native-player.js';
+import {installTvNavigation} from './tv-navigation.js';
 import './style.css';
 
 type VodSession={kind:'vod';id:string;streamUrl:string;delivery:Delivery;startOffsetMs:number;tracks?:MediaTracks;source?:SourceInfo;quality?:Quality;qualityOptions?:QualityOption[];audioStreamId?:string;item:CatalogItem};
 type Session=VodSession|LiveSession;
 const navigation=[['home','Home'],['movies','Movies'],['shows','TV Shows'],['live','Live TV']] as const;
 function App() {
-  const route=useRoute(),identity=useApi<Principal&{libraries?:Library[]}>('/me'),setup=useApi<{plexConfigured:boolean}>('/setup'),scrolled=useScrolled();
+  const route=useRoute(),identity=useApi<Principal&{libraries?:Library[]}>('/me'),setup=useApi<{plexConfigured:boolean;bootstrapTokenRequired?:boolean}>('/setup'),scrolled=useScrolled();
   const me=identity.error&&[401,403].includes(identity.error.status)?undefined:identity.data;
   const catalog=useApi<{libraries:Library[]}>(me&&!identity.data?.libraries?'/libraries':undefined),libraries=(identity.data?.libraries??catalog.data?.libraries??[]).filter(l=>['movie','show'].includes(l.type));
   const [session,setSession]=useState<Session>(),[error,setError]=useState(''),[busy,setBusy]=useState(false),[switching,setSwitching]=useState<'audio'|'quality'>(),[authUrl,setAuthUrl]=useState('');
   const failover=useRef(new LiveFailover()),[switchingLive,setSwitchingLive]=useState(false);
   const player=useRef<PlayerHandle>(null),sessionRef=useRef(session),returnTo=useRef('#home'),locking=useRef(false),routeRef=useRef(route);sessionRef.current=session;routeRef.current=route;
+  // On the Fire TV shell the live picture is native: the web player stays idle and never fetches
+  // the same session, so there is exactly one playback and one server relay per channel.
+  const nativeRef=useRef<NativePlayback|undefined>(undefined),[native,setNative]=useState<NativePlayback>();
   const libraryPage=route.page==='movies'||route.page==='shows',watching=route.page==='watch';
   const itemId=route.params.get('item');
   const searchReturnTo=useRef('#home');
@@ -49,7 +55,9 @@ function App() {
   async function action(fn:()=>Promise<void>) {if(locking.current)return;locking.current=true;setBusy(true);setError('');try{await fn();}catch(e){setError((e as Error).message);}finally{locking.current=false;setBusy(false);}}
   async function stop() {
     failover.current.cancel();setSwitchingLive(false);
-    const active=sessionRef.current,position=player.current?.stop();sessionRef.current=undefined;setSession(undefined);
+    const active=sessionRef.current,position=player.current?.stop();
+    endNativePlayback(window,nativeRef.current);nativeRef.current=undefined;setNative(undefined);
+    sessionRef.current=undefined;setSession(undefined);
     if(!active)return;
     if(active.kind==='live'){await api(`/live/sessions/${active.id}`,'DELETE');return;}
     // Detach local output first. Only an actually started VOD reports progress;
@@ -92,6 +100,9 @@ function App() {
     // A feed that cannot be started (offline, or a 4K source this server will not convert) moves on to the station's next feed.
     // The session keeps the station's feed list so the player can switch feeds without a guide lookup.
     const next=await recovery.tune(channel,program,()=>failover.current===recovery);if(!next)return;
+    // The TV shell plays the session itself; the web player is told to stay out of it.
+    const handoff=beginNativePlayback(window,{sessionId:next.id,streamUrl:next.streamUrl,title:channel.name,subtitle:program});
+    if(handoff){nativeRef.current=handoff;setNative(handoff);}
     sessionRef.current=next;setSession(next);window.location.hash='watch';
   }),[]);
   // Pause, Resume and Go Live for the current custom-channel session.
@@ -153,7 +164,20 @@ function App() {
     rememberFeed(current.channel.stack,id);watchChannel(tuneTarget(current.channel,id),current.program);
   };
   const logout=()=>void action(async()=>{try{await stop();}finally{await api('/auth/logout','POST');invalidate();setAuthUrl('');identity.reload();window.location.hash='home';}});
-  useEffect(()=>{if(identity.error&&[401,403].includes(identity.error.status)){failover.current.cancel();player.current?.stop();sessionRef.current=undefined;setSession(undefined);setSwitchingLive(false);}},[identity.error]);
+  useEffect(()=>{if(identity.error&&[401,403].includes(identity.error.status)){failover.current.cancel();player.current?.stop();endNativePlayback(window,nativeRef.current);nativeRef.current=undefined;setNative(undefined);sessionRef.current=undefined;setSession(undefined);setSwitchingLive(false);}},[identity.error]);
+  // Back, a playback error or a replaced player in the shell closes the relay here, so the
+  // FFmpeg session never outlives the viewer.
+  const reloadIdentity=useRef(identity.reload);reloadIdentity.current=identity.reload;
+  useEffect(()=>onNativePlaybackEvent(event=>{
+    const active=nativeRef.current,outcome=nativePlaybackOutcome(active,event);
+    if(!active||!outcome.release)return;
+    nativeRef.current=undefined;setNative(undefined);
+    sessionRef.current=undefined;setSession(undefined);
+    void api(`/live/sessions/${active.sessionId}`,'DELETE').catch(()=>{});
+    if(outcome.expired){reloadIdentity.current();return;}
+    if(outcome.message)setError(outcome.message);
+    window.location.hash=returnTo.current;
+  }),[]);
   const progress=(timeMs:number,state:'playing'|'paused'|'stopped')=>{const current=session;if(current?.kind!=='vod')return;void api(`/playback/sessions/${current.id}/progress`,'PATCH',{timeMs:Math.round(Math.min(timeMs,current.item.durationMs??timeMs)),state}).catch(e=>setError(e.message));};
   const vod=session?.kind==='vod'?session:undefined,channel=session?.kind==='live'?session:undefined,item=vod?.item;
   const subtitle=channel?channel.program:item?.type==='episode'?`${item.showTitle??''} · S${item.seasonNumber??'?'}:E${item.episodeNumber??'?'}`:item?.year?String(item.year):undefined;
@@ -161,14 +185,14 @@ function App() {
     {setup.error?<ErrorNotice message={setup.error.message} retry={setup.reload}/>:setup.data?.plexConfigured?<><button className="primary large" disabled={busy} onClick={()=>void action(async()=>{const result=await api<{authUrl:string}>('/auth/plex/start','POST');setAuthUrl(result.authUrl);window.open(result.authUrl,'_blank','noopener,noreferrer');})}>Sign in with Plex</button>
       {authUrl&&<div className="linking"><span className="spinner"/><p>Finish signing in on the Plex tab. tk.box connects automatically.</p><a href={authUrl} target="_blank" rel="noreferrer">Reopen Plex sign-in</a><button className="text-button" disabled={busy} onClick={()=>void action(checkAuth)}>I've signed in</button></div>}</>
     :<p>Set up your Plex server in the local configuration to enable Plex sign-in.</p>}
-    <XtreamLogin compact={!setup.data?.plexConfigured} onSignedIn={()=>{identity.reload();catalog.reload();}}/>
+    <XtreamLogin compact={!setup.data?.plexConfigured} bootstrapTokenRequired={setup.data?.bootstrapTokenRequired} onSignedIn={()=>{identity.reload();catalog.reload();}}/>
     <small className="muted">Your Plex password stays with Plex. Xtream credentials are stored encrypted on this server.</small></div></section>;
   const content=!me?signIn:route.page==='home'?<Home libraries={libraries} onOpen={openItem} onPlay={play} onWatch={watchChannel} busy={busy}/>
     :libraryPage?<LibraryView key={`${me.accountId}-${route.page}`} accountId={me.accountId} type={route.page==='movies'?'movie':'show'} libraries={libraries} params={route.params} onOpen={openItem} onPlay={play} onPlayAll={playAll}/>
     :route.page==='search'?<Search libraries={libraries} params={route.params} onOpen={openItem} onPlay={play} onSearchChange={changeSearch}/>
     :route.page==='live'?<Live key={me.accountId} admin={me.role==='admin'} params={route.params} accountId={me.accountId} onWatch={watchChannel} busy={busy} playing={session?.kind==='live'?session.channel.id:undefined}/>
     :route.page==='settings'?<div className="page"><Suspense fallback={<Loading/>}><Settings me={me} onLogout={logout}/></Suspense></div>
-    :watching?(!session&&<div className="page"><Empty title="Nothing is playing"><a href="#home">Find something to watch</a></Empty></div>)
+    :watching?(native?<div className="page native-playing"><Empty title={native.title??'Playing on your TV'}><p>Playback is running in the TV player. Press Back to return to channels.</p><button className="primary" onClick={()=>void action(async()=>{await stop();window.location.hash=returnTo.current;})}>Stop and browse channels</button></Empty></div>:!session&&<div className="page"><Empty title="Nothing is playing"><a href="#home">Find something to watch</a></Empty></div>)
     :<div className="page"><Empty title="Page not found"><a href="#home">Return home</a></Empty></div>;
   return <div className={`app page-${route.page}`}>
     <a className="skip-link" href="#main-content" onClick={e=>{e.preventDefault();document.getElementById('main-content')?.focus();}}>Skip to content</a>
@@ -183,8 +207,9 @@ function App() {
       {identity.loading&&!me?<div className="page"><Loading/></div>:<>{catalog.error&&<div className="page"><ErrorNotice message={catalog.error.message} retry={catalog.reload}/></div>}{content}</>}
     </main>
     {me&&!watching&&<nav className="tabbar" aria-label="Mobile navigation">{[...navigation,['search','Search'] as const].map(([page,label])=><a key={page} href={link(page)} aria-current={route.page===page?'page':undefined}><Icon name={page} size={22}/><span>{label.replace(' TV','').replace('TV ','')}</span></a>)}</nav>}
-    <PersistentPlayer key="persistent-player" ref={player} url={session?.streamUrl} live={!!channel} onChannel={channel&&(lineup.data?.channels.length??0)>1?stepChannel:undefined} channels={channel&&<ChannelPanel playing={channel.channel.id} busy={busy} onWatch={watchChannel}/>} feeds={channel?.channel.feeds?.map(f=>({id:f.id,label:stationName(f.name).label,...(f.quality?{quality:f.quality}:{})}))} feed={channel?.channel.id} onFeed={channel&&switchFeed}delivery={session?.delivery} startOffsetMs={vod?.startOffsetMs} tracks={vod?.tracks} programs={customId?programs??[]:undefined} source={session?.source} subtitleBase={vod?`/api/v1/playback/sessions/${vod.id}/subtitles/`:customId&&`/api/v1/live/sessions/${customId}/subtitles/`} switching={switching} liveSwitching={switchingLive} timeshift={channel?.timeshift?timeshift:undefined} onAudioChange={vod&&((id:string,timeMs:number)=>restart({audioStreamId:id},timeMs))} quality={vod?.quality} qualityOptions={vod?.qualityOptions} onQualityChange={vod&&((quality:Quality,timeMs:number)=>restart({quality},timeMs))} title={channel?channel.channel.name:item?.title} subtitle={subtitle} docked={!watching} onStop={()=>void action(async()=>{const back=watching;queue.current=undefined;await stop();if(back)window.location.hash=returnTo.current;})} onRestore={()=>{window.location.hash='watch';}} onBack={()=>{window.location.hash=returnTo.current;}} onProgress={progress} onEnded={vod&&advance} onError={playbackError}/>
+    <PersistentPlayer key="persistent-player" ref={player} url={native?'':session?.streamUrl} live={!!channel} onChannel={channel&&(lineup.data?.channels.length??0)>1?stepChannel:undefined} channels={channel&&<ChannelPanel playing={channel.channel.id} busy={busy} onWatch={watchChannel}/>} feeds={channel?.channel.feeds?.map(f=>({id:f.id,label:stationName(f.name).label,...(f.quality?{quality:f.quality}:{})}))} feed={channel?.channel.id} onFeed={channel&&switchFeed}delivery={session?.delivery} startOffsetMs={vod?.startOffsetMs} tracks={vod?.tracks} programs={customId?programs??[]:undefined} source={session?.source} subtitleBase={vod?`/api/v1/playback/sessions/${vod.id}/subtitles/`:customId&&`/api/v1/live/sessions/${customId}/subtitles/`} switching={switching} liveSwitching={switchingLive} timeshift={channel?.timeshift?timeshift:undefined} onAudioChange={vod&&((id:string,timeMs:number)=>restart({audioStreamId:id},timeMs))} quality={vod?.quality} qualityOptions={vod?.qualityOptions} onQualityChange={vod&&((quality:Quality,timeMs:number)=>restart({quality},timeMs))} title={channel?channel.channel.name:item?.title} subtitle={subtitle} docked={!watching} onStop={()=>void action(async()=>{const back=watching;queue.current=undefined;await stop();if(back)window.location.hash=returnTo.current;})} onRestore={()=>{window.location.hash='watch';}} onBack={()=>{window.location.hash=returnTo.current;}} onProgress={progress} onEnded={vod&&advance} onError={playbackError}/>
     {me&&itemId&&/^\d+$/.test(itemId)&&<Details key={itemId} id={itemId} onClose={closeItem} onOpen={openItem} onPlay={play} busy={busy} error={error}/>}
   </div>;
 }
+if ((window as Window & {TkBoxNative?: unknown}).TkBoxNative) installTvNavigation();
 createRoot(document.getElementById('root')!).render(<App/>);

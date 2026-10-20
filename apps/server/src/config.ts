@@ -11,6 +11,7 @@ const schema = z.object({
   DATA_DIR: z.string().default('./data'),
   CACHE_DIR: z.string().default('./data/cache'),
   SECRET_KEY_FILE: optionalText(z.string()),
+  INITIAL_ADMIN_TOKEN: optionalText(z.string().min(16).max(256)),
   PLEX_URL: z.string().url().default('http://127.0.0.1:32400'),
   PLEX_MACHINE_ID: optionalText(z.string().min(1)),
   PLEX_OWNER_ACCOUNT_ID: optionalText(z.string().regex(/^\d+$/)),
@@ -52,11 +53,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   });
   if (mediaRoots.some(root => !isAbsolute(root))) throw new Error('MEDIA_ROOTS must list absolute directories');
   if (pathMap.length && !mediaRoots.length) throw new Error('PLEX_PATH_MAP requires MEDIA_ROOTS');
+  const plexConfigured = !!(c.PLEX_MACHINE_ID && c.PLEX_OWNER_ACCOUNT_ID && c.PLEX_REQUIRED_LIBRARY_IDS.trim());
+  if (!plexConfigured && (c.DEPLOYMENT_MODE === 'remote' || c.PUBLIC_BASE_URL) && !c.INITIAL_ADMIN_TOKEN) throw new Error('Public or remote deployment without Plex requires INITIAL_ADMIN_TOKEN');
   return { ...c, DATA_DIR: resolve(c.DATA_DIR), CACHE_DIR: resolve(c.CACHE_DIR), trustedProxies,
     requiredLibraries: c.PLEX_REQUIRED_LIBRARY_IDS.split(',').map(v => v.trim()).filter(Boolean),
     secureCookies: !!c.PUBLIC_BASE_URL,
     localMedia: mediaRoots.length ? { roots: mediaRoots.map(root => resolve(root)), pathMap } : undefined,
-    plexConfigured: !!(c.PLEX_MACHINE_ID && c.PLEX_OWNER_ACCOUNT_ID && c.PLEX_REQUIRED_LIBRARY_IDS.trim()),
+    plexConfigured,
     browserOrigin: c.PUBLIC_BASE_URL ?? `http://${c.APP_HOST.includes(':') ? `[${c.APP_HOST}]` : c.APP_HOST}:${c.APP_PORT}`
   };
 }

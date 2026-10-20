@@ -73,18 +73,34 @@ with EPG, per-account access and provider connection limits.
 - No Android project code or APK.
 - No DRM handling or panel scraping.
 
-## M03 — Xtream VOD, series and catch-up
+## M03 — Android Fire TV MVP
+
+**Goal:** the first sideloadable APK: the existing React UI in a TV WebView, with live channels
+playing in native Media3/ExoPlayer and the remote driving the whole flow.
+
+| # | Criterion | Status | Evidence |
+| --- | --- | --- | --- |
+| 1 | TV-only `android/` project with leanback launcher, banner, server setup, persistent config | met | `android/`, `android/app/src/main/AndroidManifest.xml`, `docs/ANDROID_FIRE_TV.md` §2 |
+| 2 | Native HLS playback through Media3, launched from a successful tune | met | `PlayerActivity.kt`, `apps/web/src/native-player.ts`; `tests/firetv-bridge.test.ts` |
+| 3 | Authenticated playlist and segments from WebView cookies; no fetch monkey-patch | met | `WebViewCookies.kt`, `OriginCookieInterceptor.kt`; `SessionClientTest.kt` |
+| 4 | Back, errors and channel switches release the server relay; one player at a time | met | `PlayerActivity.kt` (`singleTop`, `onStop`, session `DELETE`), bridge tests |
+| 5 | D-pad navigation, focus ring, Back, IME and overscan | met | `apps/web/src/tv-navigation.ts`, `.tv-mode` styles; `tests/firetv-navigation.test.ts` |
+| 6 | Older WebView and 32-bit ARM compatibility | met and exercised on WebView 66 | `vite.config.ts` target, `apps/web/src/compat.ts`; four real failures found and fixed, `docs/ANDROID_FIRE_TV.md` §6 |
+| 7 | First-user administrator bootstrap is owner-controlled on public deployments | met | `INITIAL_ADMIN_TOKEN`, `IdentityService.hasLocalAdmin`; `tests/xtream-live.test.ts` |
+| 8 | Debug APK builds with a real SDK and Gradle; unit tests pass | met | `./gradlew testDebugUnitTest assembleDebug`, JDK 17 / SDK 34 / Gradle 8.9 |
+| 9 | Node tests, typecheck and production build stay green | met | see §Verification notes |
+| 10 | End-to-end flow on a TV-class WebView | met (emulator) | Android TV API 28 / WebView 66: launcher start, setup, offline recovery, sign-in, guide, D-pad, native playback, Back releasing the relay, session across two restarts |
+| 11 | Real Fire TV device acceptance (launch, playback, remote, relaunch) | **pending** | requires Astra/user testing on physical hardware; procedure in `docs/ANDROID_FIRE_TV.md` §8 |
+
+Deliberate non-goals: VOD, series, catch-up, custom-channel pause/resume in the native player,
+in-app updates, signed release builds.
+
+## M04 — Xtream VOD, series and catch-up
 
 - Normalise `get_vod_streams`, `get_series`, `get_series_info` into the catalogue model.
 - Reuse Plex-style VOD playback policy and the transcoder budget; direct play vs HLS by codec.
 - Movies/series browse UI, resume position; no DRM bypass, no catch-up unless documented.
-
-## M04 — Android / Fire TV MVP
-
-- Implement phase 1 from `docs/ANDROID_FIRE_TV.md`: TV-only `android/` module, WebView shell,
-  server URL entry, Media3 HLS/TS player, cookie sharing, leanback launcher, banner.
-- Acceptance on a Fire TV Stick 4K (Fire OS 7) and a 2nd-gen Stick (Fire OS 5): sign in, browse,
-  tune, zap, Back stops the relay, session survives relaunch.
+- Optional: native VOD playback in the TV shell, reusing `PlayerActivity`.
 
 ## M05 — Release hardening
 
@@ -92,3 +108,4 @@ with EPG, per-account access and provider connection limits.
 - Upstream sync cadence proven over several weeks; branch protection on `main`/`develop`.
 - Backup/restore of `data/` including the vault key; key rotation runbook.
 - Load check: 8 relays, 4 viewers per stream, provider connection ceilings.
+- Fire TV device matrix acceptance recorded per Fire OS version.

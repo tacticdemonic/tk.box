@@ -78,3 +78,17 @@ its provider, which is the smallest architecture that satisfies the milestone. T
 | Provider connection exhaustion | one in-flight catalogue operation per account; relays and checks share a per-provider lease |
 | Provider login brute force | per-IP rate limit (10/min), generic failure message, panel-side lockout |
 | Session theft | opaque HttpOnly cookie, hashed at rest, 12-hour expiry, CSRF origin check |
+
+## First-user administrator bootstrap (M03)
+
+On a Plex-less deployment the first provider identity becomes the administrator. That is safe
+only on a private LAN. On a public origin any visitor could win the race, so:
+
+- `INITIAL_ADMIN_TOKEN` (16–256 characters) is set by the operator. `loadConfig` refuses to
+  start when `PUBLIC_BASE_URL` or `DEPLOYMENT_MODE=remote` is used without Plex configuration
+  and without this token.
+- The first Xtream login must send `bootstrapToken` matching it. The check happens before the
+  provider panel is contacted and compares SHA-256 digests in constant time.
+- Once an administrator exists the token is ignored; later logins are viewers, and the setup
+  endpoint reports `bootstrapTokenRequired: false`.
+- A local (`DEPLOYMENT_MODE=local`) Plex-less deployment keeps the zero-configuration flow.
