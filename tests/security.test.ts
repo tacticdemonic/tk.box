@@ -139,6 +139,47 @@ test('rebranding preserves existing Plex links and sessions with secure and prev
   }
 });
 
+test('a Plex-less deployment reachable from another device always needs the bootstrap token', async () => {
+  const credentials = {serverUrl: 'https://provider.example:8443', username: 'viewer-name', password: 'secret-pass'};
+  // A synthetic panel: auth, an empty category list and no live streams.
+  const panel = async (endpoint: {url: string}) => {
+    const action = new URL(endpoint.url).searchParams.get('action') ?? 'auth';
+    return Buffer.from(JSON.stringify(action === 'auth'
+      ? {user_info: {auth: 1, status: 'Active', exp_date: String(Math.floor(Date.now() / 1000) + 86400)}, server_info: {timezone: 'Europe/London'}}
+      : []));
+  };
+  // Loopback-only development keeps zero-configuration bootstrap.
+  for (const host of ['127.0.0.1', '::1', 'localhost', '127.0.0.53']) {
+    assert.equal(loadConfig({APP_HOST: host}).loopbackOnly, true, host);
+    assert.doesNotThrow(() => loadConfig({APP_HOST: host}), host);
+  }
+  // Any other bind is reachable from the LAN, whatever the deployment-mode label says.
+  for (const host of ['0.0.0.0', '::', '192.168.1.10', '10.0.0.5', '100.64.0.1']) {
+    assert.equal(loadConfig({APP_HOST: host, INITIAL_ADMIN_TOKEN: 'owner-initial-token'}).loopbackOnly, false, host);
+    assert.throws(() => loadConfig({APP_HOST: host}), /INITIAL_ADMIN_TOKEN/, host);
+  }
+  assert.throws(() => loadConfig({DEPLOYMENT_MODE: 'remote', PUBLIC_BASE_URL: 'https://tv.example.com', APP_HOST: '127.0.0.1'}), /INITIAL_ADMIN_TOKEN/);
+
+  // The runtime guard agrees with configuration: a LAN listener without a token cannot bootstrap.
+  const lan = loadConfig({APP_HOST: '0.0.0.0', INITIAL_ADMIN_TOKEN: 'owner-initial-token'});
+  const db = openDatabase(':memory:'), vault = new Vault(randomBytes(32));
+  const app = await buildApp(lan, db, vault, new PlexAdapter(lan, 'lan-bootstrap', fakePlex({accountId: 1}).transport), false, 'tk.box', panel);
+  const headers = {origin: lan.browserOrigin};
+  try {
+    assert.equal((await app.inject({url: '/api/v1/setup'})).json().bootstrapTokenRequired, true);
+    const missing = await app.inject({method: 'POST', url: '/api/v1/auth/xtream/login', headers, payload: credentials});
+    assert.equal(missing.statusCode, 403);
+    assert.equal(missing.json().code, 'BOOTSTRAP_TOKEN_REQUIRED');
+    assert.ok(!missing.body.includes('owner-initial-token'));
+    const first = await app.inject({method: 'POST', url: '/api/v1/auth/xtream/login', headers, payload: {...credentials, bootstrapToken: 'owner-initial-token'}});
+    assert.equal(first.statusCode, 200, first.body);
+    assert.equal(first.json().role, 'admin');
+    // The token is configuration, never persisted with the account it created.
+    assert.ok(!JSON.stringify(db.prepare('SELECT * FROM xtream_identities').all()).includes('owner-initial-token'));
+    assert.ok(!JSON.stringify(db.prepare('SELECT * FROM audit').all()).includes('owner-initial-token'));
+  } finally {await app.close(); db.close();}
+});
+
 test('the Fire TV shell CSRF marker is accepted while a browser origin stays required', async () => {
   const db = openDatabase(':memory:'), vault = new Vault(randomBytes(32)), f = fakePlex({accountId: 1});
   const c = config();
@@ -155,11 +196,69 @@ test('the Fire TV shell CSRF marker is accepted while a browser origin stays req
     assert.equal(await rejects({origin: 'null', 'content-type': 'application/json'}), 403);
     assert.equal(await rejects({origin: 'null', 'x-requested-with': 'com.evil app', 'content-type': 'application/json'}), 403);
     assert.equal(await rejects({origin: 'null', 'x-requested-with': 'com.tkbox.tv/extra', 'content-type': 'application/json'}), 403);
+    assert.equal(await rejects({origin: 'null', 'x-requested-with': 'XMLHttpRequest', 'content-type': 'application/json'}), 403);
+    assert.equal(await rejects({origin: 'null', 'x-requested-with': 'com.tkbox.tv', 'sec-fetch-site': 'cross-site', 'content-type': 'application/json'}), 403);
     assert.equal(await rejects({origin: 'https://evil.example', 'x-requested-with': 'com.tkbox.tv', 'content-type': 'application/json'}), 403);
     assert.equal(await rejects({origin: 'null', 'x-requested-with': 'com.tkbox.tv', 'content-type': 'text/plain'}), 415);
     assert.equal(await rejects({'x-requested-with': 'com.tkbox.tv', 'content-type': 'application/json'}), 403);
     assert.equal((await post({origin, 'content-type': 'application/json'})).statusCode, 200);
+    assert.equal((await post({origin: 'null', 'x-requested-with': 'com.tkbox.tv', 'sec-fetch-site': 'same-origin', 'content-type': 'application/json'})).statusCode, 200);
+    // No CORS headers are ever emitted, so a hostile page's preflight cannot unlock the marker.
+    for (const preflight of [
+      {origin: 'null', 'access-control-request-method': 'POST', 'access-control-request-headers': 'x-requested-with,content-type'},
+      {origin: 'https://evil.example', 'access-control-request-method': 'POST', 'access-control-request-headers': 'content-type'}
+    ]) {
+      const answer = await app.inject({method: 'OPTIONS', url: '/api/v1/auth/logout', headers: preflight});
+      assert.equal(answer.headers['access-control-allow-origin'], undefined);
+      assert.equal(answer.headers['access-control-allow-headers'], undefined);
+      assert.equal(answer.headers['access-control-allow-methods'], undefined);
+    }
     // A GET is never origin-checked, as before.
     assert.equal((await app.inject({url: '/health'})).statusCode, 200);
+  } finally {await app.close(); db.close();}
+});
+
+test('the session cookie omits SameSite so an old WebView can hand it to the native player', async () => {
+  // WebView 66's CookieManager.getCookie() hides Lax/Strict cookies, which left the native
+  // player with no session. The server must therefore omit the attribute (browsers default it
+  // to Lax) rather than emit SameSite=Lax explicitly.
+  const db = openDatabase(':memory:'), vault = new Vault(randomBytes(32)), f = fakePlex({accountId: 1});
+  const c = config(), app = await buildApp(c, db, vault, new PlexAdapter(c, 'test', f.transport), false);
+  const origin = c.browserOrigin;
+  try {
+    const start = await app.inject({method: 'POST', url: '/api/v1/auth/plex/start', headers: {origin}, payload: {}});
+    const binding = start.cookies[0]!;
+    assert.equal(binding.sameSite, undefined);
+    const finish = await app.inject({method: 'POST', url: '/api/v1/auth/plex/status', headers: {origin, cookie: `${binding.name}=${binding.value}`}, payload: {}});
+    const session = finish.cookies.find(cookie => cookie.name === 'tk.box_local')!;
+    assert.equal(session.sameSite, undefined);
+    // HttpOnly is unchanged: page JavaScript still cannot read it.
+    assert.equal(session.httpOnly, true);
+  } finally {await app.close(); db.close();}
+});
+
+test('an HTTP provider login is accepted with the same explicit opt-in it was stored with', async () => {
+  const credentials = {serverUrl: 'https://provider.example:8443', username: 'viewer-name', password: 'secret-pass'};
+  const panel = async (endpoint: {url: string}) => {
+    const action = new URL(endpoint.url).searchParams.get('action') ?? 'auth';
+    return Buffer.from(JSON.stringify(action === 'auth'
+      ? {user_info: {auth: 1, status: 'Active', exp_date: String(Math.floor(Date.now() / 1000) + 86400)}, server_info: {timezone: 'Europe/London'}}
+      : []));
+  };
+  const db = openDatabase(':memory:'), vault = new Vault(randomBytes(32)), c = config();
+  const app = await buildApp(c, db, vault, new PlexAdapter(c, 'test', fakePlex({accountId: 1}).transport), false, 'tk.box', panel);
+  const headers = {origin: c.browserOrigin};
+  try {
+    const first = await app.inject({method: 'POST', url: '/api/v1/auth/xtream/login', headers, payload: credentials});
+    assert.equal(first.statusCode, 200, first.body);
+    // A plain-HTTP provider needs the opt-in both when stored and when looked up on sign-in;
+    // the lookup previously re-normalised without it and answered XTREAM_ENDPOINT_REJECTED.
+    const insecure = {...credentials, serverUrl: 'http://127.0.0.1:1', allowInsecureHttp: true};
+    const rejected = await app.inject({method: 'POST', url: '/api/v1/auth/xtream/login', headers, payload: {...insecure, allowInsecureHttp: false}});
+    assert.equal(rejected.statusCode, 400);
+    assert.equal(rejected.json().code, 'XTREAM_ENDPOINT_REJECTED');
+    // With the opt-in the endpoint is accepted; only the synthetic panel is unreachable.
+    const accepted = await app.inject({method: 'POST', url: '/api/v1/auth/xtream/login', headers, payload: insecure});
+    assert.notEqual(accepted.json().code, 'XTREAM_ENDPOINT_REJECTED');
   } finally {await app.close(); db.close();}
 });

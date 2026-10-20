@@ -1,8 +1,18 @@
 # tk.box implementation status
 
-Updated October 20, 2026. **M03 implemented and locally verified (Node + Android build); real-device Fire TV UAT and hosted-CI verification remain open.**
+Updated October 20, 2026. **M03.1 hardening implemented and locally verified (Node + Android build); real-device Fire TV UAT and hosted-CI verification remain open.**
 
-## Latest pass: M03 — Android Fire TV MVP
+## Latest pass: M03.1 — Fire TV security and UAT readiness
+
+- **Native playback was broken on WebView 66, and is fixed.** `CookieManager.getCookie()` on the API 28 / Chromium 66 image hides `SameSite` cookies, so the shell's snapshot never contained the session cookie and every native playlist request answered 401. The server now omits `SameSite` (`sameSite: false`, so browsers default to Lax) and `WebViewCookies.observe()` reuses the `Cookie` header of a same-origin request the WebView already made. Verified on the emulator: playlist, segments and the session DELETE all carry the cookie, and H.264/MPEG-TS playback runs with the picture advancing.
+- **HTTP provider sign-in fixed.** `XtreamStore.findByLogin` re-normalised the provider URL without the `allowInsecureHttp` opt-in, so a plain-HTTP panel authenticated and then failed with `XTREAM_ENDPOINT_REJECTED`. The flag is now passed through.
+- **Native credential leak fixed.** `OriginCookieInterceptor` attaches the WebView session cookie after OkHttp's redirect policy runs, so a followed 301/302/307/308 replayed the `Cookie` header to the redirect target, including a different origin. A two-`MockWebServer` test reproduced the cookie arriving at the foreign server. `SessionClient.client` now sets `followRedirects(false)`/`followSslRedirects(false)`, and the interceptor throws for any request outside the configured origin, so an HLS manifest naming a foreign segment or key cannot be fetched either. Covered by 4 new `SessionClientTest` cases plus the tightened origin test.
+- **LAN bootstrap hardened.** `loadConfig` now treats any non-loopback `APP_HOST` (`0.0.0.0`, `::`, a LAN IP) as reachable and refuses to start a Plex-less deployment without `INITIAL_ADMIN_TOKEN`, regardless of `DEPLOYMENT_MODE`. Strictly loopback-only development keeps zero-configuration bootstrap. The token is never logged or persisted; `/api/v1/setup` only exposes the boolean.
+- **Legacy WebView CSRF tightened.** The pre-83 WebView exception now requires the literal `Origin: null` **and** `X-Requested-With: com.tkbox.tv` (exact match, no pattern) and rejects `Sec-Fetch-Site: cross-site`. Tests assert hostile origins, other marker values and preflights receive no CORS headers. The CORS assumptions that would invalidate the exception are documented in `docs/ANDROID_FIRE_TV.md` §6.
+- **Physical UAT ready.** `docs/ANDROID_FIRE_TV.md` §8 is now an 18-row acceptance checklist with exact ADB install/diagnostic commands for an older Fire TV Stick. Physical acceptance is **not** claimed.
+- See `docs/ANDROID_FIRE_TV.md` and [auth model](AUTH_MODEL.md) for the invariants.
+
+## Previous pass: M03 — Android Fire TV MVP
 
 - `android/` is a standalone Kotlin/Gradle project: leanback launcher and banner, first-run server address with a connection test, persisted origin, hardened WebView for the existing React UI, and Media3/ExoPlayer HLS playback in `PlayerActivity`.
 - The web app exposes one explicit bridge (`apps/web/src/native-player.ts`): detect the shell, hand off `{sessionId, streamUrl, title}`, stop it, and listen for `tkbox:native-playback`. No `window.fetch` patching. Without the bridge, hls.js plays exactly as before; with it, `PersistentPlayer` gets an empty URL so the playlist is fetched once, by ExoPlayer.

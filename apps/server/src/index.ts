@@ -13,7 +13,7 @@ try {
   const idFile = join(config.DATA_DIR, 'client-id');
   if (!existsSync(idFile)) writeFileSync(idFile, randomUUID(), {flag: 'wx', mode: 0o600});
   const app = await buildApp(config, db, vault, new PlexAdapter(config, readFileSync(idFile, 'utf8')));
-  if (!['127.0.0.1', '::1', 'localhost'].includes(config.APP_HOST)) app.log.warn('Listener is reachable beyond loopback. Firewall this port and permit only your existing reverse proxy.');
+  if (!config.loopbackOnly) app.log.warn('Listener is reachable beyond loopback. Firewall this port and permit only your existing reverse proxy.');
   app.addHook('onClose', async () => { db.close(); });
   for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => { void app.close(); });
   await app.listen({host: config.APP_HOST, port: config.APP_PORT});
