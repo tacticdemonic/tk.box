@@ -40,13 +40,20 @@ class PlayerActivity : ComponentActivity() {
     }
 
     /**
-     * A repeated handoff for the session already playing is ignored. The page always stops the
-     * previous session before tuning another channel, so a different session here would mean two
-     * live relays and an untracked player; refusing keeps exactly one.
+     * A second handoff replaces the picture in place: the old relay is released before the new
+     * one starts, so there is never more than one live session and one player.
      */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        if (validatedTarget(intent)?.sessionId == sessionId) setIntent(intent)
+        setIntent(intent)
+        val target = validatedTarget(intent) ?: return
+        if (target.sessionId == sessionId) return
+        releaseRelay()
+        player?.release()
+        player = null
+        playerView?.player = null
+        setContentView(buildLayout(target.title, target.subtitle))
+        play(target)
     }
 
     private data class Target(val origin: String, val sessionId: String, val streamUrl: String, val title: String?, val subtitle: String?)
@@ -162,17 +169,22 @@ class PlayerActivity : ComponentActivity() {
         return super.onKeyDown(keyCode, event)
     }
 
+    /** Sends the session DELETE on a worker thread, at most once per player lifetime. */
+    private fun releaseRelay(): String? {
+        val session = lifetime?.release() ?: return null
+        val server = OriginPolicy.normalize(origin.orEmpty(), BuildConfig.ALLOW_CLEARTEXT)
+        if (server != null) Thread {
+            SessionClient(server, SessionClient.client(WebViewCookies, server)).stop(session)
+        }.start()
+        return session
+    }
+
     /** Stops the relay exactly once, then returns to the channel list. */
     private fun close(state: String, code: String?) {
-        val session = lifetime?.release() ?: return
+        val session = releaseRelay() ?: return
         player?.release()
         player = null
         playerView?.player = null
-        Thread {
-            OriginPolicy.normalize(origin.orEmpty(), BuildConfig.ALLOW_CLEARTEXT)?.let { server ->
-                SessionClient(server, SessionClient.client(WebViewCookies, server)).stop(session)
-            }
-        }.start()
         PlaybackOutcome.pending = PlaybackOutcome.Result(state, session, code)
         finish()
     }

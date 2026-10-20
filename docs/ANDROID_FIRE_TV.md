@@ -42,9 +42,10 @@ android/
       │  ├─ OriginCookieInterceptor.kt      # origin-scoped Cookie injection
       │  ├─ WebViewCookies.kt               # WebView CookieManager snapshot
       │  ├─ SessionClient.kt                # /health probe, authenticated session DELETE
+      │  ├─ PlaybackLifetime.kt            # one relay release per player
       │  ├─ ServerConfigStore.kt            # persisted server origin
       │  └─ TvViews.kt                      # D-pad-focusable TV controls
-      └─ test/java/com/tkbox/tv/            # OriginPolicy, BridgeValidator, SessionClient tests
+      └─ test/java/com/tkbox/tv/            # origin, bridge, cookie/media, lifetime tests
 ```
 
 The project is outside the npm workspace: no `package.json`, server or build-script changes
@@ -67,7 +68,7 @@ sequenceDiagram
     Shell->>Exo: start PlayerActivity (singleTop)
     Exo->>Server: GET playlist + MPEG-TS segments (Cookie, same origin)
     Note over Web: url="" for PersistentPlayer — no second playback
-    Exo->>Server: DELETE /api/v1/live/sessions/{id} (Back, error, stop)
+    Exo->>Server: DELETE /api/v1/live/sessions/{id} (Back, error, stop, onStop)
     Exo-->>Web: tkbox:native-playback {state, sessionId, code}
     Web->>Server: DELETE again (idempotent; 404/409 accepted)
 ```
@@ -81,8 +82,9 @@ sequenceDiagram
   `tests/firetv-bridge.test.ts`.
 - With a bridge, `PersistentPlayer` is passed `url=""`, so hls.js never attaches and the
   playlist is fetched once, by ExoPlayer.
-- `PlayerActivity` is `singleTop`: a second tune replaces the current player rather than
-  stacking one. It releases ExoPlayer and deletes the session on Back, on a playback error,
+- `PlayerActivity` is `singleTop`: a second handoff (`onNewIntent`) releases the old relay and
+  rebuilds the player in place, so a rapid re-tune never leaves two relays. Back is the route to
+  the guide; the native player handles Play/Pause itself. It releases ExoPlayer and deletes the session on Back, on a playback error,
   on a page `stopLiveStream()` call, and in `onStop` (Home, app switch, backgrounded).
 - H.264 video and AAC audio are demuxed from MPEG-TS by Media3's built-in `TsExtractor`;
   `DefaultLoadControl` buffers 15 s with a 60 s cap for slow Wi-Fi.
@@ -227,7 +229,7 @@ up/down on the remote changes channels through the existing lineup order.
 | OK | Opens details or starts the channel; opens the IME on text fields |
 | Back in a dialog | Closes the dialog, stays on the page |
 | Back in playback | Returns to the channel list; the server relay stops |
-| Channel switch | Old relay stops, one new player, no double audio |
+| Channel switch | Back to the guide, then tune another channel: the old relay stops before the new player starts |
 | Relaunch | Server address and session persist; no re-login within 12 h |
 | Server down | "Server unavailable" screen with Retry and Change address |
 | Logout | Returns to sign-in; cookies cleared |
@@ -264,6 +266,9 @@ Implemented and verified here:
 
 Known limitations:
 
+- The native player owns the remote while it is on screen: it handles Play/Pause and Back, but
+  channel up/down and the guide are reached by pressing Back first. The WebView's own channel
+  stepper remains available in browser playback.
 - Live TV only; VOD and custom-channel pause/resume stay in the WebView player (M04).
 - No in-app update manifest or signed release pipeline yet (M05).
 - Force-stop during playback skips the `DELETE`; the server's idle reaper is the fallback.
