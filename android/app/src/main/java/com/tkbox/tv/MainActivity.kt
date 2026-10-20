@@ -182,9 +182,7 @@ class MainActivity : ComponentActivity() {
         }
 
         @android.webkit.JavascriptInterface
-        fun stopLiveStream() = runOnUiThread {
-            sendBroadcast(Intent(PlayerActivity.ACTION_STOP).setPackage(packageName))
-        }
+        fun stopLiveStream() = PlayerActivity.stopCurrent()
 
         @android.webkit.JavascriptInterface
         fun isTv(): Boolean = true

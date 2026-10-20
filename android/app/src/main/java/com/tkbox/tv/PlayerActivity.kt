@@ -1,11 +1,7 @@
 package com.tkbox.tv
 
 import android.annotation.SuppressLint
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
-import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
 import android.view.KeyEvent
@@ -31,7 +27,6 @@ class PlayerActivity : ComponentActivity() {
     private var status: android.widget.TextView? = null
     private var overlay: android.widget.LinearLayout? = null
     private var lifetime: PlaybackLifetime? = null
-    private var receiver: BroadcastReceiver? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -41,7 +36,6 @@ class PlayerActivity : ComponentActivity() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() = close("ended", null)
         })
-        listenForStop()
         play(target)
     }
 
@@ -67,6 +61,7 @@ class PlayerActivity : ComponentActivity() {
     }
 
     private fun play(target: Target) {
+        current = this
         origin = target.origin
         sessionId = target.sessionId
         lifetime = PlaybackLifetime(target.sessionId)
@@ -154,15 +149,6 @@ class PlayerActivity : ComponentActivity() {
         if (player?.isPlaying == true) handler.postDelayed(hideOverlay, 4000)
     }
 
-    private fun listenForStop() {
-        val broadcast = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) = close("ended", null)
-        }
-        receiver = broadcast
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(broadcast, IntentFilter(ACTION_STOP), RECEIVER_NOT_EXPORTED)
-        else @Suppress("UnspecifiedRegisterReceiverFlag") registerReceiver(broadcast, IntentFilter(ACTION_STOP))
-    }
-
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         showOverlay()
         when (keyCode) {
@@ -198,8 +184,7 @@ class PlayerActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        receiver?.let { runCatching { unregisterReceiver(it) } }
-        receiver = null
+        if (current === this) current = null
         player?.release()
         player = null
         super.onDestroy()
@@ -211,7 +196,13 @@ class PlayerActivity : ComponentActivity() {
         const val EXTRA_STREAM_URL = "streamUrl"
         const val EXTRA_TITLE = "title"
         const val EXTRA_SUBTITLE = "subtitle"
-        const val ACTION_STOP = "com.tkbox.tv.STOP_PLAYBACK"
+
+        // The page's stop call targets the shell's own player directly; no broadcast is exported.
+        @Volatile private var current: PlayerActivity? = null
+
+        fun stopCurrent() {
+            current?.runOnUiThread { current?.close("ended", null) }
+        }
     }
 }
 
