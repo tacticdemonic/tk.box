@@ -1,9 +1,12 @@
 # Android / Fire TV App — M03 implementation
 
-Status: **implemented and exercised in M03 on `feature/firetv-mvp`**. The `android/` project
-builds a debug APK, automated tests cover the native-playback, cookie, origin and cleanup rules,
-and the flow was driven end to end on an **Android TV API 28 emulator whose WebView is Chromium
-66** — the same generation as Fire OS 5/6. Real Fire TV hardware is still **pending** (§9).
+Status: **implemented and exercised in M03/M03.1 on `feature/firetv-mvp` and
+`feature/m03-firetv-hardening`; M03.2 resolves the physical-Stick CSRF rejection and is ready
+for retest.** The `android/` project builds a debug APK, automated tests cover the
+native-playback, cookie, origin and cleanup rules, and the flow was driven end to end on an
+**Android TV API 28 emulator whose WebView is Chromium 66** — the same generation as Fire OS 5/6.
+Real Fire TV hardware is still **pending** (§9); M03.2's origin fix is verified by server tests
+and emulator reruns, not by a physical device.
 
 ## 1. Device targets
 
@@ -197,8 +200,17 @@ Chromium 66 replaces the page's `Origin` header with the literal `null` on `fetc
 `X-Requested-With: <package>`. `WebSettingsCompat.setRequestedWithHeaderOriginAllowList`
 (WebView 83+) fixes that but is unavailable here, so the server accepts
 `Origin: null` **plus** the shell's exact `X-Requested-With: com.tkbox.tv` as an equivalent CSRF
-signal. The marker is a literal package match (no pattern, no `XMLHttpRequest`), and any
-`Sec-Fetch-Site: cross-site` request carrying it is rejected.
+signal. The page also sets that header itself on every non-GET `api()` call when
+`window.TkBoxNative` is present (`apps/web/src/api.ts`), so the marker does not depend on a
+particular WebView build adding it, and `SessionClient.stop` sends it with the session `DELETE`.
+A repeated value (`com.tkbox.tv, com.tkbox.tv`, page plus WebView) still matches one package.
+Any other value, or a request with no marker, is rejected, as is any
+`Sec-Fetch-Site` other than `same-origin`/`none` (cross-site fetch metadata kills the exception
+even with the right marker).
+
+The marker exception is only needed when the WebView cannot send a real Origin. A modern Fire OS
+WebView sends `Origin: http://<server>:<port>`, which is checked against the configured origin
+instead; the two paths never overlap.
 
 Why a hostile page cannot use it:
 
@@ -216,8 +228,48 @@ Why a hostile page cannot use it:
 wildcard origin with credentials, or `Access-Control-Allow-Headers: x-requested-with` would let a
 sandboxed iframe or foreign page satisfy the marker itself; at that point the exception must be
 removed, or gated on something a page cannot forge. The same applies if `cookieOpts.sameSite`
-ever weakens from `lax`. Tests: `tests/security.test.ts`, "the Fire TV shell CSRF marker…",
-including preflight assertions.
+ever weakens from `lax`. Tests: `tests/security.test.ts`, "the Fire TV shell CSRF marker…", and
+`tests/csrf-origin.test.ts`.
+
+### Server origin configuration for LAN and Fire TV
+
+`APP_HOST` is the **listen** address. It is not the browser origin, and a wildcard
+(`0.0.0.0`, `::`) can never appear in an `Origin` header. The browser-facing origin is resolved
+in this order:
+
+1. `PUBLIC_BASE_URL` (HTTPS only; required for `DEPLOYMENT_MODE=remote`),
+2. `APP_ORIGIN` (HTTP or HTTPS, e.g. `http://192.168.1.10:3000` for LAN debugging),
+3. `http://<APP_HOST>:<APP_PORT>` for loopback and single-address binds.
+
+Set `APP_ORIGIN` whenever `APP_HOST` is a wildcard, or the server cannot know which LAN address
+the Fire Stick and browsers type. Both values are normalized to their RFC 6454 serialization
+(no trailing slash, default port omitted), so `PUBLIC_BASE_URL=https://tv.example.com/` matches
+an `Origin: https://tv.example.com`. `APP_ORIGIN` and `PUBLIC_BASE_URL` must agree when both are
+set, wildcard hosts and credentials/paths/queries are rejected at startup, and a wildcard bind
+without either logs a warning. Secure cookies follow HTTPS (`PUBLIC_BASE_URL` or an HTTPS
+`APP_ORIGIN`); LAN HTTP debug keeps plain cookies. No wildcard origin, dynamic origin or CORS
+allowance is introduced.
+
+### CSRF rejection diagnostics
+
+`CSRF_DIAGNOSTICS=true` logs one structured warning per rejected state-changing request:
+
+| Field | Contents |
+|---|---|
+| `requestId` | Fastify request id, for correlation with the 403 |
+| `method`, `route` | HTTP method and matched route template; the query string is dropped |
+| `originClass` | `missing`, `null`, `matched`, `mismatched`, `malformed` |
+| `requestOrigin` | The normalized scheme/host/port, or `null`; never a path or query |
+| `expectedOrigin` | The configured browser origin |
+| `xRequestedWith` | `shell_package`, `absent`, `other` (other values are not echoed) |
+| `secFetchSite` | `same-origin`, `same-site`, `cross-site`, `none`, `absent`, `other` |
+| `androidShell` | Marker present, or the `TkBoxTV/<version>` user-agent token |
+| `reason` | `cross_site_fetch_metadata`, `missing_origin`, `malformed_origin`, `null_origin_missing_marker`, `null_origin_invalid_marker`, `wildcard_bind_without_app_origin`, `origin_mismatch` |
+
+Cookies, `Authorization`, request bodies, Xtream credentials, provider URLs and query strings are
+never logged. Off by default. A `403 CSRF_REJECTED` with `mismatched` plus `wildcard_bind_without_app_origin`
+means `APP_ORIGIN` is missing; `null_origin_missing_marker` means the WebView sent `Origin: null`
+without the shell marker (the page bundle is older than this fix, or not running in the shell).
 
 ### Redirects and off-origin media
 
@@ -329,52 +381,87 @@ adb shell 'toybox nc -z -w 3 192.168.1.10 3000 && echo reachable || echo unreach
 If a previous build is installed and behaves oddly, remove it first (`adb uninstall com.tkbox.tv`)
 so the WebView cookie store and saved origin start clean.
 
-### 8.3 Acceptance checklist
+### 8.2a Verify the server's browser-facing origin first
 
-Run each row on the device and record Pass/Fail plus what was seen. Any Fail: capture the log
-(§8.4) before changing anything.
-
-| # | Test | Steps | Pass condition |
-|---|---|---|---|
-| 1 | Launcher | Home → Apps → Your Apps → tk.box | Banner and name present; starts from the TV launcher row |
-| 2 | Server entry | First run: type `http://192.168.1.10:3000` with the remote/IME | Text appears correctly; no overscan clipping of the field or buttons |
-| 3 | Connection test | **Test connection** | "Connected to …" within a few seconds |
-| 4 | Bad address | Enter a wrong host, **Test connection** | Clear failure message, app stays usable |
-| 5 | Sign-in | Xtream provider, username, password | Signs in; guide appears without a blank screen |
-| 6 | Bootstrap token | First sign-in on a fresh LAN server | Token field shown, wrong token refused, correct token grants admin |
-| 7 | Remote navigation | D-pad over header, filters, channel rows | Focus ring always visible and moves in the pressed direction; no focus traps |
-| 8 | Keyboard | Focus the search box, press OK | IME opens; typed text lands in the field; Back closes the IME only |
-| 9 | Programme guide | Open Live TV guide, move across the row | Programme times/now marker render; scrolling stays smooth on slow hardware |
-| 10 | Channel tune | OK on a channel | Picture and sound within a few seconds |
-| 11 | Audio/video | Watch ≥60 s | A/V in sync, no stutter loops, no green/black frames, overlay hides itself |
-| 12 | Pause/Play | Media keys or the overlay button | Pauses and resumes cleanly |
-| 13 | Back from playback | Press Back | Returns to the guide with focus restored; server relay stops |
-| 14 | Channel switching | Tune channel A, Back, tune channel B | B plays; only one relay exists at any time |
-| 15 | Session persistence | Force-stop (`adb shell am force-stop com.tkbox.tv`), relaunch | No re-login; server address and session survive |
-| 16 | Network failure | Stop the server (or pull Wi-Fi), relaunch | "Server unavailable" with Retry and Change address; Retry recovers after the server returns |
-| 17 | Auth failure | Revoke the session server-side, then tune | Returns to sign-in instead of retrying every feed |
-| 18 | Sleep/wake | Home, wait 2 min, reopen | App resumes without a stale player or a leaked relay |
-
-Verify the relay side while testing 13/14/16 — on the server host, the session's segment
-directory should disappear after Back:
+The Fire Stick failure in M03.1 (`403 CSRF_REJECTED`, "Request origin is not permitted") was a
+server origin-configuration fault, not an Android one: `APP_HOST=0.0.0.0` was being used as the
+expected browser origin, while the Stick sent `Origin: http://192.168.1.10:3000`. Run the server
+like this for LAN testing (or use `PUBLIC_BASE_URL` for remote HTTPS):
 
 ```bash
-ls "$CACHE_DIR/live" 2>/dev/null    # or: ls /var/cache/tk.box/live
+# .env (Plex-less LAN test also needs INITIAL_ADMIN_TOKEN)
+APP_HOST=0.0.0.0
+APP_PORT=3000
+APP_ORIGIN=http://192.168.1.10:3000    # exactly what the Stick enters, no trailing slash
+CSRF_DIAGNOSTICS=true                  # temporary; remove after the retest
 ```
+
+Confirm the server agrees before installing:
+
+```bash
+node --env-file=.env --import tsx -e \
+  "import {loadConfig} from './apps/server/src/config.ts'; const c=loadConfig(); console.log({listen:c.listenHost+':'+c.listenPort, browserOrigin:c.browserOrigin, secureCookies:c.secureCookies})"
+# expect { listen: '0.0.0.0:3000', browserOrigin: 'http://192.168.1.10:3000', secureCookies: false }
+```
+
+Then enter the **same** address (`http://192.168.1.10:3000`) on the Stick. If the two differ by
+host, scheme or port, every sign-in and state change will be refused with 403 by design.
+
+### 8.3 Focused M03.2 retest procedure
+
+Run these ten steps in order on the device and record Pass/Fail plus what was seen. Any Fail:
+capture the log and the CSRF diagnostic line (§8.4) before changing anything.
+
+| # | Step | Pass condition |
+|---|---|---|
+| 1 | Verify the server address: `APP_ORIGIN` (or `PUBLIC_BASE_URL`) equals what the Stick will enter (§8.2a) | `browserOrigin` printed by the config check matches the address exactly |
+| 2 | Confirm connectivity: `adb shell 'toybox nc -z -w 3 192.168.1.10 3000 && echo reachable'` | `reachable` |
+| 3 | Install the exact APK whose SHA-256 is in the PR (`adb install -r …`), launch, enter the server address, **Test connection** → **Save and continue** | "Connected to …"; the React UI loads |
+| 4 | Xtream sign-in (bootstrap token on a fresh Plex-less LAN server) | Signs in; no "Request origin is not permitted"; wrong token is refused on bootstrap |
+| 5 | Confirm authenticated API requests: open Settings/account and the Live TV channel list | Data loads; no 401/403 loop; server log shows no `csrf origin rejected` |
+| 6 | Browse the Live TV guide; move across header, filters and rows with the D-pad | Programme times/now marker render; focus ring always visible and moves in the pressed direction |
+| 7 | Tune a channel (OK) | `PlayerActivity` opens; picture within a few seconds |
+| 8 | Watch ≥60 s and check audio | A/V in sync, sound present, no stutter loop or green/black frames; overlay hides itself |
+| 9 | Press Back | Returns to the guide with focus restored; the relay stops and the session directory disappears (`ls "$CACHE_DIR/live"`) |
+| 10 | Force-stop (`adb shell am force-stop com.tkbox.tv`) and relaunch | No re-login; the server address and session survive |
+
+Additional checks when time allows: a wrong server address shows a clear failure; keyboard/IME
+in the search box; channel A → Back → channel B leaves one relay; server stopped shows "Server
+unavailable" with Retry and Change address; invalidated session returns to sign-in; Home for
+2 min then reopen leaves no stale player.
 
 ### 8.4 Capture diagnostics without credentials
 
+With `CSRF_DIAGNOSTICS=true`, the server writes one line per rejected mutation:
+
 ```bash
+journalctl -u tk.box -f | grep 'csrf origin rejected'      # systemd install
+# or, for a foreground dev server: it is already on stdout
+
+# What the Stick actually sends, captured without body or cookies:
+adb shell settings get global http_proxy >/dev/null 2>&1 || true
 adb logcat -c
-# reproduce the issue, then:
-adb logcat -d | grep -iE 'TkBox|tkbox|AndroidRuntime|Media3|ExoPlayer|chromium' > tkbox-firetv.log
+# reproduce the failure, then:
+adb logcat -d | grep -iE 'TkBox|tkbox|AndroidRuntime|Media3|ExoPlayer|chromium|console' > tkbox-firetv.log
 adb shell dumpsys package com.tkbox.tv | grep -E 'versionName|versionCode' >> tkbox-firetv.log
+adb shell dumpsys package com.amazon.webview | grep versionName >> tkbox-firetv.log
 ```
 
-The app logs no cookies, provider passwords or stream URLs, but WebView/Media3 framework lines
-can contain URLs and query strings. Scrub `Cookie:`, `password=`, `token=` and provider
-usernames before sharing. Useful facts to include: device model, Fire OS version, WebView
-version, the failing checklist row, and whether the server was reachable.
+Read the diagnostic `reason`:
+
+| `reason` | Meaning | Action |
+|---|---|---|
+| `wildcard_bind_without_app_origin` / `origin_mismatch` | Server expected an origin the Stick is not sending | Set `APP_ORIGIN` to the exact address the Stick uses (§8.2a); restart the server |
+| `missing_origin` / `null_origin_missing_marker` | Old WebView sent no usable Origin and no shell marker | Confirm the installed APK contains the M03.2 bundle (`X-Requested-With` set by `api.ts`); reinstall |
+| `null_origin_invalid_marker` | `Origin: null` with a different marker value | Reinstall the correct APK; do not relax the server |
+| `cross_site_fetch_metadata` | `Sec-Fetch-Site` was `cross-site`/`same-site` | Something is proxying or rewriting the request; inspect the proxy |
+| `malformed_origin` | Origin was not a bare scheme/host/port | Check the entered address |
+
+The app logs no cookies, provider passwords or stream URLs, and the CSRF line carries no query
+string, but WebView/Media3 framework lines can contain URLs. Scrub `Cookie:`, `password=`,
+`token=` and provider usernames before sharing. Useful facts to include: device model, Fire OS
+version, WebView version, the failing step, the full CSRF line, and whether the server was
+reachable.
 
 ### 8.5 What to report back
 

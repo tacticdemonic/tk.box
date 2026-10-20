@@ -14,9 +14,10 @@ try {
   if (!existsSync(idFile)) writeFileSync(idFile, randomUUID(), {flag: 'wx', mode: 0o600});
   const app = await buildApp(config, db, vault, new PlexAdapter(config, readFileSync(idFile, 'utf8')));
   if (!config.loopbackOnly) app.log.warn('Listener is reachable beyond loopback. Firewall this port and permit only your existing reverse proxy.');
+  if (config.unconfiguredWildcardOrigin) app.log.warn('APP_HOST is a wildcard bind address without APP_ORIGIN or PUBLIC_BASE_URL. Set APP_ORIGIN=http://<lan-ip>:<port> so LAN browsers and the Fire TV shell pass CSRF origin validation.');
   app.addHook('onClose', async () => { db.close(); });
   for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => { void app.close(); });
-  await app.listen({host: config.APP_HOST, port: config.APP_PORT});
+  await app.listen({host: config.listenHost, port: config.listenPort});
 } catch (e) {
   const code = (e as NodeJS.ErrnoException).code;
   process.stderr.write(JSON.stringify({level: 'error', code: code ?? 'STARTUP_FAILED', message: code === 'EADDRINUSE' ? 'Configured port is in use. Select an unused APP_PORT.' : 'Startup failed. Check configuration, state-directory permissions and dependency installation.'}) + '\n');

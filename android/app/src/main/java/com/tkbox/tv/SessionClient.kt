@@ -30,6 +30,7 @@ class SessionClient(private val origin: String, private val client: OkHttpClient
             .url("$origin/api/v1/live/sessions/$sessionId")
             .delete("{}".toRequestBody(JSON))
             .header("Origin", origin)
+            .header("X-Requested-With", "com.tkbox.tv")
             .header("Accept", "application/json")
             .build()
         return try {

@@ -46,6 +46,8 @@ class SessionClientTest {
             assertEquals("{}", recorded.body.readUtf8())
             assertEquals("application/json", recorded.getHeader("Content-Type")?.substringBefore(";"))
             assertEquals(server.url("/").toString().trimEnd('/'), recorded.getHeader("Origin"))
+            // The shell marker the server accepts alongside a null WebView Origin.
+            assertEquals("com.tkbox.tv", recorded.getHeader("X-Requested-With"))
             assertEquals("tk.box_local=token", recorded.getHeader("Cookie"))
             assertTrue(seen!!.endsWith("/api/v1/live/sessions/$session"))
         }
