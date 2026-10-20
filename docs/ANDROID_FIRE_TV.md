@@ -83,7 +83,7 @@ sequenceDiagram
   playlist is fetched once, by ExoPlayer.
 - `PlayerActivity` is `singleTop`: a second tune replaces the current player rather than
   stacking one. It releases ExoPlayer and deletes the session on Back, on a playback error,
-  on a stop broadcast, and in `onStop` (Home, app switch, process backgrounded).
+  on a page `stopLiveStream()` call, and in `onStop` (Home, app switch, backgrounded).
 - H.264 video and AAC audio are demuxed from MPEG-TS by Media3's built-in `TsExtractor`;
   `DefaultLoadControl` buffers 15 s with a 60 s cap for slow Wi-Fi.
 

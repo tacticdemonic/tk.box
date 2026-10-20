@@ -1,7 +1,7 @@
 package com.tkbox.tv
 
 /**
- * Guarantees one player, one relay release. Back, a playback error, a stop broadcast and the
+ * Guarantees one player, one relay release. Back, a playback error, a page stop call and the
  * activity stopping (Home, app switch) can all race; only the first caller claims the session.
  */
 class PlaybackLifetime(private val sessionId: String) {
