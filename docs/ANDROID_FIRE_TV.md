@@ -248,8 +248,9 @@ WebView and Media3 may still include URLs in framework logs, so scrub any `Cooki
 
 Implemented and verified here:
 
-- Android project builds with `./gradlew testDebugUnitTest` and `assembleDebug`; unit tests for
-  origin/URL rules, bridge input validation, cookie scoping and session release pass.
+- Android project builds with `./gradlew testDebugUnitTest` and `assembleDebug`; 16 unit tests
+  for origin/URL rules, bridge input validation, cookie scoping, authenticated playlist and
+  segment requests, and one-time session release pass.
 - Node tests cover the native bridge contract, browser fallback, TV navigation geometry, build
   target/polyfills and the bootstrap safeguard; typecheck and production build pass.
 

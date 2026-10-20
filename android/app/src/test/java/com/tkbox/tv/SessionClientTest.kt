@@ -100,3 +100,47 @@ class SessionClientTest {
         override fun withWriteTimeout(timeout: Int, unit: java.util.concurrent.TimeUnit) = this
     }
 }
+
+class HlsAuthenticationTest {
+    private val session = "S".repeat(24)
+
+    @Test
+    fun playlistAndSegmentRequestsCarryTheWebViewCookieAndOnlyToThisOrigin() {
+        MockWebServer().use { server ->
+            val origin = server.url("/").toString().trimEnd('/')
+            // The same OkHttp stack PlayerActivity hands to Media3's HLS data source.
+            val client = SessionClient.client(CookieSource { url ->
+                if (OriginPolicy.isTrusted(url, origin)) "tk.box_local=session-token" else null
+            }, origin)
+            val playlist = "$origin/api/v1/live/sessions/$session/index.m3u8"
+            val segment = "$origin/api/v1/live/sessions/$session/seg-1.ts"
+            server.enqueue(MockResponse().setBody("#EXTM3U\n#EXTINF:2,\nseg-1.ts\n"))
+            server.enqueue(MockResponse().setBody("TS"))
+
+            for (url in listOf(playlist, segment)) {
+                client.newCall(Request.Builder().url(url).build()).execute().use { response -> assertTrue(response.isSuccessful) }
+            }
+
+            val requests = List(2) { server.takeRequest() }
+            assertEquals(listOf("/api/v1/live/sessions/$session/index.m3u8", "/api/v1/live/sessions/$session/seg-1.ts"),
+                requests.map { it.path })
+            for (request in requests) {
+                assertEquals("tk.box_local=session-token", request.getHeader("Cookie"))
+                assertNull("a media GET needs no CSRF origin", request.getHeader("Origin"))
+            }
+        }
+    }
+
+    @Test
+    fun aSegmentFromAnotherOriginGetsNoCookie() {
+        MockWebServer().use { server ->
+            val origin = server.url("/").toString().trimEnd('/')
+            val client = SessionClient.client(CookieSource { "tk.box_local=session-token" }, origin)
+            server.enqueue(MockResponse().setBody("TS"))
+            // A playlist that pointed elsewhere is refused before Media3 ever requests it.
+            assertNull(OriginPolicy.resolveStream("https://evil.example/seg-1.ts", session, origin, false))
+            client.newCall(Request.Builder().url("$origin/api/v1/live/sessions/$session/seg-1.ts").build()).execute().close()
+            assertEquals("tk.box_local=session-token", server.takeRequest().getHeader("Cookie"))
+        }
+    }
+}

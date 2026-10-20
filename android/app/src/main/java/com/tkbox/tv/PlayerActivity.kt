@@ -29,6 +29,7 @@ class PlayerActivity : ComponentActivity() {
     private var sessionId: String? = null
     private var origin: String? = null
     private var status: android.widget.TextView? = null
+    private var overlay: android.widget.LinearLayout? = null
     private var lifetime: PlaybackLifetime? = null
     private var receiver: BroadcastReceiver? = null
 
@@ -60,6 +61,7 @@ class PlayerActivity : ComponentActivity() {
         playerView = view
         root.addView(view, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         val overlay = TvViews.column(this).apply { gravity = Gravity.CENTER }
+        this.overlay = overlay
         overlay.addTv(TvViews.text(this, title ?: "tk.box", 34f, bold = true))
         subtitle?.let { overlay.addTv(TvViews.text(this, it, 20f)) }
         val label = TvViews.text(this, "Starting playback…", 17f).apply { setTextColor(0xFFA0A0AB.toInt()) }
@@ -90,10 +92,12 @@ class PlayerActivity : ComponentActivity() {
             override fun onPlaybackStateChanged(state: Int) {
                 status?.text = when (state) {
                     Player.STATE_BUFFERING -> "Buffering…"
-                    Player.STATE_READY -> "LIVE"
+                    Player.STATE_READY -> null
                     else -> null
                 }
                 status?.visibility = if (status?.text.isNullOrEmpty()) android.view.View.GONE else android.view.View.VISIBLE
+                // Hide the title and Stop button once the picture is up; any key brings them back.
+                if (state == Player.STATE_READY) handler.postDelayed(hideOverlay, 4000) else handler.removeCallbacks(hideOverlay)
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -117,6 +121,17 @@ class PlayerActivity : ComponentActivity() {
         exo.playWhenReady = true
     }
 
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val hideOverlay = Runnable {
+        if (player?.isPlaying == true) overlay?.visibility = android.view.View.GONE
+    }
+
+    private fun showOverlay() {
+        overlay?.visibility = android.view.View.VISIBLE
+        handler.removeCallbacks(hideOverlay)
+        if (player?.isPlaying == true) handler.postDelayed(hideOverlay, 4000)
+    }
+
     private fun listenForStop() {
         val broadcast = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) = close("ended", null)
@@ -127,6 +142,7 @@ class PlayerActivity : ComponentActivity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        showOverlay()
         when (keyCode) {
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_HEADSETHOOK -> {
                 player?.let { if (it.isPlaying) it.pause() else it.play() }
@@ -144,13 +160,11 @@ class PlayerActivity : ComponentActivity() {
         player?.release()
         player = null
         playerView?.player = null
-        if (session != null) {
-            Thread {
-                OriginPolicy.normalize(origin.orEmpty(), BuildConfig.ALLOW_CLEARTEXT)?.let { server ->
-                    SessionClient(server, SessionClient.client(WebViewCookies, server)).stop(session)
-                }
-            }.start()
-        }
+        Thread {
+            OriginPolicy.normalize(origin.orEmpty(), BuildConfig.ALLOW_CLEARTEXT)?.let { server ->
+                SessionClient(server, SessionClient.client(WebViewCookies, server)).stop(session)
+            }
+        }.start()
         PlaybackOutcome.pending = PlaybackOutcome.Result(state, session, code)
         finish()
     }
