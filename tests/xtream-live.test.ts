@@ -13,6 +13,7 @@ import { IdentityService } from '../apps/server/src/services/identity.js';
 import { XtreamClient } from '../apps/server/src/providers/xtream.js';
 import { buildApp } from '../apps/server/src/app.js';
 import { PlexAdapter } from '../apps/server/src/providers/plex.js';
+import { loadConfig } from '../apps/server/src/config.js';
 import { config, fakePlex } from './fixtures.js';
 
 const future = () => String(Math.floor(Date.now() / 1000) + 86400);
@@ -250,4 +251,49 @@ test('upstream migrations still apply after the fork migration on a populated da
       assert.equal(db.pragma('foreign_keys', {simple: true}), 1, 'foreign keys are enforced for normal operation');
     } finally {db.close();}
   } finally {rmSync(folder, {recursive: true, force: true});}
+});
+
+test('the first provider identity becomes administrator only with an owner-controlled bootstrapping rule', async () => {
+  // A public deployment without Plex cannot initialize without INITIAL_ADMIN_TOKEN.
+  assert.throws(() => loadConfig({PUBLIC_BASE_URL: 'https://tv.example.com'}), /INITIAL_ADMIN_TOKEN/);
+  assert.throws(() => loadConfig({DEPLOYMENT_MODE: 'remote', PUBLIC_BASE_URL: 'https://tv.example.com'}), /INITIAL_ADMIN_TOKEN/);
+  assert.doesNotThrow(() => loadConfig({PUBLIC_BASE_URL: 'https://tv.example.com', INITIAL_ADMIN_TOKEN: 'owner-initial-token'}));
+  // A Plex-configured deployment never needs the token.
+  assert.doesNotThrow(() => loadConfig({PUBLIC_BASE_URL: 'https://tv.example.com', PLEX_MACHINE_ID: 'machine', PLEX_OWNER_ACCOUNT_ID: '1', PLEX_REQUIRED_LIBRARY_IDS: '10'}));
+
+  const {transport} = panel();
+  const db = openDatabase(':memory:'), vault = new Vault(randomBytes(32)), fixture = fakePlex({accountId: 1});
+  const publicConfig = loadConfig({PUBLIC_BASE_URL: 'https://tv.example.com', INITIAL_ADMIN_TOKEN: 'owner-initial-token'});
+  const app = await buildApp(publicConfig, db, vault, new PlexAdapter(publicConfig, 'test', fixture.transport), false, 'tk.box', transport);
+  const headers = {origin: 'https://tv.example.com'};
+  try {
+    const setup = await app.inject({url: '/api/v1/setup'});
+    assert.equal(setup.json().bootstrapTokenRequired, true);
+    // Unauthenticated first sign-in cannot claim the administrator role.
+    const missing = await app.inject({method: 'POST', url: '/api/v1/auth/xtream/login', headers, payload: credentials});
+    assert.equal(missing.statusCode, 403);
+    assert.equal(missing.json().code, 'BOOTSTRAP_TOKEN_REQUIRED');
+    const wrong = await app.inject({method: 'POST', url: '/api/v1/auth/xtream/login', headers, payload: {...credentials, bootstrapToken: 'not-the-owner-token'}});
+    assert.equal(wrong.statusCode, 403);
+    assert.ok(!wrong.body.includes('owner-initial-token'));
+    // The owner initializes the deployment with the server-configured token.
+    const first = await app.inject({method: 'POST', url: '/api/v1/auth/xtream/login', headers, payload: {...credentials, bootstrapToken: 'owner-initial-token'}});
+    assert.equal(first.statusCode, 200, first.body);
+    assert.equal(first.json().role, 'admin');
+    assert.equal((await app.inject({url: '/api/v1/setup'})).json().bootstrapTokenRequired, false);
+    // Once an administrator exists, later sign-ins need no token and never become administrators.
+    const second = await app.inject({method: 'POST', url: '/api/v1/auth/xtream/login', headers, payload: {...credentials, username: 'second-user'}});
+    assert.equal(second.statusCode, 200, second.body);
+    assert.equal(second.json().role, 'viewer');
+  } finally {await app.close(); db.close();}
+
+  // A local deployment without Plex keeps the existing zero-configuration first-user flow.
+  const localDb = openDatabase(':memory:'), localVault = new Vault(randomBytes(32)), localConfig = loadConfig({});
+  const local = await buildApp(localConfig, localDb, localVault, new PlexAdapter(localConfig, 'test', fakePlex({accountId: 1}).transport), false, 'tk.box', panel().transport);
+  try {
+    assert.equal((await local.inject({url: '/api/v1/setup'})).json().bootstrapTokenRequired, false);
+    const first = await local.inject({method: 'POST', url: '/api/v1/auth/xtream/login', headers: {origin: 'http://127.0.0.1:3000'}, payload: credentials});
+    assert.equal(first.statusCode, 200, first.body);
+    assert.equal(first.json().role, 'admin');
+  } finally {await local.close(); localDb.close();}
 });

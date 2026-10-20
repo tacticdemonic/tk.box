@@ -2,17 +2,18 @@ import {useState} from 'react';
 import {api} from './api.js';
 import {ErrorNotice} from './components.js';
 
-type Props = {onSignedIn: () => void; compact?: boolean};
+type Props = {onSignedIn: () => void; compact?: boolean; bootstrapTokenRequired?: boolean};
 
 // Xtream-only sign-in. The provider credentials authenticate the application session; the panel
 // password is sent once and never kept in browser storage.
-export function XtreamLogin({onSignedIn, compact = false}: Props) {
+export function XtreamLogin({onSignedIn, compact = false, bootstrapTokenRequired = false}: Props) {
   const [open, setOpen] = useState(compact), [busy, setBusy] = useState(false), [error, setError] = useState('');
   const [serverUrl, setServerUrl] = useState(''), [username, setUsername] = useState(''), [password, setPassword] = useState(''), [insecure, setInsecure] = useState(false);
+  const [bootstrapToken, setBootstrapToken] = useState('');
   const submit = async () => {
     setBusy(true); setError('');
     try {
-      await api('/auth/xtream/login', 'POST', {serverUrl, username, password, allowInsecureHttp: insecure});
+      await api('/auth/xtream/login', 'POST', {serverUrl, username, password, allowInsecureHttp: insecure, ...(bootstrapToken ? {bootstrapToken} : {})});
       onSignedIn();
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
@@ -26,6 +27,7 @@ export function XtreamLogin({onSignedIn, compact = false}: Props) {
         <label>Username<input value={username} required maxLength={128} autoComplete="username" onChange={e => setUsername(e.target.value)}/></label>
         <label>Password<input type="password" value={password} required maxLength={128} autoComplete="current-password" onChange={e => setPassword(e.target.value)}/></label>
         <label><input type="checkbox" checked={insecure} onChange={e => setInsecure(e.target.checked)}/> The provider uses plain HTTP</label>
+        {bootstrapTokenRequired&&<label>Initial administrator token<input type="password" value={bootstrapToken} maxLength={256} autoComplete="off" onChange={e => setBootstrapToken(e.target.value)}/><small>Only the first sign-in on a new server needs this. It is set by the server operator.</small></label>}
         {error && <ErrorNotice message={error}/>}
         <button className="primary large" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
       </form>

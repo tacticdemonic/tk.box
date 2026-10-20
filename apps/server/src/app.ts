@@ -105,10 +105,11 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   // identity service only after the Xtream panel accepted the credentials.
   app.post('/api/v1/auth/xtream/login', {config: {rateLimit: {max: 10, timeWindow: 60000}}}, async (req, reply) => {
     const input = z.object({serverUrl: z.string().trim().min(1).max(2048), username: z.string().min(1).max(128), password: z.string().min(1).max(128),
-      allowInsecureHttp: z.boolean().default(false), name: z.string().trim().min(1).max(120).optional()}).strict().parse(req.body);
+      allowInsecureHttp: z.boolean().default(false), name: z.string().trim().min(1).max(120).optional(), bootstrapToken: z.string().trim().min(1).max(256).optional()}).strict().parse(req.body);
     const credentials = {serverUrl: input.serverUrl, username: input.username, password: input.password, allowInsecureHttp: input.allowInsecureHttp};
     // The panel must accept the credentials before a session or a provider row exists.
-    const login = await identity.xtreamLogin(credentials, () => new XtreamClient(credentials, xtreamTransport).authenticate(), !config.plexConfigured);
+    const login = await identity.xtreamLogin(credentials, () => new XtreamClient(credentials, xtreamTransport).authenticate(),
+      {enabled: !config.plexConfigured, requiredToken: config.INITIAL_ADMIN_TOKEN, suppliedToken: input.bootstrapToken, publicDeployment: config.DEPLOYMENT_MODE === 'remote' || !!config.PUBLIC_BASE_URL});
     let account = xtream.findByLogin(credentials.serverUrl, credentials.username);
     if (!account) account = xtream.create(login.accountId, {name: input.name ?? new URL(credentials.serverUrl).hostname, credentials});
     else {
@@ -194,7 +195,7 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   app.delete<{Params: {id: string}}>('/api/v1/live/sessions/:id', async req => { const {hash} = await auth(req); live.stop(req.params.id, hash); customTv.stop(req.params.id, hash); return {status: 'stopped'}; });
   registerCatalog(app,plex,auth);
   app.get('/health', async () => ({status: 'ok'}));
-  app.get('/api/v1/setup', async () => ({plexConfigured: config.plexConfigured, milestone: 0}));
+  app.get('/api/v1/setup', async () => ({plexConfigured: config.plexConfigured, bootstrapTokenRequired: !config.plexConfigured && !!config.INITIAL_ADMIN_TOKEN && !identity.hasLocalAdmin(), milestone: 0}));
   app.post('/api/v1/auth/plex/start', { config: {rateLimit: {max: 10, timeWindow: 60000}} }, async (_req, reply) => {
     requireThat(config.plexConfigured, 'SETUP_REQUIRED', 'Configure Plex owner, machine and library IDs.', 503);
     const start = await identity.start(); reply.setCookie(linkCookie, start.binding, {...cookieOpts, maxAge: 600}); return {authUrl: start.authUrl};
