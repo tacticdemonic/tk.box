@@ -22,13 +22,17 @@ export function spatialNext(boxes: Box[], current: number, direction: Direction)
   return best;
 }
 const focusable = 'a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+// Containers with tabindex=-1 (main, dialogs) are skipped deliberately: the TV remote moves
+// between controls, and a ring around a whole region reads as an error.
 const editable = (element: Element | null) => element instanceof HTMLElement && (element.matches('input:not([type=range]):not([type=checkbox]),textarea') && !element.hasAttribute('readonly'));
 const choices = (element: Element | null) => element instanceof HTMLElement && element.matches('select,input[type=range]');
 const visible = (element: HTMLElement) => {
   const box = element.getBoundingClientRect(), style = window.getComputedStyle(element);
   return box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
 };
-const candidates = () => Array.from(document.querySelectorAll<HTMLElement>(focusable)).filter(element => visible(element) && !element.closest('[inert]'));
+// The skip link exists for keyboards; on a TV it would be the first stop from anywhere.
+const candidates = () => Array.from(document.querySelectorAll<HTMLElement>(focusable))
+  .filter(element => visible(element) && !element.closest('[inert]') && !element.matches('.skip-link'));
 const move = (direction: Direction) => {
   const items = candidates();
   if (!items.length) return;
@@ -66,11 +70,20 @@ export function installTvNavigation() {
   window.addEventListener('keydown', onKey);
   // The shell calls this before its own Back handling, so a modal never traps the remote.
   (window as Window & {TkBoxTv?: {handleBack: () => boolean}}).TkBoxTv = {handleBack: handleTvBack};
-  // Stopping playback returns to the guide: put the remote back where the viewer left it.
+  // Stopping playback returns to the guide: put the remote back on the channel that was playing,
+  // or on the control that started it, so one OK press resumes where the viewer was.
   let returnFocus: HTMLElement | null = null;
   window.addEventListener('hashchange', () => {
-    if (location.hash.startsWith('#watch')) returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    else if (returnFocus?.isConnected) {returnFocus.focus({preventScroll: true}); returnFocus = null;}
+    if (location.hash.startsWith('#watch')) {
+      returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      return;
+    }
+    const saved = returnFocus?.isConnected && visible(returnFocus) ? returnFocus : null;
+    returnFocus = null;
+    // A row can be re-rendered while the native player is up, so fall back to a stable control:
+    // the current section's nav link, which is always small and always present.
+    const fallback = document.querySelector<HTMLElement>('.nav-links [aria-current=page], .nav-links a');
+    (saved ?? fallback)?.focus({preventScroll: true});
   });
   return () => window.removeEventListener('keydown', onKey);
 }

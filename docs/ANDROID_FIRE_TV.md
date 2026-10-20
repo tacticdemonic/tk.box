@@ -1,9 +1,9 @@
 # Android / Fire TV App — M03 implementation
 
-Status: **implemented in M03 on `feature/firetv-mvp`**. The `android/` project builds a debug
-APK, and every native-playback, cookie, origin and cleanup rule below is covered by automated
-tests. Real-device UAT is **pending** — see §9. No claim in this document substitutes a build
-or a unit test for a Fire TV.
+Status: **implemented and exercised in M03 on `feature/firetv-mvp`**. The `android/` project
+builds a debug APK, automated tests cover the native-playback, cookie, origin and cleanup rules,
+and the flow was driven end to end on an **Android TV API 28 emulator whose WebView is Chromium
+66** — the same generation as Fire OS 5/6. Real Fire TV hardware is still **pending** (§9).
 
 ## 1. Device targets
 
@@ -144,12 +144,42 @@ That is a race on a public host: whoever signs in first owns the instance. M03 a
   walks WebView history, then exits.
 - Focus is visible: 3 px accent ring, offset 4 px, plus a tinted background on guide cells.
   The shell adds `.tv-mode`, which applies 3.5 v/h overscan padding.
-- Stopping playback returns focus to the control that started it (hashchange in
+- Stopping playback returns focus to the control that started it, or to the current section's
+  nav link when the row was re-rendered while the native player was up (hashchange in
   `tv-navigation.ts`).
-- Older WebViews: the Vite build targets `chrome61` + `es2018`, and `apps/web/src/compat.ts`
-  fills only the builtins the bundle calls (`Object.fromEntries`, `Array.prototype.at`,
-  `String.prototype.replaceAll`, `Promise.allSettled`, `AbortSignal.timeout/any`,
-  `queueMicrotask`). `tests/firetv-navigation.test.ts` asserts the target and the polyfills.
+- The skip link stays keyboard-only; it is excluded from TV focus so the remote never lands on
+  invisible navigation.
+
+### WebView compatibility (measured, not assumed)
+
+Chromium 66 on an Android TV image exposed four real failures, each fixed and re-verified:
+
+| Failure | Cause | Fix |
+|---|---|---|
+| Blank page, no API calls | `globalThis` undefined aborts the bundle | polyfill in `compat.ts`, imported first |
+| `[9,15].flatMap is not a function` | React's JSX transform uses `flat`/`flatMap` (Chrome 69) | polyfills |
+| Bundle parse error on `BigInt` | one runtime import of `qualityTiers` pulled all of zod in | `packages/contracts/src/quality-tiers.ts` is zod-free; the player imports it |
+| Nav labels collide, zero padding | `clamp()` (Chrome 79) and `min()` unsupported; inside a custom property an invalid value is accepted and then computes to nothing | `.legacy-css` class applied by a layout probe, with plain fallbacks |
+
+`gap` is the subtle one: `@supports (gap: 1px)` is **true** on Chromium 66 because *grid* gap
+exists, while *flex* gap does not. `compat.ts` therefore measures real layout and adds
+`.legacy-flex-gap`, whose rules are flat `.legacy-flex-gap .selector{margin-left:…}` — CSS
+nesting is not available on that WebView either.
+
+The Vite build targets `chrome61` + `es2018`. `tests/firetv-navigation.test.ts` asserts the
+target, the polyfills and the fallback hooks. The app logs one line,
+`TkBoxCompat flexGap=… modernCss=… chrome=…`, so a UAT log states the WebView's capabilities
+without any credential.
+
+### CSRF from an old WebView
+
+Chromium 66 replaces the page's `Origin` header with the literal `null` on `fetch`, and adds
+`X-Requested-With: <package>`. `WebSettingsCompat.setRequestedWithHeaderOriginAllowList`
+(WebView 83+) fixes that but is unavailable here, so the server accepts
+`Origin: null` **plus** a well-formed `X-Requested-With` from the shell as an equivalent CSRF
+signal: a cross-origin page cannot set a custom header without a preflight this server never
+allows. Browsers are still checked on `Origin` alone
+(`tests/security.test.ts`, "the Fire TV shell CSRF marker…").
 
 ## 7. Build and test commands
 
@@ -168,6 +198,25 @@ cd android
 ```
 
 The APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
+
+### Emulator run (M03 evidence)
+
+`android-34;android-tv;x86` under KVM, WebView 66.0.3359.158, 960×540 CSS viewport:
+
+```bash
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+adb reverse tcp:3000 tcp:3000          # the server stays on loopback
+adb shell am start -n com.tkbox.tv/.MainActivity
+```
+
+Verified on that device: first-run server entry and connection test; the React sign-in and
+guide rendering; D-pad focus with a visible ring across header, filters and guide row; a
+successful tune handing off to `PlayerActivity`; H.264/MPEG-TS playback with the picture
+advancing and the overlay auto-hiding; Back returning to the guide; and the server-side FFmpeg
+relay and its segment directory disappearing once Back is pressed.
+
+Not covered by that run: a physical Stick, Fire OS 5 specifically, HEVC, a real provider, and
+12 h session expiry.
 
 ## 8. Sideloading and UAT procedure
 
@@ -256,6 +305,9 @@ Implemented and verified here:
 - Node tests cover the native bridge contract, browser fallback, TV navigation geometry, build
   target/polyfills and the bootstrap safeguard; typecheck and production build pass.
 
+**Verified on the API 28 TV emulator (WebView 66):** launch, setup, connection test, sign-in,
+guide, D-pad focus, native HLS playback, Back, relay release. See §7.
+
 **Not verified — pending hardware UAT:**
 
 - Launch from the Fire TV launcher, D-pad feel, IME, and overscan on an actual Stick.
@@ -269,6 +321,9 @@ Known limitations:
 - The native player owns the remote while it is on screen: it handles Play/Pause and Back, but
   channel up/down and the guide are reached by pressing Back first. The WebView's own channel
   stepper remains available in browser playback.
+- Feed failover (`LiveFailover`) runs at tune time and on a WebView playback error. In native
+  playback a failed stream returns to the guide with a message; automatic backup-feed retry
+  inside `PlayerActivity` is deferred to M04, as is a stall watchdog.
 - Live TV only; VOD and custom-channel pause/resume stay in the WebView player (M04).
 - No in-app update manifest or signed release pipeline yet (M05).
 - Force-stop during playback skips the `DELETE`; the server's idle reaper is the fallback.

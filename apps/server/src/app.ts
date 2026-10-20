@@ -69,7 +69,12 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
     reply.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self'; connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'");
     if (config.secureCookies) reply.header('Strict-Transport-Security', 'max-age=31536000');
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-      requireThat(req.headers.origin === config.browserOrigin, 'CSRF_REJECTED', 'Request origin is not permitted.', 403);
+      // Chromium WebView before 83 replaces the page Origin with "null" and marks the request
+      // X-Requested-With: <package>. That marker is set by the shell only, and a cross-origin page
+      // cannot send a custom header without a preflight this server never allows, so it is an
+      // equally strong CSRF signal. Browsers continue to be checked on Origin alone.
+      const shellRequest = req.headers.origin === 'null' && /^[\w.]+$/.test(String(req.headers['x-requested-with'] ?? ''));
+      requireThat(req.headers.origin === config.browserOrigin || shellRequest, 'CSRF_REJECTED', 'Request origin is not permitted.', 403);
       requireThat(req.headers['content-type']?.split(';')[0] === 'application/json', 'INVALID_CONTENT_TYPE', 'Use application/json.', 415);
     }
     for (const migration of legacyCookies) {

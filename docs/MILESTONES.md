@@ -85,11 +85,12 @@ playing in native Media3/ExoPlayer and the remote driving the whole flow.
 | 3 | Authenticated playlist and segments from WebView cookies; no fetch monkey-patch | met | `WebViewCookies.kt`, `OriginCookieInterceptor.kt`; `SessionClientTest.kt` |
 | 4 | Back, errors and channel switches release the server relay; one player at a time | met | `PlayerActivity.kt` (`singleTop`, `onStop`, session `DELETE`), bridge tests |
 | 5 | D-pad navigation, focus ring, Back, IME and overscan | met | `apps/web/src/tv-navigation.ts`, `.tv-mode` styles; `tests/firetv-navigation.test.ts` |
-| 6 | Older WebView and 32-bit ARM compatibility | met (build/unit level) | `vite.config.ts` target, `apps/web/src/compat.ts`, `minSdk 22` |
+| 6 | Older WebView and 32-bit ARM compatibility | met and exercised on WebView 66 | `vite.config.ts` target, `apps/web/src/compat.ts`; four real failures found and fixed, `docs/ANDROID_FIRE_TV.md` §6 |
 | 7 | First-user administrator bootstrap is owner-controlled on public deployments | met | `INITIAL_ADMIN_TOKEN`, `IdentityService.hasLocalAdmin`; `tests/xtream-live.test.ts` |
 | 8 | Debug APK builds with a real SDK and Gradle; unit tests pass | met | `./gradlew testDebugUnitTest assembleDebug`, JDK 17 / SDK 34 / Gradle 8.9 |
 | 9 | Node tests, typecheck and production build stay green | met | see §Verification notes |
-| 10 | Real Fire TV device acceptance (launch, playback, remote, relaunch) | **pending** | requires Astra/user testing on physical hardware; procedure in `docs/ANDROID_FIRE_TV.md` §8 |
+| 10 | End-to-end flow on a TV-class WebView | met (emulator) | Android TV API 28 / WebView 66: setup, sign-in, guide, D-pad, native playback, Back releasing the relay |
+| 11 | Real Fire TV device acceptance (launch, playback, remote, relaunch) | **pending** | requires Astra/user testing on physical hardware; procedure in `docs/ANDROID_FIRE_TV.md` §8 |
 
 Deliberate non-goals: VOD, series, catch-up, custom-channel pause/resume in the native player,
 in-app updates, signed release builds.

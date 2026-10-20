@@ -138,3 +138,28 @@ test('rebranding preserves existing Plex links and sessions with secure and prev
     } finally {await app.close(); db.close();}
   }
 });
+
+test('the Fire TV shell CSRF marker is accepted while a browser origin stays required', async () => {
+  const db = openDatabase(':memory:'), vault = new Vault(randomBytes(32)), f = fakePlex({accountId: 1});
+  const c = config();
+  const app = await buildApp(c, db, vault, new PlexAdapter(c, 'test', f.transport), false);
+  const post = (headers: Record<string, string>) => app.inject({method: 'POST', url: '/api/v1/auth/logout', headers, payload: {}});
+  try {
+    const origin = c.browserOrigin;
+    // A WebView before 83 sends Origin: null plus its package marker.
+    assert.equal((await post({origin: 'null', 'x-requested-with': 'com.tkbox.tv', 'content-type': 'application/json'})).statusCode, 200);
+    // A page cannot forge that marker without a preflight this server refuses, so it is not a
+    // CSRF bypass; the checks still reject everything they rejected before.
+    // Logout is idempotent, so the status distinguishes the CSRF guard, not session state.
+    const rejects = (headers: Record<string, string>) => post(headers).then(r => r.statusCode);
+    assert.equal(await rejects({origin: 'null', 'content-type': 'application/json'}), 403);
+    assert.equal(await rejects({origin: 'null', 'x-requested-with': 'com.evil app', 'content-type': 'application/json'}), 403);
+    assert.equal(await rejects({origin: 'null', 'x-requested-with': 'com.tkbox.tv/extra', 'content-type': 'application/json'}), 403);
+    assert.equal(await rejects({origin: 'https://evil.example', 'x-requested-with': 'com.tkbox.tv', 'content-type': 'application/json'}), 403);
+    assert.equal(await rejects({origin: 'null', 'x-requested-with': 'com.tkbox.tv', 'content-type': 'text/plain'}), 415);
+    assert.equal(await rejects({'x-requested-with': 'com.tkbox.tv', 'content-type': 'application/json'}), 403);
+    assert.equal((await post({origin, 'content-type': 'application/json'})).statusCode, 200);
+    // A GET is never origin-checked, as before.
+    assert.equal((await app.inject({url: '/health'})).statusCode, 200);
+  } finally {await app.close(); db.close();}
+});

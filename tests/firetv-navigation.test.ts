@@ -39,3 +39,21 @@ test('the TV shell receives a Back hook and a bundle that can run on the older W
   const config = readFileSync(new URL('../apps/web/vite.config.ts', import.meta.url), 'utf8');
   assert.match(config, /target: \['chrome61', 'es2018'\]/);
 });
+
+test('the Fire TV compatibility layer covers the failures found on WebView 66', () => {
+  const compat = readFileSync(new URL('../apps/web/src/compat.ts', import.meta.url), 'utf8');
+  // globalThis first, or the bundle never executes; then flat/flatMap for the JSX transform.
+  assert.ok(compat.indexOf('globalThis') < compat.indexOf('fromEntries'), 'globalThis must be installed first');
+  for (const builtin of ['flat', 'flatMap']) assert.ok(compat.includes(`array.${builtin} ??=`), builtin);
+  // The probes must measure layout, because @supports (gap) is true for grid gap on this WebView.
+  assert.match(compat, /legacy-flex-gap/);
+  assert.match(compat, /legacy-css/);
+  assert.match(compat, /getBoundingClientRect/);
+  const css = readFileSync(new URL('../apps/web/src/style.css', import.meta.url), 'utf8');
+  // Flat selectors only: that WebView has no CSS nesting.
+  assert.ok(!/^\.legacy-flex-gap \{[^}]*\{/m.test(css), 'legacy rules must not be nested');
+  assert.match(css, /^:root\.legacy-css\{--gutter:/m);
+  // The player must not pull the zod schema module into the browser bundle.
+  const player = readFileSync(new URL('../apps/web/src/player.tsx', import.meta.url), 'utf8');
+  assert.match(player, /contracts\/src\/quality-tiers\.js/);
+});

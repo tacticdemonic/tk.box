@@ -9,10 +9,13 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.WebChromeClient
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewFeature
 import java.io.ByteArrayInputStream
 
 /**
@@ -110,12 +113,25 @@ class MainActivity : ComponentActivity() {
             displayZoomControls = false
             userAgentString = "$userAgentString TkBoxTV/${BuildConfig.VERSION_NAME}"
         }
+        // WebView 83+ can send the page's real Origin for allowlisted hosts; older WebViews
+        // (Fire OS 5/6, WebView 66 here) send "null" plus X-Requested-With, which the server
+        // accepts as the shell marker.
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST))
+            WebSettingsCompat.setRequestedWithHeaderOriginAllowList(view.settings, setOf(serverOrigin))
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(view, false)
         view.setBackgroundColor(0xFF0C0C10.toInt())
         view.isFocusable = true
         view.isFocusableInTouchMode = true
         view.webViewClient = TvWebViewClient()
+        // Page console output goes to logcat so a UAT log shows a JavaScript failure; the page
+        // never logs credentials, and this adds no URL or cookie to the line.
+        view.webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(message: android.webkit.ConsoleMessage): Boolean {
+                android.util.Log.i("TkBoxConsole", "${message.message()} (${message.lineNumber()})")
+                return true
+            }
+        }
         view.addJavascriptInterface(Bridge(serverOrigin), "TkBoxNative")
         view.loadUrl("$serverOrigin/")
         root.addView(view, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
@@ -138,6 +154,7 @@ class MainActivity : ComponentActivity() {
             // Sign-in sets the session cookie here; keep the native snapshot current.
             WebViewCookies.refresh(server)
             WebViewCookies.flush()
+
         }
 
         override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
@@ -150,6 +167,7 @@ class MainActivity : ComponentActivity() {
     private fun showOffline() {
         val server = origin ?: return
         root.removeAllViews()
+        webView?.destroy()
         webView = null
         val column = TvViews.column(this)
         column.addTv(TvViews.text(this, "Server unavailable", 30f, bold = true))

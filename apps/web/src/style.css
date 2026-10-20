@@ -10,7 +10,7 @@ html.modal-open{overflow:hidden}
 body{margin:0;background:var(--bg);min-height:100vh}
 a{color:inherit;text-decoration:none}
 h1,h2,h3,p{margin-top:0}
-h1{font-size:clamp(26px,3vw,36px);line-height:1.15;font-weight:700;letter-spacing:-.02em}
+h1{font-size:32px;font-size:clamp(26px,3vw,36px);line-height:1.15;font-weight:700;letter-spacing:-.02em}
 h2{font-size:20px;font-weight:650;letter-spacing:-.01em}
 h3{font-size:16px;font-weight:600}
 p{line-height:1.6}
@@ -1094,8 +1094,75 @@ dialog:has(.picker){width:min(880px,calc(100% - 32px))}
 
 /* Fire TV: the shell adds .tv-mode. Overscan-safe padding and one loud focus ring. */
 .tv-mode body{padding:3.5vh 3.5vw}
+.tv-mode .nav{left:0;right:0;padding:10px var(--gutter)}
+.tv-mode .page{padding-left:var(--gutter);padding-right:var(--gutter)}
+.legacy-css .tv-mode .page{padding-left:max(var(--gutter),3.5vw);padding-right:max(var(--gutter),3.5vw)}
 .tv-mode :focus-visible{outline:3px solid var(--accent);outline-offset:4px;box-shadow:0 0 0 7px rgba(245,184,46,.22)}
+/* The WebView takes focus for scrolling; a ring around the whole page reads as an error. */
+.tv-mode body:focus,.tv-mode body:focus-visible,.tv-mode html:focus,.tv-mode main:focus,.tv-mode main:focus-visible,
+.tv-mode .nav:focus,.tv-mode .nav:focus-visible,.tv-mode .app:focus,.tv-mode .app:focus-visible{outline:none;box-shadow:none}
 .tv-mode .poster-art:focus-visible,.tv-mode .category-tile:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
 .tv-mode .station-button:focus-visible,.tv-mode .guide-program:focus-visible,.tv-mode .channel-item:focus-visible{outline:3px solid var(--accent);outline-offset:-3px;background:var(--accent-tint)}
 .tv-mode .nav-links a:focus-visible,.tv-mode .tabbar a:focus-visible{outline-offset:6px}
 .tv-mode .native-playing .empty{max-width:640px;margin:0 auto}
+
+/* Fire OS 5/6 run a Chromium without flex `gap` (Chrome 84) or `clamp()` (Chrome 79); the
+   fallbacks above and the margins below keep TV spacing readable without touching the modern
+   path. Grid gap has been supported since Chrome 66 and needs nothing here. */
+.legacy-flex-gap .nav-links a+a{margin-left:18px}
+.legacy-flex-gap .nav-actions>*+*{margin-left:10px}
+.legacy-flex-gap .nav-links{margin-left:18px}
+.legacy-flex-gap .nav-links a+.nav-links a{margin-left:0}
+.legacy-flex-gap .tabbar a+a{padding-left:2px}
+.legacy-flex-gap .button-row>*+*{margin-left:10px}
+.legacy-flex-gap .tabs>*+*{margin-left:8px}
+.legacy-flex-gap .segmented>*+*{margin-left:6px}
+.legacy-flex-gap .guide-filters>*+*{margin-left:12px}
+.legacy-flex-gap .player-bar>*+*{margin-left:6px}
+.legacy-flex-gap .channel-panel-head>*+*{margin-left:10px}
+.legacy-flex-gap .card-frame+.poster-title{margin-top:8px}
+.legacy-flex-gap .picker-options>*+*{margin-left:18px}
+.legacy-flex-gap .pick-tray>*+*{margin-left:6px}
+.legacy-flex-gap .feed-choices .segmented>*+*{margin-left:6px}
+
+/* Fire OS 5/6 (Chromium 66) has neither `clamp()` (Chrome 79), flex `gap` (Chrome 84) nor
+   `min()`. An unsupported clamp inside a custom property is accepted at parse time and then
+   computes to nothing, which zeroes the padding that uses it, so those variables and the
+   heavily-used clamps get plain values here. The modern path above is untouched. */
+:root.legacy-css{--gutter:40px}
+.legacy-css h1{font-size:32px}
+.legacy-css .page{padding:calc(var(--nav-h) + 24px) var(--gutter) 64px}
+.legacy-css .hero h1{font-size:40px}
+.legacy-css .hero-content{bottom:120px}
+.legacy-css .hero-dots{bottom:130px}
+.legacy-css .rows{margin-top:-70px;padding-bottom:64px}
+.legacy-css .row-scroll{grid-auto-columns:150px}
+.legacy-css .row-wide .row-scroll,.row-wide{--card-w:280px}
+.legacy-css .row-heading h2{font-size:19px}
+.legacy-css .poster-grid{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
+.legacy-css .browse-title{font-size:26px}
+.legacy-css .collection-head h2{font-size:23px}
+.legacy-css .category-grid{grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}
+.legacy-css .detail-hero-content{left:40px;right:40px;bottom:24px}
+.legacy-css .detail-hero h1{font-size:38px}
+.legacy-css .detail-body{padding:8px 40px 24px}
+.legacy-css .detail-episodes{padding:8px 40px 40px}
+.legacy-css .episode{grid-template-columns:36px 150px minmax(0,1fr)}
+.legacy-css .player-top,.player-bottom{padding:22px 32px}
+.legacy-css .player-heading strong{font-size:19px}
+.legacy-css .sign-in-card{padding:32px}
+
+.legacy-css .hero-content{width:calc(100% - 2 * var(--gutter));max-width:960px}
+.legacy-css .sign-in-card{width:440px;max-width:100%}
+.legacy-css .toast{width:560px;max-width:calc(100% - 32px)}
+.legacy-css .hero{min-height:480px;height:60vh;max-height:600px}
+.legacy-css dialog{width:720px;max-width:calc(100% - 32px)}
+.legacy-css .media-dialog{width:940px;max-width:calc(100% - 32px)}
+.legacy-css .player-panel{width:340px;max-width:calc(100vw - 32px);max-height:420px}
+.legacy-css .player.docked{width:400px;max-width:calc(100vw - 40px)}
+.legacy-css .player-expired{max-width:420px}
+.legacy-css dialog:has(.picker){width:880px;max-width:calc(100% - 32px)}
+.legacy-css .modal-content{width:880px;max-width:90vw}
+.legacy-css .browse-menu{width:290px;max-width:calc(100vw - 32px)}
+.legacy-css .media-menu{max-width:320px}
+.legacy-css .player-panel.channels{width:400px;max-width:calc(100vw - 32px);max-height:520px}
