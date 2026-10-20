@@ -1,252 +1,268 @@
-# Android / Fire TV App — MVP Implementation Plan
+# Android / Fire TV App — M03 implementation
 
-Status: **research + design only**. No Android SDK is available in this environment, so this
-milestone delivers the plan below, not a built APK. Building it later needs a machine with
-JDK 17, Android SDK platform 34 and build-tools 34.
+Status: **implemented in M03 on `feature/firetv-mvp`**. The `android/` project builds a debug
+APK, and every native-playback, cookie, origin and cleanup rule below is covered by automated
+tests. Real-device UAT is **pending** — see §9. No claim in this document substitutes a build
+or a unit test for a Fire TV.
 
-Goal: a sideloadable Android TV app for old Fire TV Sticks that browses the existing tk.box
-web UI and plays live channels reliably — including devices whose WebView cannot play HLS.
+## 1. Device targets
 
-## 0. Backend facts this plan relies on (verified in the repo)
-
-- Session auth is **cookie-based** (`apps/server/src/app.ts`, `services/identity.ts`):
-  `tk.box_local` over plain HTTP, `__Host-tk.box` over HTTPS (`secureCookies` is set only when
-  `PUBLIC_BASE_URL` is configured — `config.ts`). Cookies are `httpOnly`, `SameSite=Lax`,
-  expire after **12 h**.
-- Non-GET requests must send `Origin` equal to `config.browserOrigin` (CSRF check) and
-  `Content-Type: application/json`.
-- Tuning: `POST /api/v1/live/sessions` `{channelId}` → `{id, streamUrl, channel, delivery, ...}`
-  (`streamUrl` is **relative** — `/api/v1/live/sessions/{id}/index.m3u8` — and the server
-  serves it as `application/vnd.apple.mpegurl`). The browser resolves it against the page
-  origin; the native player must resolve it against the saved server origin.
-  **Segments are MPEG-TS** (`video/mp2t`), cookie-authed.
-- `DELETE /api/v1/live/sessions/{id}` stops the FFmpeg relay. Playlist requests fully
-  reauthorize; segments use a lighter session check. Relay routes are rate-limited.
-- IPTV channels are strictly live. Custom Plex channels additionally offer pause/resume/go-live
-  (`/pause`, `/resume`, `/go-live`) and per-program WebVTT subtitles.
-- The web player (`apps/web/src/player.tsx`) plays `*.m3u8` via **hls.js over MSE**, with
-  native HLS only as fallback. DRM is never used or bypassed anywhere; the relay emits
-  plain HLS, so DRM is out of scope by construction (never strip or bypass Widevine/PlayReady).
-
-## 1. Target devices and platform levels
-
-| Fire OS | Android | API | Devices (relevant) |
+| Fire OS | Android | API | Devices in scope |
 |---|---|---|---|
-| 5 | 5.1 | 22 | Fire TV Stick 1st/2nd gen (2014/2016) — **32-bit ARM**, 1 GB RAM; Fire TV 2nd gen box (2015) — 32-bit, 2 GB |
-| 6 | 7.1 | 25 | Fire TV 3rd gen pendant (2017), Cube 1st gen (2018); 2018 Stick 4K shipped here, later updated |
-| 7 | 9 | 28 | Fire TV Stick 3rd gen (2020), Stick 4K / 4K Max, Cube 2nd/3rd gen |
+| 5 | 5.1 | 22 | Fire TV Stick 1st/2nd gen, Fire TV 2nd gen box — 32-bit ARM, 1–2 GB RAM |
+| 6 | 7.1 | 25 | Fire TV 3rd gen pendant, Cube 1st gen |
+| 7 | 9 | 28 | Stick 3rd gen, Stick 4K / 4K Max, Cube 2nd/3rd gen |
 
-- Fire TV Sticks in the field run Fire OS 5–7 (API 22/25/28). Only pre-2015 boxes still on
-  Fire OS 3/4 (API 17/19) are lost by `minSdk 22` — acceptable; their WebView/GPU are too
-  old to be worth supporting.
-- **minSdk 22 trade-offs**: everything we need — Media3 (`minSdk 21`), OkHttp 4
-  (`minSdk 21`), the leanback-ish WebView pattern — works at 22. Going lower buys only
-  pre-Fire-OS-5 boxes, forces ExoPlayer 2.x (Media3 starts at 21) and an older WebView:
-  not worth it. `targetSdk 34`, `compileSdk 34`.
-- 32-bit ARM: Fire TV Stick 1st/2nd gen are `armeabi-v7a`. Media3 and OkHttp are pure
-  Java/Kotlin (no native code), so one universal APK works on both ABIs. If native code is
-  ever added (e.g. FFmpegKit), ship `armeabi-v7a` + `arm64-v8a` splits.
-- RAM is 1–1.5 GB on the sticks in scope: keep the app single-process, no background
-  services, and one ExoPlayer instance at a time.
+`minSdk 22`, `compileSdk 34`, `targetSdk 34`. Media3, OkHttp and the shell are pure JVM code,
+so one universal APK covers `armeabi-v7a` and `arm64-v8a`. Pre-2015 Fire OS 3/4 boxes are out
+of scope.
 
-## 2. Packaging options
+Toolchain used to build and test this milestone: JDK 17 (Temurin 17.0.20.1), Gradle 8.9,
+AGP 8.5.2, Kotlin 2.0.20, Android SDK platform 34, build-tools 34.0.0, Media3 1.4.1,
+OkHttp 4.12.0. Media3 1.5+ requires `compileSdk 35`; 1.4.1 is the newest line that builds
+against platform 34.
 
-| | (a) Plain WebView wrapper | (b) Capacitor | (c) Hybrid: WebView UI + Media3 player |
-|---|---|---|---|
-| Code reuse | ~100% | ~100% | ~100% of UI; small native layer |
-| Maintenance | trivial shell | capacitor core + plugins to track | one activity + client, ~500 LOC |
-| Playback reliability | **fails on old Fire OS** (see §3) | same WebView limitation | **good** — Media3 handles HLS/TS |
-| D-pad / TV support | poor (mouse-oriented web UI) | poor | natively acceptable; focus fixes in web UI later |
-| APK size | ~3–6 MB | ~10–15 MB | ~8–12 MB |
-| Build complexity | lowest | medium (Capacitor toolchain) | low (plain Gradle, no extra toolchain) |
-
-**Recommendation: (c).** Options (a)/(b) ship a TV app whose core feature — live playback —
-does not work on the target devices. The shell can keep ~100% UI reuse; only the player is
-native. Build a thin wrapper on top of the existing API contract, keep the web app as the
-single UI source, and let native code do one job: reliable playback (§3).
-
-## 3. Playback: why WebView video fails, and the Media3 handoff
-
-**WebView limits on Fire OS 5/6/7:**
-- Android WebView has no native HLS support. hls.js needs MSE (`MediaSource`); Amazon's
-  embedded WebView on Fire OS 5/6 does not reliably expose a usable MSE path for HLS (Silk
-  does, the WebView does not), and newer WebViews still cannot demux MPEG-TS. Result:
-  `*.m3u8` playback in the WebView is unreliable at best.
-- MPEG-TS (`video/mp2t`) is playable in **no** Android WebView — no TS demuxer. The relay's
-  segments are MPEG-TS, so the WebView cannot play them even if the playlist loaded.
-- Codecs on Fire TV hardware: H.264 (baseline/main) is universally supported; HEVC only on
-  Fire OS 7-era devices; AAC-LC is safe. Since the relay transcodes/remuxes to H.264/AAC,
-  H.264/AAC is all the native player must guarantee. DRM: out of scope, never bypass.
-
-**Why Media3/ExoPlayer:** `androidx.media3:media3-exoplayer-hls` downloads `index.m3u8`
-itself and demuxes the MPEG-TS segments with the built-in `TsExtractor` (`HlsMediaSource` /
-`DefaultMediaSourceFactory` auto-detects HLS by URI). It is pure Java — runs on 32-bit ARM
-with 1 GB RAM — and is the standard Android playback stack. WebView stays for UI only; even
-Fire OS 5 gets reliable playback.
-
-**Handoff:** the web UI already performs the whole tune flow (POST session, then plays
-`streamUrl`). Two ways to hand it to native, in order of preference:
-
-1. **Explicit hook (recommended, one small web PR).** Add `window.tkbox.onChannelRequest`
-   to the player: when defined, the web app calls
-   `window.tkbox.onChannelRequest({channelId, streamUrl, sessionId})` instead of starting
-   hls.js. The Android shell defines it and starts `PlayerActivity`. This avoids a second
-   player and gives the web app a clean TV mode.
-2. **Fetch shim (zero web changes, MVP fallback).** On `onPageFinished`, wrap `window.fetch`:
-   when a response to `POST /api/v1/live/sessions` carries `{id, streamUrl}`, call
-   `Android.playStream(streamUrl, sessionId)`; native starts `PlayerActivity` (resolving the
-   relative URL against the saved origin and playing HLS with cookies). The web player still
-   receives the response and may show a playback error behind the native player; reload the
-   WebView when the player closes.
-
-Either way, `DELETE /api/v1/live/sessions/{id}` runs natively on player exit, so the FFmpeg
-relay is released. The bridge contract in §7 is the same for both.
-
-## 4. D-pad, focus, Back, overscan, launcher
-
-- **Focus**: Fire TV remotes send `KEYCODE_DPAD_*`, which Chromium maps to arrow keys and to
-  DOM focus movement — no injected key handling is the baseline. Keep the web UI's focusable
-  elements in DOM order (they already are), give the WebView focus at start, and keep the
-  existing `:focus-visible` outline visible. `KEYCODE_DPAD_CENTER` clicks the focused element,
-  which opens the IME for text inputs.
-- **Back button** (`OnBackPressedCallback`, androidx.activity): in the WebView activity —
-  `canGoBack()` first (web history), else exit. In `PlayerActivity`, Back stops playback,
-  `DELETE`s the session, and returns to the WebView — never web-history inside the player.
-- **Overscan / safe area**: Amazon recommends 5% title-safe margins. Apply 5% padding to the
-  WebView activity root and to the player's control overlay; the video surface stays
-  full-bleed. No insets plumbing.
-- **Leanback launcher**: the launcher activity's intent-filter needs
-  `android.intent.action.MAIN` + `android.intent.category.LEANBACK_LAUNCHER` (not the phone
-  `LAUNCHER`) and `android:banner` (320×180 px drawable, e.g. the tk.box logo + wordmark on
-  dark). Because the app is TV-only, declare
-  `android.software.leanback` `required="true"`, and declare
-  `android.hardware.touchscreen` `required="false"` (touchscreen not required).
-- `android:keepScreenOn` while playing; react to `ACTION_HEADSET_PLUG`/volume keys only if
-  needed (not in MVP).
-
-## 5. Sessions, login, networking
-
-- **Cookie sharing**: WebView and OkHttp share the process-wide Android `CookieManager`
-  (`CookieManager.getInstance()`). `httpOnly` cookies are stored by CookieManager (only JS
-  is barred from reading them), so signing in inside the WebView (the existing Plex PIN flow)
-  automatically authenticates native requests. OkHttp gets a `JavaNetCookieJar(CookieManager)`;
-  no manual cookie plumbing.
-- **CSRF/JSON**: native POSTs (`/live/sessions`, pause/resume later) must send
-  `Origin: <server origin>` and `Content-Type: application/json` — the same rules the web
-  app obeys. `SameSite=Lax` is not an issue: playlist/segment requests are same-site (same
-  host as the page origin).
-- **LAN vs HTTPS**: LAN dev hosts run plain HTTP (`APP_HOST`/`APP_PORT`, cookie
-  `tk.box_local`). Fire OS 7 (API 28) blocks cleartext by default: set
-  `android:usesCleartextTraffic="true"` **only** in a `debug` manifest overlay and keep the
-  release manifest cleartext-free, or use a `network_security_config` allowing cleartext for
-  LAN hosts explicitly. Remote deployments use `PUBLIC_BASE_URL` (HTTPS-only by validation)
-  with `__Host-` secure cookies — no cleartext needed.
-- **Certificates**: user-installed CAs are not trusted by default at API 24+. For a
-  self-signed LAN cert, either install the CA as a system cert on the Fire TV (adb, not
-  user-friendly) or — recommended — run TLS with a public/Let's Encrypt cert, or plain HTTP
-  on LAN only. Do not ship a custom TrustManager that accepts anything.
-- **Server address entry**: first-run screen with a URL field + "Test connection"
-  (`GET /api/v1/setup` + `/health`), persisted in DataStore/SharedPreferences. Keep a
-  last-used list. **mDNS** (`NsdManager`, `_http._tcp` browse) is optional and explicitly
-  deferred — manual entry is the MVP.
-- 12 h session expiry: on 401 the WebView redirects to sign-in; a "Session expired, sign in
-  again" overlay in the shell re-loads the origin.
-
-## 6. Sideloading and updates
-
-- **Install routes** (no Play Store):
-  - `adb connect <tv-ip>:5555 && adb install app-debug.apk` — requires ADB debugging on the
-    Stick (Settings → My Fire TV → About → click 7× → Developer options → ADB debugging).
-  - AFTV **Downloader** app: use it to fetch the APK on-device (Downloader itself is
-    sideloaded once via adb, or installed from Amazon's Appstore where available).
-  - Fire OS 5/6: Settings → Applications → Unknown sources. Fire OS 7: Developer options →
-    Install unknown apps → allow for Downloader.
-- **versionCode strategy**: strict monotonic integer, `versionCode = 10000*major + 100*minor
-  + patch` (e.g. 1.2.3 → 10203); never decrease it on a release you have shipped.
-- **In-app update check**: on launch (throttled to once/day), `GET <server>/tv/update.json`
-  — a static manifest (served from the tk.box server's web root or any static host):
-  `{"versionCode": 10203, "versionName": "1.2.3", "apkUrl": "https://…/tkbox-tv-1.2.3.apk", "sha256": "…"}`.
-  If `versionCode` > installed: download to `getExternalFilesDir`, verify sha256, then
-  `FileProvider` + `ACTION_INSTALL_PACKAGE` (`REQUEST_INSTALL_PACKAGES` permission, Fire OS 7;
-  plain `ACTION_VIEW` intent works at API 22). No Play Store dependency anywhere.
-
-## 7. MVP scope
-
-`android/` at the repo root, fully separate from the npm workspace (no `package.json`
-changes; the server build ignores it).
+## 2. Project layout
 
 ```
 android/
-├─ settings.gradle.kts          # pluginManagement repositories: google(), mavenCentral()
-├─ build.gradle.kts             # AGP 8.5.2, Kotlin 2.0.20
-├─ gradle.properties            # org.gradle.jvmargs=-Xmx2g; android.useAndroidX=true
+├─ settings.gradle.kts, build.gradle.kts, gradle.properties
+├─ gradlew, gradlew.bat, gradle/wrapper/    # Gradle 8.9 wrapper
 └─ app/
-   ├─ build.gradle.kts          # compileSdk 34, minSdk 22, targetSdk 34
-   └─ src/main/
-      ├─ AndroidManifest.xml    # LEANBACK_LAUNCHER, banner, no touchscreen requirement
-      ├─ res/drawable/banner.png # 320×180
-      └─ java/com/tkbox/tv/
-         ├─ MainActivity.kt     # WebView host (launcher); loads saved server origin
-         ├─ TvWebViewClient.kt  # page lifecycle, error page, fetch-shim injection
-         ├─ ChannelBridge.kt    # @JavascriptInterface("Android") bridge
-         ├─ PlayerActivity.kt   # Media3 ExoPlayer (HLS), session stop on exit
-         ├─ SessionApi.kt       # OkHttp: cookie jar, Origin/JSON headers, POST+DELETE session
-         ├─ ServerStore.kt      # DataStore: url, last-used
-         └─ UpdateChecker.kt    # manifest check + installer
+   ├─ build.gradle.kts                      # minSdk 22, debug ALLOW_CLEARTEXT=true, release=false
+   └─ src/
+      ├─ main/AndroidManifest.xml           # LEANBACK_LAUNCHER, banner, no touchscreen
+      ├─ debug/AndroidManifest.xml          # cleartext HTTP for LAN development only
+      ├─ main/res/                          # banner.png (320×180), app_icon, theme
+      ├─ main/java/com/tkbox/tv/
+      │  ├─ MainActivity.kt                 # WebView host, server setup, bridge, Back
+      │  ├─ PlayerActivity.kt               # one Media3 HLS player, session release
+      │  ├─ OriginPolicy.kt                 # origin/URL/cleartext rules
+      │  ├─ BridgeValidator.kt              # JavaScript bridge input validation
+      │  ├─ OriginCookieInterceptor.kt      # origin-scoped Cookie injection
+      │  ├─ WebViewCookies.kt               # WebView CookieManager snapshot
+      │  ├─ SessionClient.kt                # /health probe, authenticated session DELETE
+      │  ├─ ServerConfigStore.kt            # persisted server origin
+      │  └─ TvViews.kt                      # D-pad-focusable TV controls
+      └─ test/java/com/tkbox/tv/            # OriginPolicy, BridgeValidator, SessionClient tests
 ```
 
-- **Toolchain** (modern build machine): JDK 17, Gradle 8.9, AGP 8.5.2, Kotlin 2.0.20,
-  `androidx.media3:media3-exoplayer-hls:1.4.1` (1.5+ requires compileSdk 35),
-  `com.squareup.okhttp3:okhttp:4.12.0`, `androidx.activity:activity-ktx`,
-  `androidx.webkit:webkit`.
-- **Key classes**:
-  - `MainActivity`: `WebView` (JavaScript + DOM storage enabled), loads `origin/`; injects
-    `ChannelBridge` and the fetch shim in `TvWebViewClient.onPageFinished`; Back =
-    `canGoBack()` → history, else exit.
-  - `TvWebViewClient`: injects `fetch` wrapper; renders an offline/error page when the origin
-    is unreachable; restarts the activity on renderer death (`onRenderProcessGone`, API 26+;
-    on older devices the whole process dies — the launcher activity is the recovery path).
-  - `ChannelBridge`: `@JavascriptInterface fun playStream(streamUrl: String, sessionId: String)`
-    → starts `PlayerActivity` with extras; `@JavascriptInterface fun isTv(): Boolean` → `true`
-    (lets future web hooks detect the shell).
-  - `PlayerActivity`: `ExoPlayer.Builder(context).build()`, `DefaultMediaSourceFactory`,
-    `PlaybackException` → toast + finish (and `DELETE` session); `onDestroy` → release +
-    `DELETE`. `setWakeMode(C.WAKE_MODE_NETWORK)` + `keepScreenOn`, and
-    `setHandleAudioBecomingNoisy(true)`.
-  - `SessionApi`: `POST /api/v1/live/sessions` `{channelId: String}` with `Origin` + JSON
-    headers, cookie jar on; `DELETE /api/v1/live/sessions/{id}` with the same headers and an
-    empty `{}` JSON body (the server's CSRF hook requires both on every non-GET), treating
-    404/409 as success (the relay may already have been reaped).
-- **JS bridge contract** (the future web hook; the fetch shim implements it today):
-  `window.Android.playStream(streamUrl, sessionId)` — native takes over playback of an
-  already-created session; `window.Android.isTv()` — feature detection; the session delete is
-  native on exit, idempotent if the server already reaped it. No web-app source changes in MVP.
+The project is outside the npm workspace: no `package.json`, server or build-script changes
+reach the Node application.
 
-## 8. Risks and phased plan
+## 3. Playback architecture
 
-**Risks**
-- WebView generation skew on Fire OS 5 (Chromium ~M61-era): parts of the web UI may render
-  poorly. Mitigate: prioritize Fire OS 7 dev/testing; treat 5/6 as best-effort with an in-app
-  compatibility banner; never depend on WebView video.
-- Session leak: if the app is force-stopped, the `DELETE` never fires and the FFmpeg relay
-  keeps running. The server has stream ownership/reaping (`LiveTv.stop`, session tracking) —
-  verify idle-timeout behavior during phase 2 and surface a server fix if missing.
-- 12 h cookie expiry: long-running TV in the living room will hit sign-out; the 401 overlay
-  re-auth flow must be frictionless.
-- `SameSite=Lax` + OkHttp: requests to the same host are same-site, but verify with a real
-  Stick early (phase 1 acceptance).
+The WebView renders the existing React UI unchanged. Playback differs by platform:
 
-**Phases**
+```mermaid
+sequenceDiagram
+    participant Web as React UI (WebView)
+    participant Shell as TkBoxNative bridge
+    participant Server as tk.box server
+    participant Exo as PlayerActivity (Media3)
+    Web->>Server: POST /api/v1/live/sessions {channelId}
+    Server-->>Web: {id, streamUrl: /api/v1/live/sessions/{id}/index.m3u8}
+    Web->>Shell: playLiveStream({sessionId, streamUrl, title})
+    Shell->>Shell: validate origin + path, snapshot WebView cookies
+    Shell->>Exo: start PlayerActivity (singleTop)
+    Exo->>Server: GET playlist + MPEG-TS segments (Cookie, same origin)
+    Note over Web: url="" for PersistentPlayer — no second playback
+    Exo->>Server: DELETE /api/v1/live/sessions/{id} (Back, error, stop)
+    Exo-->>Web: tkbox:native-playback {state, sessionId, code}
+    Web->>Server: DELETE again (idempotent; 404/409 accepted)
+```
 
-| Phase | Scope | Acceptance | Effort |
-|---|---|---|---|
-| 1 MVP | WebView shell, server URL entry, fetch shim, `PlayerActivity` (HLS+TS), session delete, leanback launcher, banner, cookies | On a Fire TV Stick 4K (Fire OS 7): sign in, tune a 10-channel source, zap < 3 s, Back exits playback and stops the relay, relaunch keeps the session; on a Stick 2nd gen (Fire OS 5): same, no crash | 2–3 weeks part-time |
-| 2 Playback robustness | Feed failover (re-POST with next `channel.feeds` id on 4xx/stall), stall watchdog (port `LivePlaybackWatchdog`), error surfaces, verify idle reaping | 24 h soak on 3 channels, mixed lossy WiFi; auto-switch to backup feed; no relay leaks, no memory growth | 1–2 weeks |
-| 3 Polish | Pause/resume/go-live for custom channels (existing endpoints), VOD playback via native player, in-app update UI + manifest, `session expired` overlay, web PR for explicit `onChannelRequest` hook, mDNS (optional) | Custom-channel pause survives 5 min, resume/Golive correct; update installs over 2 released versions; hook replaces shim | 2–3 weeks |
+- The web app still tunes through `LiveFailover` (feed selection and retry stay in one place).
+- `apps/web/src/native-player.ts` is the explicit interface: detection
+  (`window.TkBoxNative.playLiveStream`), a strict handoff payload, `stopLiveStream`, and a
+  `tkbox:native-playback` event listener. Nothing patches `window.fetch`.
+- No bridge → `beginNativePlayback` returns `undefined`, `PersistentPlayer` gets the real
+  `streamUrl`, and hls.js behaves exactly as before. This is covered by
+  `tests/firetv-bridge.test.ts`.
+- With a bridge, `PersistentPlayer` is passed `url=""`, so hls.js never attaches and the
+  playlist is fetched once, by ExoPlayer.
+- `PlayerActivity` is `singleTop`: a second tune replaces the current player rather than
+  stacking one. It releases ExoPlayer and deletes the session on Back, on a playback error,
+  on a stop broadcast, and in `onStop` (Home, app switch, process backgrounded).
+- H.264 video and AAC audio are demuxed from MPEG-TS by Media3's built-in `TsExtractor`;
+  `DefaultLoadControl` buffers 15 s with a 60 s cap for slow Wi-Fi.
 
-## 9. Environment note
+## 4. Authentication and cookies
 
-No Android SDK (no `sdkmanager`, platform-tools, emulator) exists in this environment, and
-no Android build was run. This document is the milestone deliverable; the repo tree and the
-backend contract above are verified, but every Android build/toolchain claim (§7) is
-standard-practice, not exercised here.
+WebView's `android.webkit.CookieManager` and OkHttp's cookie store do not share data.
+`WebViewCookies` takes a snapshot of `CookieManager.getCookie(origin)` on page load, before a
+handoff, and on resume, and `OriginCookieInterceptor` adds that snapshot as a `Cookie` header
+**only** to requests whose scheme, host and port match the configured origin. Cookie values are
+never logged, returned to JavaScript or written anywhere else.
+
+- The session cookie stays `httpOnly`: page JavaScript cannot read it. The bridge exposes
+  only `playLiveStream`, `stopLiveStream`, `isTv`, `logout`.
+- `POST`, `DELETE` and other non-GET calls send `Origin: <configured origin>` and
+  `Content-Type: application/json` with a `{}` body, matching the server's CSRF hook.
+- `DELETE /api/v1/live/sessions/{id}` treats 200/204 as stopped, 404/405/409 as already gone,
+  and 401/403 as an expired session.
+- Sign-out clears `CookieManager` and reloads the origin. A native 401/403 event is forwarded
+  to the page as `code: "UNAUTHENTICATED"`, which drops the session and reloads `/me`.
+- WebView settings: JavaScript and DOM storage on; `allowFileAccess`, `allowContentAccess`,
+  `allowFileAccessFromFileURLs`, `allowUniversalAccessFromFileURLs` off;
+  `MIXED_CONTENT_NEVER_ALLOW`; no multiple windows; no third-party cookies.
+- Navigation and subresource loads outside the configured origin are blocked
+  (`shouldOverrideUrlLoading` and `shouldInterceptRequest`).
+- Plain HTTP is accepted only when `BuildConfig.ALLOW_CLEARTEXT` is true, which is the debug
+  build only. The release manifest sets `usesCleartextTraffic="false"`, and `OriginPolicy`
+  independently requires HTTPS. No custom `TrustManager` or hostname verifier exists.
+- Release builds keep `android:allowBackup="false"` so the WebView cookie store is not backed
+  up off-device.
+
+## 5. First-user administrator safeguard (server)
+
+M02 let the first Xtream identity bootstrap the administrator on any Plex-less deployment.
+That is a race on a public host: whoever signs in first owns the instance. M03 adds:
+
+- `INITIAL_ADMIN_TOKEN` (16–256 chars, optional). `loadConfig` refuses to start a public or
+  remote deployment (`PUBLIC_BASE_URL` or `DEPLOYMENT_MODE=remote`) without Plex configuration
+  unless the token is set.
+- The first Xtream login on an empty installation must present `bootstrapToken` matching the
+  configured token (constant-time comparison of SHA-256 digests). A wrong or missing token is
+  rejected **before** the provider panel is contacted.
+- After an administrator exists, the token is ignored: later logins need no token and are
+  viewers, exactly as in M02. Plex-configured deployments are unchanged; a local
+  (`DEPLOYMENT_MODE=local`) Plex-less deployment keeps the zero-configuration first-user flow.
+- `GET /api/v1/setup` returns `bootstrapTokenRequired` so the login screen can show the field
+  only when it is needed. Tests: `tests/xtream-live.test.ts` ("the first provider identity
+  becomes administrator only with an owner-controlled bootstrapping rule").
+
+## 6. Fire TV remote and WebView compatibility
+
+- Arrow keys move focus geometrically (`apps/web/src/tv-navigation.ts`) only when the shell is
+  present (`window.TkBoxNative`). `<select>` and range inputs keep native arrow behaviour;
+  text fields keep Left/Right for the caret and can move out vertically. Enter on an empty
+  focus starts at the first control; the IME opens for text fields as usual.
+- Back: the page closes an open dialog first (`window.TkBoxTv.handleBack`), then the shell
+  walks WebView history, then exits.
+- Focus is visible: 3 px accent ring, offset 4 px, plus a tinted background on guide cells.
+  The shell adds `.tv-mode`, which applies 3.5 v/h overscan padding.
+- Stopping playback returns focus to the control that started it (hashchange in
+  `tv-navigation.ts`).
+- Older WebViews: the Vite build targets `chrome61` + `es2018`, and `apps/web/src/compat.ts`
+  fills only the builtins the bundle calls (`Object.fromEntries`, `Array.prototype.at`,
+  `String.prototype.replaceAll`, `Promise.allSettled`, `AbortSignal.timeout/any`,
+  `queueMicrotask`). `tests/firetv-navigation.test.ts` asserts the target and the polyfills.
+
+## 7. Build and test commands
+
+```bash
+# Node side
+npm run typecheck
+npx tsx --test tests/firetv-bridge.test.ts tests/firetv-navigation.test.ts
+npx tsx --test tests/xtream-live.test.ts
+npm test          # full suite, when releasing
+npm run build
+
+# Android side (JDK 17 + Android SDK 34)
+cd android
+./gradlew testDebugUnitTest
+./gradlew assembleDebug
+```
+
+The APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
+
+## 8. Sideloading and UAT procedure
+
+### 8.1 Identify the device
+
+Settings → My Fire TV → About → Fire TV Stick. Note the model (e.g. "Fire TV Stick 4K") and
+Fire OS version (e.g. Fire OS 7.6.x). Devices on Fire OS 5 (API 22) are the compatibility
+floor for M03.
+
+### 8.2 Enable ADB
+
+Settings → My Fire TV → About → click the device name 7 times → Developer Options →
+ADB debugging **on**. Note the device IP under Settings → My Fire TV → About → Network.
+
+```bash
+adb connect 192.168.1.50:5555
+adb devices          # expect "device", not "unauthorized"
+```
+
+### 8.3 Install
+
+```bash
+cd android
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+Fire OS 5/6 also needs Settings → Applications → Unknown sources for sideloaded updates;
+the first `adb install` is enough for a fresh install.
+
+### 8.4 First launch
+
+1. The app opens directly on the server screen (no browser).
+2. Enter the tk.box address with the remote and the on-screen keyboard, e.g.
+   `https://tv.example.com` or, in a debug build on a LAN, `http://192.168.1.10:3000`.
+3. Select **Test connection** — expect "Connected to …".
+4. Select **Save and continue** — the tk.box sign-in screen loads inside the app.
+
+### 8.5 Sign in
+
+- **Xtream:** expand "Sign in with an Xtream provider", enter the panel address, username and
+  password. If the server requires an initial administrator token, the field appears; enter
+  the operator's `INITIAL_ADMIN_TOKEN`.
+- **Plex:** if the backend has Plex configured, use the Plex button and complete the PIN on a
+  phone or computer; the app polls and signs in automatically.
+
+### 8.6 Browse and tune
+
+Live TV → D-pad to a channel (the accent ring follows) → **OK** to tune. The WebView shows
+"Playback is running in the TV player" while the native activity plays the channel. Channel
+up/down on the remote changes channels through the existing lineup order.
+
+### 8.7 Verify the acceptance points
+
+| Check | Expected |
+|---|---|
+| Playback | Picture and sound within a few seconds; "Buffering…" only briefly |
+| D-pad | Focus moves between nav, filters, channel rows and player controls |
+| OK | Opens details or starts the channel; opens the IME on text fields |
+| Back in a dialog | Closes the dialog, stays on the page |
+| Back in playback | Returns to the channel list; the server relay stops |
+| Channel switch | Old relay stops, one new player, no double audio |
+| Relaunch | Server address and session persist; no re-login within 12 h |
+| Server down | "Server unavailable" screen with Retry and Change address |
+| Logout | Returns to sign-in; cookies cleared |
+
+### 8.8 Capture logs without credentials
+
+```bash
+adb logcat -c
+# reproduce the issue, then:
+adb logcat -d | grep -iE 'tkbox|AndroidRuntime|Media3|ExoPlayer' > tkbox-firetv.log
+```
+
+The app never logs cookies, provider passwords or stream URLs. Review the file before sharing;
+WebView and Media3 may still include URLs in framework logs, so scrub any `Cookie:` or
+`password=` values.
+
+## 9. Evidence, limitations and pending work
+
+Implemented and verified here:
+
+- Android project builds with `./gradlew testDebugUnitTest` and `assembleDebug`; unit tests for
+  origin/URL rules, bridge input validation, cookie scoping and session release pass.
+- Node tests cover the native bridge contract, browser fallback, TV navigation geometry, build
+  target/polyfills and the bootstrap safeguard; typecheck and production build pass.
+
+**Not verified — pending hardware UAT:**
+
+- Launch from the Fire TV launcher, D-pad feel, IME, and overscan on an actual Stick.
+- Real HLS playback, buffering behaviour and codec compatibility on Fire OS 5 hardware.
+- Session persistence across a real app restart and after a 12 h expiry.
+- No claim of hardware compatibility is made until Astra/user testing on a physical device
+  completes. Record device model, Fire OS version and the outcome in this section.
+
+Known limitations:
+
+- Live TV only; VOD and custom-channel pause/resume stay in the WebView player (M04).
+- No in-app update manifest or signed release pipeline yet (M05).
+- Force-stop during playback skips the `DELETE`; the server's idle reaper is the fallback.

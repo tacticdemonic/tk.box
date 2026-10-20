@@ -1,8 +1,17 @@
 # tk.box implementation status
 
-Updated October 19, 2026. **M02 implemented and locally verified; real-provider and hosted-CI verification remain open.**
+Updated October 20, 2026. **M03 implemented and locally verified (Node + Android build); real-device Fire TV UAT and hosted-CI verification remain open.**
 
-## Latest pass: M02 — Xtream authentication and Live TV
+## Latest pass: M03 — Android Fire TV MVP
+
+- `android/` is a standalone Kotlin/Gradle project: leanback launcher and banner, first-run server address with a connection test, persisted origin, hardened WebView for the existing React UI, and Media3/ExoPlayer HLS playback in `PlayerActivity`.
+- The web app exposes one explicit bridge (`apps/web/src/native-player.ts`): detect the shell, hand off `{sessionId, streamUrl, title}`, stop it, and listen for `tkbox:native-playback`. No `window.fetch` patching. Without the bridge, hls.js plays exactly as before; with it, `PersistentPlayer` gets an empty URL so the playlist is fetched once, by ExoPlayer.
+- Cookies come from WebView's `CookieManager` snapshot and are added only for the configured origin; playlist and MPEG-TS segment requests are authenticated without exposing the cookie to page JavaScript, and Back/errors/switching close the server session once (`PlaybackLifetime`).
+- Origin and URL rules reject foreign hosts, another session's playlist, query strings, credentials and plain HTTP in release builds. `INITIAL_ADMIN_TOKEN` now guards first-user bootstrap on public Plex-less deployments.
+- Fire TV navigation is geometric D-pad focus with a visible ring, Back that closes a dialog first, and a `chrome61`/`es2018` build target plus narrow polyfills for Fire OS 5/6 WebViews.
+- **205 Node tests pass**, typecheck and production build are clean; **12 Android unit tests pass** and `assembleDebug` produces `android/app/build/outputs/apk/debug/app-debug.apk`. Not verified: any physical Fire TV device. Device UAT procedure: [Fire TV](ANDROID_FIRE_TV.md) §8.
+
+## Previous pass: M02 — Xtream authentication and Live TV
 
 - Xtream subscriptions now load into the existing Live TV pipeline. A refresh publishes categories and channels into `iptv_sources`/`iptv_channels` with stable identity `xtream:{stream_id}`, so renames, re-categories and reordering keep the saved row, number, listing, stack and favourites. The provider XMLTV snapshot is stored per source and read by the existing guide; `get_short_epg` is a bounded fallback. A failed or empty refresh keeps the last known channels and guide.
 - Accounts without Plex can sign in with a provider (`/api/v1/auth/xtream/login`). `xtream_identities` gives them a local role on the same session table; Plex accounts keep their existing re-authorisation. Administrators reach every provider; other accounts only granted ones, enforced on the catalogue, guide, tuning and playlist paths.
