@@ -4,7 +4,7 @@ import {spawnSync} from 'node:child_process';
 import {mkdtemp,readFile,rm,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {mediaTracks,type PlexAdapter,type PlexGrant,type PlexMetadata} from '../apps/server/src/providers/plex.js';
+import {customAudioMap,mediaMarkers,mediaTracks,type PlexAdapter,type PlexGrant,type PlexMetadata} from '../apps/server/src/providers/plex.js';
 import {SubtitleService} from '../apps/server/src/services/subtitles.js';
 import {matroskaTextTrack} from '../apps/server/src/services/matroska-subtitles.js';
 
@@ -17,10 +17,24 @@ const item={ratingKey:'7',librarySectionID:'1',title:'Film',duration:60000,type:
 const grant={accountId:'1',role:'admin',serverToken:'secret',libraries:[]} as PlexGrant;
 const srt='1\r\n00:00:01,000 --> 00:00:02,500\r\nHello there\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\n<i>Second line</i>\r\n';
 
+test('custom channels map English audio, else the file default, else the first track',()=>{
+  const withAudio=(...audio:object[])=>({...item,Media:[{...item.Media[0]!,Part:[{key:'/p',Stream:[{id:'1',streamType:1},...audio]}]}]}) as PlexMetadata;
+  assert.equal(customAudioMap(withAudio({id:'2',streamType:2,languageCode:'fra',index:1,default:true},{id:'3',streamType:2,languageCode:'eng',index:2})),'0:2');
+  assert.equal(customAudioMap(withAudio({id:'2',streamType:2,languageCode:'eng',index:1},{id:'3',streamType:2,languageCode:'eng',index:2,default:true})),'0:2');
+  assert.equal(customAudioMap(withAudio({id:'2',streamType:2,languageCode:'fra',index:1},{id:'3',streamType:2,languageCode:'deu',index:2,default:true})),'0:2');
+  assert.equal(customAudioMap(withAudio({id:'2',streamType:2,languageCode:'eng'})),'0:a:0?');
+});
+
 test('media tracks describe audio and subtitle choices, marking image subtitles unsupported',()=>{
   const tracks=mediaTracks(item);
   assert.deepEqual(tracks.audio,[{id:'2',label:'English (AC3 5.1)',language:'eng',selected:true}]);
   assert.deepEqual(tracks.subtitles.map(t=>[t.id,t.label,t.supported,t.forced]),[['3','English (SRT External)',true,false],['4','Français (PGS)',false,true]]);
+});
+
+test('media markers keep intros and credits in order, clamped to the title, and drop commercials',()=>{
+  const marked={...item,Marker:[{type:'credits',startTimeOffset:50000,endTimeOffset:61000,final:true},{type:'commercial',startTimeOffset:20000,endTimeOffset:30000},{type:'intro',startTimeOffset:5000,endTimeOffset:5000},{type:'intro',startTimeOffset:1000,endTimeOffset:9000}]} as PlexMetadata;
+  assert.deepEqual(mediaMarkers(marked),[{type:'intro',startMs:1000,endMs:9000,final:false},{type:'credits',startMs:50000,endMs:60000,final:true}]);
+  assert.deepEqual(mediaMarkers(item),[]);
 });
 
 test('sidecar subtitles convert to cached WebVTT and image subtitles are refused',{skip:spawnSync('ffmpeg',['-version']).status!==0&&'ffmpeg unavailable'},async()=>{

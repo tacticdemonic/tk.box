@@ -7,7 +7,7 @@ import { opaque } from '../security/vault.js';
 import { assertVideoEncode, type EncoderBudget } from '../streaming/policy.js';
 import { SegmentBuffer, ViewerCursor, renderManifest, type Segment } from '../streaming/buffer.js';
 import type { CustomChannelStore } from '../persistence/custom-channels.js';
-import { mediaTracks, type PlexAdapter, type PlexGrant } from '../providers/plex.js';
+import { customAudioMap, mediaTracks, type PlexAdapter, type PlexGrant } from '../providers/plex.js';
 import type { LocalMedia } from '../providers/local-media.js';
 import type { PartProxy } from '../providers/part-proxy.js';
 import type { Slot } from './scheduler.js';
@@ -29,6 +29,13 @@ export type TimeshiftState = { state: string; viewerCursorUtc: number; broadcast
 const segmentName = /^seg-\d{6}\.ts$/;
 const LIVE_WINDOW_MS = 90000, LIVE_SEGMENTS = 8, LEAD_IN_MS = 30000, FREE_FLOOR = 1024 ** 3;
 const sleep = (ms: number) => new Promise(done => setTimeout(done, Math.max(0, ms)).unref());
+// A segment's broadcast start. A program's first segment is placed by the clock; the rest follow back to back, since
+// its media is continuous. Stamping them by arrival would put a gap wherever FFmpeg fell behind (a slow read or
+// encode), and captions, timed from the airing's start by broadcast time, would run ahead by every gap.
+export function segmentStart(previousEnd: number | undefined, now: number, durationMs: number, newProgram: boolean) {
+  if (previousEnd === undefined) return Math.round(now - durationMs);
+  return newProgram ? Math.round(Math.max(previousEnd, now - durationMs)) : previousEnd;
+}
 
 // Custom channel playout. A channel is a schedule, not a running video: a station starts when the first viewer
 // tunes in and stops when the last one leaves. It plays one program at a time, joining the airing program at its
@@ -172,7 +179,7 @@ export class CustomTv {
           if (sequence > s.lastSequence && duration > 0) {
             const bytes = await stat(join(s.dir, line)).then(x => x.size, () => 0);
             if (!bytes) break;
-            const previous = s.segments.at(-1), start = Math.round(Math.max(previous?.end ?? 0, now - duration)), marked = discontinuity && !!previous;
+            const previous = s.segments.at(-1), start = segmentStart(previous?.end, now, duration, discontinuity || !!s.opening), marked = discontinuity && !!previous;
             s.segments.push({ id: line, uri: line, start, end: start + Math.max(1, Math.round(duration)), bytes, programId: s.library ?? '', revision: 0, sequence, discontinuity: marked, discontinuitySequence: s.discontinuities });
             if (marked) s.discontinuities++;
             if (s.opening) { s.airings.push({ ...s.opening, start }); s.opening = undefined; }
@@ -235,7 +242,7 @@ export class CustomTv {
       s.opening = opening;
       // Copied video starts at the keyframe before the join point, which can be seconds earlier.
       if (!encode && offsetMs > 500) void this.keyframe(input, offsetMs).then(at => { if (at !== undefined) opening.mediaStartMs = at; });
-      return await this.exec(s, [...this.inputArgs(input, offsetMs), '-t', ((slot.end - now) / 1000).toFixed(3), '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
+      return await this.exec(s, [...this.inputArgs(input, offsetMs), '-t', ((slot.end - now) / 1000).toFixed(3), '-map', '0:v:0', '-map', customAudioMap(item), '-sn', '-dn',
         ...(encode ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-maxrate', '8M', '-bufsize', '16M', '-pix_fmt', 'yuv420p', '-threads', '2', '-force_key_frames', 'expr:gte(t,n_forced*2)'] : ['-c:v', 'copy']),
         '-c:a', 'aac', '-b:a', '160k', '-ac', '2']);
     } finally { release(); done(); }
