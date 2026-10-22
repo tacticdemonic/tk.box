@@ -8,7 +8,7 @@ import {IdentityService} from '../apps/server/src/services/identity.js';
 import {buildApp} from '../apps/server/src/app.js';
 import {config,fakePlex,metadata} from './fixtures.js';
 import {ArtworkCache} from '../apps/server/src/providers/artwork-cache.js';
-import {sortIndex,promotedHubs,promotedCollectionIds} from '../apps/server/src/providers/plex-catalog.js';
+import {sortIndex,promotedHubs,promotedCollectionIds,externalRatings,catalogNode} from '../apps/server/src/providers/plex-catalog.js';
 
 function catalogFixture() {
   const base=fakePlex(),requests:{path:string;query:URLSearchParams;token:string|null}[]=[],nodes:Record<string,Record<string,unknown>>={
@@ -36,7 +36,7 @@ function catalogFixture() {
 }
 test('catalog uses viewer grants, bounded scoped queries and safe DTOs with no source paths or tokens',async()=>{
   const f=catalogFixture(),plex=new PlexAdapter(config(),'test',f.transport),grant=await plex.authorize('fixture-account-token');
-  const page=await plex.catalogPage(grant,'10',{limit:24,offset:0,q:'title & 4K',sort:'year'});assert.equal(page.total,32);assert.equal(page.hasMore,true);assert.equal(page.items[0]!.posterUrl,'/api/v1/catalog/items/42/artwork?kind=poster');
+  const page=await plex.catalogPage(grant,'10',{limit:24,offset:0,q:'title & 4K',sort:'year'});assert.equal(page.total,32);assert.equal(page.hasMore,true);assert.equal(page.items[0]!.posterUrl,'/api/v1/catalog/items/42/artwork?kind=poster&v=123');
   const request=f.requests.find(r=>r.path==='/library/sections/10/all')!;assert.equal(request.query.get('title'),'title & 4K');assert.equal(request.query.get('sort'),'year:desc');assert.equal(request.query.get('X-Plex-Container-Size'),'24');assert.equal(request.token,'fixture-viewer-server-token');
   const raw=JSON.stringify(page);for(const forbidden of ['must-not-leak','server-token','Media','/library/parts/','/thumb/123'])assert.ok(!raw.includes(forbidden));
   const before=f.requests.length;await assert.rejects(plex.catalogPage(grant,'99',{}),{code:'PLEX_ACCESS_DENIED'});assert.equal(f.requests.length,before);
@@ -131,6 +131,7 @@ test('catalog HTTP routes protect listings/details/images; VOD resume/beginning 
     const listing=await app.inject({url:'/api/v1/catalog/libraries/10/items',headers});assert.equal(listing.statusCode,200);assert.ok(!listing.body.includes('secret'));
     const art=await app.inject({url:'/api/v1/catalog/items/42/artwork',headers});assert.equal(art.statusCode,200);assert.equal(art.headers['content-type'],'image/png');assert.equal(art.headers['x-secret'],undefined);
     assert.equal((await app.inject({url:'/api/v1/catalog/items/42/artwork',headers:{...headers,'if-none-match':art.headers.etag}})).statusCode,304);
+    assert.equal((await app.inject({url:'/api/v1/catalog/items/42/artwork?kind=poster&v=123',headers})).statusCode,200);assert.equal((await app.inject({url:'/api/v1/catalog/items/42/artwork?v=x',headers})).statusCode,400);
     assert.equal((await app.inject({url:'/api/v1/catalog/items/42/artwork?url=http://arbitrary.invalid',headers})).statusCode,400);
     const payload={mode:'plex_vod',ratingKey:'42',capabilities:{videoCodecs:['h264:8'],audioCodecs:['aac'],containers:['mp4']}};
     const resume=await app.inject({method:'POST',url:'/api/v1/playback/sessions',headers,payload});assert.equal(resume.statusCode,200);assert.equal(resume.json().startOffsetMs,120000);
@@ -160,8 +161,8 @@ test('recent TV uses series posters and groups a season batch into one card whil
   const page=await plex.catalogPage(grant,'20',{shelf:'recent',limit:20});
   assert.equal(f.requests.find(r=>r.path==='/library/sections/20/recentlyAdded')!.query.get('X-Plex-Container-Size'),'60');
   assert.deepEqual(page.items.map(i=>[i.type,i.id]),[['season','101'],['episode','601'],['episode','504']]);
-  const season=page.items[0]!;assert.equal(season.episodeCount,3);assert.equal(season.showTitle,'Fixture show');assert.equal(season.posterUrl,'/api/v1/catalog/items/100/artwork?kind=poster');
-  assert.equal(page.items[1]!.showPosterUrl,'/api/v1/catalog/items/100/artwork?kind=poster');assert.equal(page.items[1]!.posterUrl,'/api/v1/catalog/items/601/artwork?kind=poster');
+  const season=page.items[0]!;assert.equal(season.episodeCount,3);assert.equal(season.showTitle,'Fixture show');assert.equal(season.posterUrl,'/api/v1/catalog/items/100/artwork?kind=poster&v=1');
+  assert.equal(page.items[1]!.showPosterUrl,'/api/v1/catalog/items/100/artwork?kind=poster&v=1');assert.equal(page.items[1]!.posterUrl,'/api/v1/catalog/items/601/artwork?kind=poster&v=1');
   assert.equal(page.hasMore,false);
 });
 
@@ -177,7 +178,7 @@ test('recent TV merges seasons of one show that arrived together into a show car
     episode('15','100','103',2,5*day),episode('16','100','103',1,5*day-60)],totalSize:8}});
   const page=await plex.catalogPage(grant,'20',{shelf:'recent',limit:20});
   assert.deepEqual(page.items.map(i=>[i.type,i.id]),[['show','100'],['season','201'],['season','103']]);
-  const show=page.items[0]!;assert.equal(show.title,'Show 100');assert.equal(show.seasonCount,2);assert.equal(show.episodeCount,4);assert.equal(show.posterUrl,'/api/v1/catalog/items/100/artwork?kind=poster');
+  const show=page.items[0]!;assert.equal(show.title,'Show 100');assert.equal(show.seasonCount,2);assert.equal(show.episodeCount,4);assert.equal(show.posterUrl,'/api/v1/catalog/items/100/artwork?kind=poster&v=1');
 });
 
 test('non-title jump buckets follow the sorted order and pick a readable granularity',()=>{
@@ -213,4 +214,16 @@ test('promoted Home hubs yield each collection once, in Plex order, skipping row
   const transport=(async(input:string|URL|Request,init?:RequestInit)=>new URL(String(input)).pathname==='/hubs/promoted'?Response.json({MediaContainer:{Hub:[{key:'/library/collections/900/children'},{key:'/library/collections/800/children'},{key:'/library/collections/555/children'}]}}):f.transport(input,init)) as typeof fetch;
   const plex=new PlexAdapter(config(),'test',transport),grant=await plex.authorize('fixture');
   assert.deepEqual(await plex.homeCollections(grant),{collections:[{id:'900',title:'Halloween - All Time Classics',libraryId:'20'}]});
+});
+test('external ratings map Plex rating images to sources in a fixed order, falling back to the top-level pairs',()=>{
+  const node=(extra:object)=>catalogNode.parse({ratingKey:'1',type:'movie',title:'A',...extra});
+  assert.deepEqual(externalRatings(node({Rating:[
+    {image:'themoviedb://image.rating',value:7.8,type:'audience'},{image:'rottentomatoes://image.rating.spilled',value:4.2,type:'audience'},
+    {image:'imdb://image.rating',value:7.6,type:'audience'},{image:'rottentomatoes://image.rating.ripe',value:8.1,type:'critic'},{image:'unknown://x',value:5}
+  ]})),[{source:'imdb',score:7.6},{source:'tomatometer',score:8.1,fresh:true},{source:'popcornmeter',score:4.2,fresh:false},{source:'tmdb',score:7.8}]);
+  assert.deepEqual(externalRatings(node({rating:6.1,ratingImage:'rottentomatoes://image.rating.rotten',audienceRating:8,audienceRatingImage:'rottentomatoes://image.rating.upright'})),
+    [{source:'tomatometer',score:6.1,fresh:false},{source:'popcornmeter',score:8,fresh:true}]);
+  assert.equal(externalRatings(node({rating:7})),undefined);
+  // A malformed Rating list is dropped instead of failing the item.
+  assert.equal(externalRatings(node({Rating:'bad'})),undefined);
 });

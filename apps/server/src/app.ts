@@ -9,7 +9,7 @@ import { z, ZodError } from 'zod';
 import type { Config } from './config.js';
 import type { Db } from './persistence/database.js';
 import { SettingsStore } from './persistence/database.js';
-import { PlexAdapter, audioStreams, mediaTracks } from './providers/plex.js';
+import { PlexAdapter, audioStreams, mediaMarkers, mediaTracks } from './providers/plex.js';
 import { LocalMedia, byteRange, type LocalPart } from './providers/local-media.js';
 import { IdentityService } from './services/identity.js';
 import { PlaybackService } from './services/playback.js';
@@ -23,6 +23,9 @@ import { IptvStore } from './persistence/iptv-store.js';
 import { SourceRefresh } from './services/source-refresh.js';
 import { registerIptv } from './iptv-api.js';
 import { registerCatalog } from './catalog-api.js';
+import { ClientEvents, registerEvents } from './events-api.js';
+import { registerExplore } from './explore-api.js';
+import { ExploreStore } from './persistence/explore-store.js';
 import { LiveTv } from './services/live-tv.js';
 import { HealthStore } from './persistence/channel-health-store.js';
 import { ChannelHealth } from './services/channel-health.js';
@@ -30,6 +33,8 @@ import { registerChannelHealth } from './health-api.js';
 import { IptvSettingsStore, iptvSettings } from './persistence/iptv-settings.js';
 import { ProviderConnections } from './streaming/provider-connections.js';
 import { SportsStore } from './persistence/sports-store.js';
+import { ServiceKeys, serviceKeysInput } from './persistence/service-keys.js';
+import { PlexBackground } from './services/plex-background.js';
 import { SportsSchedule } from './services/sports-schedule.js';
 import { DEFAULT_ESPN, DEFAULT_TSDB } from './providers/sports-feeds.js';
 import { registerSports } from './sports-api.js';
@@ -38,6 +43,14 @@ import { registerCustomChannels } from './custom-api.js';
 import { CustomTv } from './services/custom-tv.js';
 import { PartProxy } from './providers/part-proxy.js';
 import { EpisodeSync } from './services/episode-sync.js';
+import { ArtworkStore } from './persistence/artwork-store.js';
+import { ArtworkEngine } from './services/artwork-engine.js';
+import { ArtworkWorker } from './services/artwork-worker.js';
+import { ArtworkSchedule } from './services/artwork-schedule.js';
+import { registerArtwork } from './artwork-api.js';
+import { CleanupStore } from './persistence/cleanup-store.js';
+import { CleanupEngine, type CleanupServices } from './services/cleanup-engine.js';
+import { registerCleanup } from './cleanup-api.js';
 
 export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexAdapter, logging = true, cookieNamespace = 'tk.box') {
   const app = Fastify({ logger: logging ? {level: 'info'} : false, logController: new LogController({disableRequestLogging: true}), bodyLimit: 65536, trustProxy: config.trustedProxies.length ? config.trustedProxies : false });
@@ -62,7 +75,8 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   const stopStreams = (matches: (s: {id: string; hash: string}) => boolean) => {for (const s of streams) if (matches(s)) s.abort.abort();};
   app.addHook('onRequest', async (req, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff').header('Referrer-Policy', 'no-referrer').header('Cache-Control', 'no-store');
-    reply.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self'; connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+    // blob: images are ones the page made itself (the artwork layout editor's previews); data: stays blocked.
+    reply.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' blob:; connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'");
     if (config.secureCookies) reply.header('Strict-Transport-Security', 'max-age=31536000');
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       requireThat(req.headers.origin === config.browserOrigin, 'CSRF_REJECTED', 'Request origin is not permitted.', 403);
@@ -90,7 +104,9 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   const iptv = new IptvStore(db,vault);
   const refresh = new SourceRefresh(iptv), custom = new CustomChannelStore(db);
   registerIptv(app,iptv,refresh,auth,admin,undefined,undefined,custom,async (req,id,kind) => plex.artwork((await auth(req)).grant,id,kind));
-  const episodes = new EpisodeSync(custom, plex, () => identity.adminGrant(config.PLEX_OWNER_ACCOUNT_ID ? [config.PLEX_OWNER_ACCOUNT_ID] : []), (message, detail) => app.log.info(detail, message));
+  // Background work reads Plex with the owner's Plex token from Admin › Connections.
+  const serviceKeys = new ServiceKeys(db, vault), background = new PlexBackground(serviceKeys, plex, (message, detail) => app.log.warn(detail, message));
+  const episodes = new EpisodeSync(custom, plex, () => background.grant(), (message, detail) => app.log.info(detail, message));
   registerCustomChannels(app,custom,plex,admin,episodes);
   app.addHook('onReady', async () => { episodes.start(); });
   const live = new LiveTv(iptv, budget, config.CACHE_DIR, config.FFMPEG_PATH, config.FFPROBE_PATH, (message, detail) => app.log.warn(detail, message));
@@ -109,10 +125,20 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   registerChannelHealth(app, iptv, healthStore, health, admin);
   // Sports events: event-driven sources show a channel only while the event it names is on.
   const list = (value: string | undefined, fallback: string[]) => { const items = (value ?? '').split(',').map(s => s.trim()).filter(Boolean); return items.length ? items : fallback; };
+  // Without a saved TheSportsDB key, its free public key ('123') is used.
   const sportsStore = new SportsStore(db, id => iptv.relist(id)), sports = new SportsSchedule(iptv, sportsStore, healthStore, () => health.pump(),
-    {espn: list(config.SPORTS_ESPN_LEAGUES, DEFAULT_ESPN), tsdb: list(config.SPORTS_TSDB_LEAGUES, DEFAULT_TSDB), tsdbKey: config.THESPORTSDB_API_KEY ?? '123', zone: config.SPORTS_NAME_TIMEZONE ?? 'America/New_York', nameHours: 3, tickMs: 60000},
+    {espn: list(config.SPORTS_ESPN_LEAGUES, DEFAULT_ESPN), tsdb: list(config.SPORTS_TSDB_LEAGUES, DEFAULT_TSDB), tsdbKey: () => serviceKeys.get('thesportsdb') ?? '123', zone: config.SPORTS_NAME_TIMEZONE ?? 'America/New_York', nameHours: 3, tickMs: 60000},
     (message, detail) => app.log.info(detail, message));
   registerSports(app, iptv, sportsStore, sports, admin);
+  // Admin › Connections: keys no feature's own settings hold. A new TheSportsDB key is used from the next download on,
+  // a new Plex admin token from the next background task.
+  app.get('/api/v1/admin/keys', async req => { await admin(req); return serviceKeys.view(); });
+  // A Plex admin token is saved only once Plex vouches for it as the server owner's.
+  app.put('/api/v1/admin/keys', async req => {
+    const {grant} = await admin(req), input = serviceKeysInput.parse(req.body);
+    if (input.plex) await background.check(input.plex).catch((e: AppError) => { throw e.code === 'PLEX_TOKEN_NOT_OWNER' || e.code === 'PLEX_UNAVAILABLE' ? e : new AppError('PLEX_TOKEN_REJECTED', 'Plex didn’t accept that token.', 400); });
+    const saved = serviceKeys.update(grant.accountId, input); sports.invalidate(); background.invalidate(); return saved;
+  });
   refresh.published = () => sports.invalidate();
   app.addHook('onReady', async () => { void sports.tick(); });
   // Custom channels share the live session routes; their sessions belong to CustomTv.
@@ -151,6 +177,33 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   });
   app.delete<{Params: {id: string}}>('/api/v1/live/sessions/:id', async req => { const {hash} = await auth(req); live.stop(req.params.id, hash); customTv.stop(req.params.id, hash); return {status: 'stopped'}; });
   registerCatalog(app,plex,auth);
+  // Open pages hear when artwork or cleanup jobs change the library, and reload what they show.
+  const events = new ClientEvents();
+  registerEvents(app, events, auth);
+  const exploreStore = new ExploreStore(db, vault);
+  registerExplore(app, plex, exploreStore, auth, admin, hash => identity.accountToken(hash));
+  // Artwork: the engine runs as a separate Python process, apart from every playback path.
+  const artworkStore = new ArtworkStore(db, vault, resolve('apps/artwork/defaults.json'));
+  const artwork = new ArtworkEngine(artworkStore, {python: config.PYTHON_PATH, script: resolve('apps/artwork/overlayrr.py'), collectionsScript: resolve('apps/artwork/plex_collections.py'), dataDir: config.DATA_DIR, cacheDir: config.CACHE_DIR, plexUrl: config.PLEX_URL},
+    (message, detail) => app.log.info(detail, message), () => exploreStore.view().traktClientId || undefined);
+  const artworkWorker = new ArtworkWorker(artwork, (message, detail) => app.log.warn(detail, message));
+  const artworkSchedule = new ArtworkSchedule(artworkStore, artwork, plex, () => background.grant(), (message, detail) => app.log.warn(detail, message));
+  registerArtwork(app, artworkStore, artwork, artworkWorker, artworkSchedule, admin);
+  artwork.finished = () => events.publish('library');
+  app.addHook('onReady', async () => { artworkSchedule.start(); });
+  app.addHook('onClose', async () => { artworkSchedule.close(); artworkWorker.close(); artwork.close(); });
+  // Clean Up: the purge script runs as a separate Python process too. Seerr is Explore's connection, Radarr is Collections'.
+  const cleanupStore = new CleanupStore(db, vault);
+  const cleanupServices = (): CleanupServices => {
+    const {radarr, radarrKey} = artworkStore.collectionsConfig(), own = cleanupStore.connections();
+    return {seerr: exploreStore.seerr(), radarr: {url: radarr.url, key: radarrKey}, tautulli: {url: own.tautulliUrl, key: own.tautulliKey}, sonarr: {url: own.sonarrUrl, key: own.sonarrKey}};
+  };
+  const cleanup = new CleanupEngine(cleanupStore, {python: config.PYTHON_PATH, script: resolve('apps/cleanup/purge_requests.py'), poster: resolve('apps/cleanup/leaving-soon.png'), dataDir: config.DATA_DIR, plexUrl: config.PLEX_URL},
+    cleanupServices, () => background.grant(), (message, detail) => app.log.info(detail, message));
+  registerCleanup(app, cleanupStore, cleanup, cleanupServices, admin);
+  cleanup.finished = () => events.publish('library');
+  app.addHook('onReady', async () => { cleanup.start(); });
+  app.addHook('onClose', async () => { cleanup.close(); });
   app.get('/health', async () => ({status: 'ok'}));
   app.get('/api/v1/setup', async () => ({plexConfigured: config.plexConfigured, milestone: 0}));
   app.post('/api/v1/auth/plex/start', { config: {rateLimit: {max: 10, timeWindow: 60000}} }, async (_req, reply) => {
@@ -180,7 +233,7 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
     // startAtMs with audioStreamId or quality restarts a title at the current position with another track or quality.
     const input = z.object({mode: z.literal('plex_vod'), ratingKey: z.string().regex(/^\d+$/), capabilities: caps,startFrom:z.enum(['resume','beginning']).default('resume'),
       startAtMs: z.number().int().nonnegative().optional(), audioStreamId: z.string().regex(/^\d+$/).max(20).optional(), quality: quality.default('auto')}).strict().parse(req.body);
-    const {hash, grant} = await auth(req), item = await plex.metadata(grant, input.ratingKey), media = item.Media[0];
+    const {hash, grant} = await auth(req), item = await plex.metadata(grant, input.ratingKey, {markers: true}), media = item.Media[0];
     requireThat(media, 'SOURCE_INCOMPATIBLE', 'No playable media.', 422);
     const video = media.Part[0]?.Stream?.find(s => s.streamType === 1), {audio, fileDefault, plexSelected} = audioStreams(item);
     const requested = input.audioStreamId === undefined ? undefined : audio.find(s => s.id === input.audioStreamId);
@@ -190,9 +243,9 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
     const sourceVideo = {codec: media.videoCodec, width: media.width, height: media.height, container: media.container, audioCodec: target?.codec ?? media.audioCodec, bitDepth: video?.bitDepth, bitrateKbps: media.bitrate};
     const route = chooseRoute(sourceVideo, input.capabilities, input.quality, false, !otherTrack);
     const startOffsetMs = Math.max(0, Math.min(input.startAtMs ?? (input.startFrom==='beginning' ? 0 : item.viewOffset ?? 0), item.duration));
-    // Track and source details let the player offer subtitles and describe the stream.
+    // Track and source details let the player offer subtitles and describe the stream; markers let it skip intros and credits.
     const playing = route.kind === 'direct' ? fileDefault : target;
-    const details = {tracks: mediaTracks(item, playing?.id), source: {videoCodec: media.videoCodec, audioCodec: playing?.codec ?? media.audioCodec, width: media.width, height: media.height, container: media.container, bitrateKbps: media.bitrate},
+    const details = {tracks: mediaTracks(item, playing?.id), markers: mediaMarkers(item), source: {videoCodec: media.videoCodec, audioCodec: playing?.codec ?? media.audioCodec, width: media.width, height: media.height, container: media.container, bitrateKbps: media.bitrate},
       quality: input.quality, qualityOptions: qualityOptions(sourceVideo, input.capabilities, false, !otherTrack)};
     if (route.kind === 'direct') return {...playback.createVod(hash, input.ratingKey, startOffsetMs), ...details};
     if (requested && requested.id !== plexSelected?.id) await plex.selectAudioStream(grant, item, requested.id);

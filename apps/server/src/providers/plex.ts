@@ -3,8 +3,8 @@ import {createHash} from 'node:crypto';
 import {ArtworkCache} from './artwork-cache.js';
 import type { Config } from '../config.js';
 import { AppError, requireThat } from '../errors.js';
-import {catalogContainer,catalogDto,catalogQuery,groupRecentEpisodes,applyCatalogFilters,artworkPath,logoPath,type ArtworkKind,collectionsContainer,collectionDto,collectionArtwork,sortIndex,promotedHubs,promotedCollectionIds,type CatalogQuery,type CatalogAction,type CatalogCollection} from './plex-catalog.js';
-import type {CatalogPage} from '../../../../packages/contracts/src/index.js';
+import {catalogContainer,catalogDto,catalogQuery,groupRecentEpisodes,applyCatalogFilters,artworkPath,logoPath,versioned,type ArtworkKind,collectionsContainer,collectionDto,collectionArtwork,sortIndex,promotedHubs,promotedCollectionIds,type CatalogQuery,type CatalogAction,type CatalogCollection} from './plex-catalog.js';
+import type {CatalogItem,CatalogPage} from '../../../../packages/contracts/src/index.js';
 
 const accountSchema = z.object({ id: z.union([z.string(), z.number()]).transform(String) });
 const pinSchema = z.object({ id: z.number().int(), code: z.string(), expiresIn: z.number().positive(), authToken: z.string().nullable().optional() });
@@ -15,6 +15,8 @@ export const metadataSchema = z.object({
   title: z.string(), duration: z.number().positive(), type: z.enum(['movie', 'episode']),
   viewOffset: z.number().optional(),
   viewCount: z.number().int().nonnegative().optional(), lastViewedAt: z.number().optional(),
+  // Plex's detected intro and credits sections (requested with includeMarkers); `final` marks the closing credits.
+  Marker: z.array(z.object({ type: z.string().max(40), startTimeOffset: z.number().nonnegative(), endTimeOffset: z.number().nonnegative(), final: z.union([z.boolean(), z.number()]).optional() })).max(50).optional(),
   Media: z.array(z.object({ container: z.string(), videoCodec: z.string(), audioCodec: z.string().optional(), bitrate: z.number().positive().optional(),
     width: z.number().positive().optional(), height: z.number().positive().optional(),
     // `file` is the part's absolute path on the Plex host; same-host mode (LocalMedia) may read it from disk.
@@ -32,6 +34,13 @@ export function audioStreams(item: PlexMetadata) {
   const audio = (item.Media[0]?.Part[0]?.Stream ?? []).filter(s => s.streamType === 2);
   return { audio, fileDefault: audio.find(s => s.default) ?? audio[0], plexSelected: audio.find(s => s.selected) };
 }
+// The FFmpeg map for a custom channel's audio: English (the file's default English track first), else the file's
+// default, else the first track. Plex's stream index is the file's stream index.
+export function customAudioMap(item: PlexMetadata) {
+  const { audio, fileDefault } = audioStreams(item), english = audio.filter(s => /^en(g)?$/i.test(s.languageCode ?? ''));
+  const pick = english.find(s => s.default) ?? english[0] ?? fileDefault;
+  return pick?.index === undefined ? '0:a:0?' : `0:${pick.index}`;
+}
 // `playingAudio` replaces Plex's selection flag with the track this session actually delivers.
 export function mediaTracks(item: PlexMetadata, playingAudio?: string) {
   const streams = item.Media[0]?.Part[0]?.Stream ?? [], label = (s: (typeof streams)[number]) => s.extendedDisplayTitle ?? s.displayTitle ?? s.title ?? s.language ?? 'Unknown';
@@ -39,6 +48,12 @@ export function mediaTracks(item: PlexMetadata, playingAudio?: string) {
     audio: streams.filter(s => s.streamType === 2).map(s => ({ id: s.id, label: label(s), language: s.languageCode, selected: playingAudio === undefined ? !!s.selected : s.id === playingAudio })),
     subtitles: streams.filter(s => s.streamType === 3).map(s => ({ id: s.id, label: label(s), language: s.languageCode, forced: !!s.forced, selected: !!s.selected, supported: !!subtitleInputFormat(s.codec) && (!!s.key || s.index !== undefined) })),
   };
+}
+// The intro and credits sections the player offers to skip, in playback order. Commercial markers and empty ranges are dropped.
+export function mediaMarkers(item: PlexMetadata) {
+  return (item.Marker ?? []).flatMap(m => (m.type === 'intro' || m.type === 'credits') && m.endTimeOffset > m.startTimeOffset
+    ? [{ type: m.type as 'intro' | 'credits', startMs: m.startTimeOffset, endMs: Math.min(m.endTimeOffset, item.duration), final: !!m.final }] : [])
+    .sort((a, b) => a.startMs - b.startMs);
 }
 const decisionSchema = z.object({ MediaContainer: z.object({
   generalDecisionCode: z.coerce.number().optional(),
@@ -74,9 +89,17 @@ export class PlexAdapter {
     return { Accept: 'application/json', 'X-Plex-Product': 'tk.box', 'X-Plex-Version': '0.0.1',
       'X-Plex-Client-Identifier': this.clientId, ...(token ? { 'X-Plex-Token': token } : {}) };
   }
-  private async json(url: URL, token?: string, method = 'GET') {
+  // `sameOrigin` follows redirects that stay on the requested origin (Discover adds the viewer's preferred
+  // services to some shelves that way); any other redirect is refused, so the token never leaves that host.
+  private async json(url: URL, token?: string, method = 'GET', sameOrigin = false) {
     try {
-      const response = await this.transport(url, { method, headers: this.headers(token), redirect: 'error', signal: AbortSignal.timeout(10000) });
+      let response = await this.transport(url, { method, headers: this.headers(token), redirect: sameOrigin ? 'manual' : 'error', signal: AbortSignal.timeout(10000) });
+      for (let hops = 0; sameOrigin && response.status >= 300 && response.status < 400; hops++) {
+        const next = new URL(response.headers.get('location') ?? '', url);
+        await response.body?.cancel();
+        if (hops >= 3 || next.origin !== url.origin) throw new AppError('PLEX_UNAVAILABLE', 'Plex redirected the request elsewhere.', 502);
+        response = await this.transport(next, { method, headers: this.headers(token), redirect: 'manual', signal: AbortSignal.timeout(10000) });
+      }
       if (!response.ok) {
         await response.body?.cancel();
         throw new AppError(response.status === 401 || response.status === 403 ? 'PLEX_ACCESS_DENIED' : 'PLEX_UNAVAILABLE', 'Plex request could not be completed.', response.status === 401 || response.status === 403 ? 403 : 502);
@@ -91,7 +114,9 @@ export class PlexAdapter {
           chunks.push(chunk);
         }
       } finally { reader.releaseLock(); }
-      return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+      // Discover's watchlist actions answer with an empty body.
+      const text = Buffer.concat(chunks).toString('utf8');
+      return (text ? JSON.parse(text) : {}) as unknown;
     } catch (e) {
       if (e instanceof AppError) throw e;
       throw new AppError('PLEX_UNAVAILABLE', 'Plex is unavailable or returned invalid data.', 502);
@@ -150,9 +175,29 @@ export class PlexAdapter {
     requireThat(!isOwner || resource.owned, 'PLEX_ACCESS_DENIED', 'Configured owner does not own this Plex server.', 403);
     return { accountId: account.id, role: isOwner ? 'admin' : 'viewer', serverToken, libraries };
   }
-  async metadata(grant: PlexGrant, ratingKey: string) {
+  // Plex's cloud catalog (watchlist, Discover shelves, search), read with the viewer's own Plex account token.
+  async discover(accountToken: string, path: string, query: Record<string, string | number> = {}, method = 'GET') {
+    const url = new URL(path, 'https://discover.provider.plex.tv');
+    requireThat(url.origin === 'https://discover.provider.plex.tv', 'INVALID_REQUEST', 'Discover requests stay on Plex.');
+    for (const [key, value] of Object.entries(query)) url.searchParams.set(key, String(value));
+    return this.json(url, accountToken, method, true);
+  }
+  // This server's copy of a title the viewer can open: titles with that name whose guid (plex://, imdb://, tmdb://, tvdb://) matches.
+  async libraryMatch(grant: PlexGrant, kind: 'movie' | 'show', title: string, guids: string[]) {
+    if (!guids.length || !title.trim()) return undefined;
+    const matches = z.object({ MediaContainer: z.object({ Metadata: z.array(z.object({ ratingKey: plexId, guid: z.string().optional(), Guid: z.array(z.object({ id: z.string() })).optional() })).default([]) }) });
+    const found = await Promise.all(grant.libraries.filter(l => l.type === kind).map(async library => {
+      const url = new URL(`/library/sections/${library.key}/all`, this.config.PLEX_URL);
+      for (const [key, value] of Object.entries({ type: kind === 'movie' ? '1' : '2', title: title.trim().slice(0, 100), includeGuids: '1', 'X-Plex-Container-Start': '0', 'X-Plex-Container-Size': '50' })) url.searchParams.set(key, value);
+      const items = await this.json(url, grant.serverToken).then(data => matches.parse(data).MediaContainer.Metadata, () => []);
+      return items.find(item => (item.guid && guids.includes(item.guid)) || item.Guid?.some(g => guids.includes(g.id)))?.ratingKey;
+    }));
+    return found.find(Boolean);
+  }
+  async metadata(grant: PlexGrant, ratingKey: string, options: { markers?: boolean } = {}) {
     requireThat(/^\d+$/.test(ratingKey), 'INVALID_MEDIA', 'Invalid Plex media identifier.');
-    const result = z.object({ MediaContainer: z.object({ Metadata: z.array(metadataSchema) }) }).parse(await this.json(new URL(`/library/metadata/${ratingKey}`, this.config.PLEX_URL), grant.serverToken));
+    const url = new URL(`/library/metadata/${ratingKey}`, this.config.PLEX_URL); if (options.markers) url.searchParams.set('includeMarkers', '1');
+    const result = z.object({ MediaContainer: z.object({ Metadata: z.array(metadataSchema) }) }).parse(await this.json(url, grant.serverToken));
     const item = result.MediaContainer.Metadata[0];
     requireThat(item && item.ratingKey === ratingKey && grant.libraries.some(l => l.key === item.librarySectionID), 'PLEX_ACCESS_DENIED', 'Media is not accessible to this account.', 403);
     return item;
@@ -198,6 +243,26 @@ export class PlexAdapter {
     const result=z.object({MediaContainer:z.object({Directory:z.array(z.object({key:z.union([z.string().regex(/^\d+$/).max(20),z.number().int().nonnegative()]).transform(String),title:z.string().max(200)})).max(2000).default([])})}).parse(await this.json(url,grant.serverToken));
     return {genres:result.MediaContainer.Directory.map(({key,title})=>({id:key,title}))};
   }
+  // Like Plex's Categories: each genre's tile shows the backdrop of a random title from it, a different title per
+  // genre where the library has one, so tiles don't repeat the same art. Plex does the shuffling, so it costs nothing extra.
+  async catalogGenreArt(grant:PlexGrant,libraryId:string) {
+    const library=this.library(grant,libraryId),{genres}=await this.catalogGenres(grant,libraryId);
+    const section=z.union([z.string(),z.number()]).transform(String).optional();
+    const page=z.object({MediaContainer:z.object({librarySectionID:section,Metadata:z.array(z.object({ratingKey:z.string().regex(/^\d+$/).max(20),art:z.string().max(500).optional(),librarySectionID:section})).max(8).default([])})});
+    const candidates=async(genre:string)=>{
+      const url=new URL(`/library/sections/${libraryId}/all`,this.config.PLEX_URL);
+      url.searchParams.set('type',library.type==='movie'?'1':'2');url.searchParams.set('genre',genre);url.searchParams.set('sort','random');
+      url.searchParams.set('X-Plex-Container-Start','0');url.searchParams.set('X-Plex-Container-Size','8');url.searchParams.set('includeFields','ratingKey,art,librarySectionID');
+      // A genre whose lookup fails just keeps its plain tile.
+      try {const container=page.parse(await this.json(url,grant.serverToken)).MediaContainer;return container.Metadata.filter(n=>artworkPath(n.art)&&(n.librarySectionID??container.librarySectionID??libraryId)===libraryId).map(n=>({id:n.ratingKey,art:n.art}));}
+      catch {return [];}
+    };
+    const found:{id:string;art?:string}[][]=[];
+    for(let i=0;i<genres.length;i+=6)found.push(...await Promise.all(genres.slice(i,i+6).map(g=>candidates(g.id))));
+    const used=new Set<string>(),art:Record<string,string>={};
+    genres.forEach((g,i)=>{const ids=found[i]??[],pick=ids.find(n=>!used.has(n.id))??ids[0];if(pick){used.add(pick.id);art[g.id]=versioned(`/api/v1/catalog/items/${pick.id}/artwork?kind=tile`,pick.art);}});
+    return {art};
+  }
   async catalogIndex(grant:PlexGrant,libraryId:string,input:Partial<CatalogQuery>) {
     const library=this.library(grant,libraryId),query=catalogQuery.parse(input);
     requireThat(['all','unwatched'].includes(query.shelf),'INVALID_INDEX','Jump navigation requires a full library listing.');
@@ -241,6 +306,32 @@ export class PlexAdapter {
     const items=container.Metadata.map(node=>{requireThat((node.librarySectionID??container.librarySectionID??libraryId)===libraryId,'PLEX_ACCESS_DENIED','Plex returned media outside the requested library.',403);return catalogDto(node,libraryId);});
     if(grouped){const cards=groupRecentEpisodes(items);return {items:cards.slice(0,query.limit),offset:0,limit:query.limit,hasMore:cards.length>query.limit||(container.totalSize!==undefined?items.length<container.totalSize:items.length===size)};}
     return {items,offset:query.offset,limit:query.limit,total:container.totalSize,hasMore:container.totalSize!==undefined?query.offset+items.length<container.totalSize:items.length===query.limit};
+  }
+  // A library's titles added after `sinceMs`, newest first, read page by page until Plex's list gets back to then (at
+  // most `max` entries; `complete` says it got there). TV episodes that arrived together group as on the Recent shelf.
+  async addedSince(grant:PlexGrant,libraryId:string,sinceMs:number,max=2000) {
+    const library=this.library(grant,libraryId),size=100,items:CatalogItem[]=[];
+    let complete=false;
+    for(let offset=0;offset<max&&!complete;offset+=size) {
+      const url=new URL(`/library/sections/${libraryId}/recentlyAdded`,this.config.PLEX_URL);
+      url.searchParams.set('X-Plex-Container-Start',String(offset));url.searchParams.set('X-Plex-Container-Size',String(size));
+      url.searchParams.set('excludeElements','Media,Role,Director,Writer,Country,Guid,Collection,Producer');
+      const nodes=catalogContainer.parse(await this.json(url,grant.serverToken)).MediaContainer.Metadata;
+      requireThat(nodes.length<=size,'PLEX_PAGINATION_INVALID','Plex did not honor the requested page limit.',502);
+      complete=nodes.length<size;
+      for(const node of nodes) {
+        if((node.addedAt??0)*1000<=sinceMs){complete=true;break;}
+        requireThat((node.librarySectionID??libraryId)===libraryId,'PLEX_ACCESS_DENIED','Plex returned media outside the requested library.',403);
+        items.push(catalogDto(node,libraryId));
+      }
+    }
+    return {items:library.type==='show'?groupRecentEpisodes(items):items,complete};
+  }
+  // Plex Media Server's notification feed, which pushes library changes as they happen. The token goes in a header,
+  // which Node's WebSocket takes though the DOM typings don't.
+  notificationSocket(grant:PlexGrant) {
+    const url=new URL('/:/websockets/notifications',this.config.PLEX_URL);url.protocol=url.protocol==='https:'?'wss:':'ws:';
+    return new WebSocket(url,{headers:this.headers(grant.serverToken)} as unknown as string[]);
   }
   async catalogChildren(grant:PlexGrant,id:string,input:Partial<CatalogQuery>):Promise<CatalogPage> {
     const {node,section}=await this.catalogNode(grant,id),query=catalogQuery.parse(input);
@@ -366,7 +457,7 @@ export class PlexAdapter {
       .map(c=>({id:`collection:${c.ratingKey}`,title:c.title,count:c.childCount,kind:c.subtype==='show'?'show' as const:'movie' as const}))};
   }
   async artwork(grant:PlexGrant,id:string,kind:ArtworkKind) {
-    const {node}=await this.catalogNode(grant,id),path=kind==='logo'?logoPath(node):artworkPath(kind==='backdrop'?node.art:node.thumb??node.parentThumb??node.grandparentThumb);
+    const {node}=await this.catalogNode(grant,id),path=kind==='logo'?logoPath(node):artworkPath(kind==='backdrop'||kind==='tile'?node.art:node.thumb??node.parentThumb??node.grandparentThumb);
     requireThat(path,'ARTWORK_NOT_FOUND','Artwork is unavailable.',404);
     return this.cachedArtwork(grant,path,kind);
   }
@@ -378,7 +469,7 @@ export class PlexAdapter {
     return pending;
   }
   private async loadArtwork(path:string,kind:ArtworkKind,serverToken:string) {
-    const url=new URL('/photo/:/transcode',this.config.PLEX_URL),[width,height]=kind==='poster'?[360,540]:kind==='logo'?[800,400]:[1280,720];
+    const url=new URL('/photo/:/transcode',this.config.PLEX_URL),[width,height]=kind==='poster'?[360,540]:kind==='logo'?[800,400]:kind==='tile'?[800,450]:[1280,720];
     url.searchParams.set('url',path);url.searchParams.set('width',String(width));url.searchParams.set('height',String(height));url.searchParams.set('minSize','1');url.searchParams.set('upscale','0');
     // Logos are transparent; PNG keeps the transparency a JPEG transcode would fill in.
     if(kind==='logo')url.searchParams.set('format','png');
