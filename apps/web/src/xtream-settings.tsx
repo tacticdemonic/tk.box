@@ -1,6 +1,7 @@
 import {useEffect,useState} from 'react';
 import {api} from './api.js';
 import {useApi,invalidate} from './hooks.js';
+import {type ImportStatus} from './import-progress.js';
 import {Card,SectionHead,useMutation} from './settings-ui.js';
 import {Empty,ErrorNotice,Icon,Loading,Modal} from './components.js';
 
@@ -45,16 +46,35 @@ export function XtreamSettings() {
 }
 
 function AccountCard({account, changed, mutation}:{account: XtreamAccount; changed: () => void; mutation: ReturnType<typeof useMutation>}) {
-  const [editing, setEditing] = useState(false), badge = state(account);
+  const [editing, setEditing] = useState(false), badge = state(account), [job, setJob] = useState<ImportStatus>();
+  // Bumped after a refresh is accepted, so the poll re-reads status for work this card just started.
+  const [poll, setPoll] = useState(0);
+  // The refresh route accepts work and answers at once; the import's own status is polled here and
+  // stops as soon as it reaches a terminal state.
+  useEffect(() => {
+    let live = true, timer: number | undefined;
+    const stop = () => { if (timer !== undefined) { window.clearInterval(timer); timer = undefined; } };
+    const read = async () => {
+      const next = await api<ImportStatus>(`/xtream/accounts/${account.id}/imports`);
+      if (!live) return;
+      setJob(next);
+      if (next.active) { if (timer === undefined) timer = window.setInterval(() => void read().catch(() => {}), 3000); }
+      else { stop(); changed(); }
+    };
+    void read().catch(() => {});
+    return () => { live = false; stop(); };
+  }, [account.id, poll]);
+  const active = job?.active ?? null;
   const refresh = () => void mutation.run(async () => {
     await api(`/xtream/accounts/${account.id}/refresh`, 'POST', {includeEpg: true});
-    invalidate('/guide'); invalidate('/iptv/channels'); invalidate('/xtream/accounts');
+    invalidate('/xtream/accounts');
+    setPoll(value => value + 1);
   });
   const toggle = () => void mutation.run(async () => {
     await api(`/xtream/accounts/${account.id}`, 'PATCH', {expectedRevision: account.revision, enabled: !account.enabled});
   });
   return <Card title={account.name} description={<>{account.serverOrigin}</>} actions={<>
-    <button className="text-button" disabled={mutation.busy} onClick={refresh}><Icon name="restart" size={16}/> Refresh</button>
+    <button className="text-button" disabled={mutation.busy || !!active} onClick={refresh}><Icon name="restart" size={16}/> {active ? 'Importing…' : 'Refresh'}</button>
     <button className="text-button" disabled={mutation.busy} onClick={() => setEditing(true)}>Settings</button>
     <button className="text-button" disabled={mutation.busy} onClick={toggle}>{account.enabled ? 'Disable' : 'Enable'}</button>
   </>}>
@@ -64,6 +84,10 @@ function AccountCard({account, changed, mutation}:{account: XtreamAccount; chang
       <div className="stat"><span>Expires</span><strong>{dateTime(account.expiresAt)}</strong>{account.isTrial && <small>Trial account</small>}</div>
       <div className="stat"><span>Connections</span><strong>{account.maxConnections ?? '—'}</strong><small>{account.activeConnections !== null ? `${account.activeConnections} in use` : 'Provider limit'}</small></div>
     </div>
+    {active && <p className="small" role="status">{active.state === 'queued' ? 'Import queued.' : active.stage === 'publish' ? 'Saving the channel list…' : 'Loading channels and guide…'} Cached channels stay available meanwhile.</p>}
+    {!active && job?.latest?.state === 'failed' && <p className="small danger" role="status">Import failed: {(job.latest.error ?? 'XTREAM_UNREACHABLE').replaceAll('_', ' ').toLowerCase()}. The last known channel list is still in use.</p>}
+    {!active && job?.latest?.state === 'interrupted' && <p className="small danger" role="status">Import was interrupted. Refresh again to restart it.</p>}
+    {!active && job?.latest?.state === 'completed' && job.latest.guideError && <p className="small warning-text" role="status">Guide problem: {job.latest.guideError.replaceAll('_', ' ').toLowerCase()}. Channels are unaffected.</p>}
     {account.lastError && <p className="small warning-text">Last problem: {account.lastError.replaceAll('_', ' ').toLowerCase()}. The last known channel list stays in use until a refresh succeeds.</p>}
     {mutation.error && <p className="small danger">{mutation.error}</p>}
     {editing && <EditProvider account={account} onClose={() => setEditing(false)} changed={changed}/>}

@@ -1,10 +1,49 @@
 # tk.box implementation status
 
-Updated October 20, 2026. **M03.2 closes the physical Fire TV Stick CSRF rejection; Node tests,
-Android tests, typecheck, build and APK packaging are locally verified. Hosted CI and physical
-Stick acceptance remain open.**
+Updated October 22, 2026. **M03.3 separates Xtream sign-in from catalogue import. Node tests,
+typecheck, the production build and a real-browser sign-in against a deliberately slow synthetic
+panel are locally verified. Hosted CI and physical Stick acceptance remain open.**
 
-## Latest pass: M03.2 — physical Fire Stick CSRF rejection
+## Latest pass: M03.3 — Xtream sign-in no longer waits for the catalogue
+
+- **Confirmed mechanism.** `POST /api/v1/auth/xtream/login` authenticated the provider, then ran
+  the full catalogue + EPG import inline before setting the session cookie. The web client's
+  `AbortSignal.timeout(30000)` fired first on the device (30.8 s) while the same request took
+  78.5 s from a PC, so a large provider could never sign in from the TV UI.
+- **Authentication is now separate from import.** The login route makes exactly one bounded
+  provider call (account authentication), establishes the identity and session, records the
+  provider account and queues an import. It returns while that import is still queued or running.
+  The frontend deadline stays at 30 s.
+- **Managed import lifecycle.** `XtreamImports` owns sign-in, manual and scheduled imports. Job
+  rows live in `xtream_imports` (fork migration 1003) with `queued`/`running`/`completed`/`failed`/
+  `interrupted`, a current stage and a stable error code. A partial unique index allows one active
+  import per provider; two run server-wide; a validation and an import exclude each other; a
+  credential change, disable or removal during the fetch fails the job instead of publishing; a
+  restart marks inherited rows `interrupted`; shutdown aborts and drains.
+- **Manual refresh returns 202.** `POST /xtream/accounts/:id/refresh`, the admin equivalent and an
+  Xtream IPTV source's refresh accept the work and expose status at
+  `GET /xtream/accounts/:id/imports`, scoped by the existing provider access rule.
+- **UI.** Sign-in leaves the form as soon as the session exists; a bounded 3-second poll reports
+  "Signed in. Loading channels…", the publish stage, guide-only failure, import failure with
+  Retry, and interruption. The guide shows a loading state instead of "No channels" during a first
+  import, and cached channels stay browsable during a refresh. A deadline abort now reads as a
+  timeout, not "The user aborted a request".
+- **Responsiveness fix found by the large-catalogue test.** Publishing 8,436 channels blocked the
+  event loop for 38 s: `coverage()` compared every channel against every other, `feedFor`/
+  `channel()` were re-queried per channel, and `source()` copied the multi-megabyte sealed
+  snapshot on every read. Guide resolution now uses a per-pass index, channel rows are reused
+  within a pass, and source metadata is read without its sealed payloads. The publish step takes
+  ~1.1 s and health/status/UI requests stay responsive.
+- **Evidence.** `tests/xtream-imports.test.ts` (11) covers the delayed import, `/me` before
+  completion, credential/bootstrap rejection, deduplication, account scoping, last-known-good,
+  stale-publish prevention, restart, an 8,436-channel catalogue and the validation/import
+  distinction. A Chromium run of the real form against a synthetic 8,436-channel panel that
+  delays every catalogue call past 30 s signed in in ~120 ms, showed "Signed in. Loading
+  channels…", never showed "No channels", and filled the 8,432-channel guide without a reload.
+- **APK.** No native Android source change was needed; the currently installed APK remains valid.
+  Physical acceptance on the AFTMM is still pending.
+
+## Previous pass: M03.2 — physical Fire Stick CSRF rejection
 
 - **Root cause: server origin configuration, not WebView behaviour.** `loadConfig` used
   `APP_HOST` for both the listen address and the expected browser origin. With the documented

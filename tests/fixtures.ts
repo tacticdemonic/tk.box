@@ -22,3 +22,14 @@ export function fakePlex(options: {accountId?: number; authorized?: boolean; mis
   }) as typeof fetch;
   return {transport, calls, options};
 }
+
+// Waits for the provider import the app accepted to reach a terminal state. Polls rather than
+// sleeps a fixed time, so a fast synthetic panel finishes immediately and a slow one is bounded.
+export async function settle(app: {inject: (options: {url: string; headers?: Record<string, string>}) => Promise<{json: () => any}>}, accountId: string, headers: Record<string, string>, limit = 80) {
+  for (let attempt = 0; attempt < limit; attempt++) {
+    const status = (await app.inject({url: `/api/v1/xtream/accounts/${accountId}/imports`, headers})).json();
+    if (!status.active) return status.latest;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error('import did not settle');
+}

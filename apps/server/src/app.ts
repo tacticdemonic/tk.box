@@ -38,8 +38,9 @@ import { registerCustomChannels } from './custom-api.js';
 import { CustomTv } from './services/custom-tv.js';
 import { PartProxy } from './providers/part-proxy.js';
 import { EpisodeSync } from './services/episode-sync.js';
-import { XtreamStore } from './persistence/xtream-store.js';
+import { XtreamStore, type XtreamImport } from './persistence/xtream-store.js';
 import { XtreamService } from './services/xtream-service.js';
+import { XtreamImports } from './services/xtream-imports.js';
 import { XtreamClient, type XtreamTransport } from './providers/xtream.js';
 import { registerXtream } from './xtream-api.js';
 
@@ -189,14 +190,18 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   let stopProviderStreams: (id: string) => void = () => {};
   xtream.onChange = id => stopProviderStreams(id);
   const xtreamService = new XtreamService(xtream, iptv, xtreamTransport ? (id: string) => new XtreamClient(xtream.credentials(id), xtreamTransport) : undefined);
-  registerXtream(app, xtream, xtreamService, admin, auth);
+  const xtreamImports = new XtreamImports(xtream, xtreamService, (message, detail) => app.log.warn(detail, message));
+  registerXtream(app, xtream, xtreamService, xtreamImports, admin, auth);
   // Provider sign-in for accounts without Plex. Authentication and the session are issued by the
-  // identity service only after the Xtream panel accepted the credentials.
+  // identity service only after the Xtream panel accepted the credentials. The catalogue and guide
+  // import is queued, never awaited: a large provider takes longer than any browser will wait, and
+  // a slow import must not be able to turn a good sign-in into a timeout.
   app.post('/api/v1/auth/xtream/login', {config: {rateLimit: {max: 10, timeWindow: 60000}}}, async (req, reply) => {
     const input = z.object({serverUrl: z.string().trim().min(1).max(2048), username: z.string().min(1).max(128), password: z.string().min(1).max(128),
       allowInsecureHttp: z.boolean().default(false), name: z.string().trim().min(1).max(120).optional(), bootstrapToken: z.string().trim().min(1).max(256).optional()}).strict().parse(req.body);
     const credentials = {serverUrl: input.serverUrl, username: input.username, password: input.password, allowInsecureHttp: input.allowInsecureHttp};
-    // The panel must accept the credentials before a session or a provider row exists.
+    // The panel must accept the credentials before a session or a provider row exists. This is the
+    // only provider call on the critical path: one bounded account validation.
     const login = await identity.xtreamLogin(credentials, () => new XtreamClient(credentials, xtreamTransport).authenticate(),
       {enabled: !config.plexConfigured, requiredToken: config.INITIAL_ADMIN_TOKEN, suppliedToken: input.bootstrapToken,
         reachable: !config.loopbackOnly || config.DEPLOYMENT_MODE === 'remote' || !!config.PUBLIC_BASE_URL});
@@ -207,20 +212,26 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
       // Replacing credentials revokes streams; only do that when they actually changed.
       if (!xtream.credentialsMatch(account.id, credentials)) xtream.update(login.accountId, account.id, {expectedRevision: account.revision, credentials});
     }
-    // A provider that authenticates but fails its first refresh still signs in; the account view
-    // reports the stable error code.
-    try { await xtreamService.refresh(login.accountId, account.id, {includeEpg: true}); } catch { /* recorded on the account */ }
+    // A returning viewer with a usable catalogue enters the application now; the queued import
+    // refreshes it in the background. Scheduling failure is reported as such, never as "queued".
+    let job: XtreamImport | null = null, importError: string | undefined;
+    try { job = xtreamImports.schedule(login.accountId, account.id, true, Date.now(), login.xtream); }
+    catch (error) { importError = error instanceof AppError ? error.code : 'IMPORT_UNAVAILABLE'; }
     reply.setCookie(sessionCookie, login.cookie, {...cookieOpts, maxAge: 43200});
-    return {status: 'authenticated', accountId: login.accountId, role: login.role, account: xtream.status(account.id)};
+    return {status: 'authenticated', accountId: login.accountId, role: login.role, account: xtream.status(account.id),
+      import: job ? {id: job.id, state: job.state, includeEpg: job.includeEpg} : null, ...(importError ? {importError} : {})};
   });
   const refresh = new SourceRefresh(iptv), custom = new CustomChannelStore(db);
-  // Scheduled and manual source refreshes for Xtream sources go through their account.
-  refresh.xtream = (actor, sourceId) => {
+  // Scheduled and manual source refreshes for Xtream sources go through their account, and through
+  // the same import manager as sign-in, so one provider never runs two imports.
+  refresh.xtream = async (actor, sourceId) => {
     const accountId = iptv.xtreamAccountFor(sourceId);
     requireThat(accountId, 'SOURCE_NOT_FOUND', 'Xtream account not found.', 404);
-    return xtreamService.refresh(actor, accountId, {includeEpg: true});
+    const job = await xtreamImports.run(actor, accountId, true);
+    requireThat(job.state === 'completed', job.error ?? 'XTREAM_IMPORT_FAILED', 'The provider import did not complete.', 502);
+    return {state: job.state, sourceId};
   };
-  registerIptv(app,iptv,refresh,auth,admin,undefined,undefined,custom,async (req,id,kind) => plex.artwork((await auth(req)).grant,id,kind));
+  registerIptv(app,iptv,refresh,auth,admin,undefined,undefined,custom,async (req,id,kind) => plex.artwork((await auth(req)).grant,id,kind),xtreamImports);
   const episodes = new EpisodeSync(custom, plex, () => identity.adminGrant(config.PLEX_OWNER_ACCOUNT_ID ? [config.PLEX_OWNER_ACCOUNT_ID] : []), (message, detail) => app.log.info(detail, message));
   registerCustomChannels(app,custom,plex,admin,episodes);
   app.addHook('onReady', async () => { episodes.start(); });
@@ -247,6 +258,9 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
     (message, detail) => app.log.info(detail, message));
   registerSports(app, iptv, sportsStore, sports, admin);
   refresh.published = () => sports.invalidate();
+  // Imports continue after the sign-in response; a published catalogue rematches sports events.
+  xtreamImports.published = () => sports.invalidate();
+  app.addHook('onReady', async () => { xtreamImports.start(); });
   app.addHook('onReady', async () => { void sports.tick(); });
   // Custom channels share the live session routes; their sessions belong to CustomTv.
   const parts = new PartProxy(plex), customTv = new CustomTv(custom, plex, localMedia, parts, budget, config.CACHE_DIR, () => settings.get().pauseRetentionMinutes * 60000, config.SEGMENT_CACHE_MAX_BYTES,
@@ -415,7 +429,7 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   };
   if (existsSync(webRoot)) await registerAssets(webRoot,'');
   const reaper = setInterval(() => identity.reap(), 30000); reaper.unref();
-  app.addHook('preClose', async () => {stopStreams(() => true); transcodes.close(); live.close(); customTv.close(); parts.close(); episodes.close(); health.close(); sports.close();});
+  app.addHook('preClose', async () => {await xtreamImports.close();stopStreams(() => true); transcodes.close(); live.close(); customTv.close(); parts.close(); episodes.close(); health.close(); sports.close();});
   app.addHook('onClose', async () => { clearInterval(reaper); });
   return app;
 }

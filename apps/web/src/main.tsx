@@ -14,6 +14,8 @@ import {HeaderSearch} from './header-search.js';
 const Settings=lazy(()=>import('./settings.js').then(m=>({default:m.Settings})));
 import {Live,ChannelPanel,rememberFeed,tuneTarget,hasFeed,stationName,type WatchChannel,type StationFeed} from './live.js';
 import {XtreamLogin} from './xtream-login.js';
+import {useImportProgress} from './import-progress.js';
+import {XtreamImportBanner} from './import-banner.js';
 import {beginNativePlayback,endNativePlayback,nativePlaybackOutcome,onNativePlaybackEvent,type NativePlayback} from './native-player.js';
 import {installTvNavigation} from './tv-navigation.js';
 import './style.css';
@@ -24,6 +26,10 @@ const navigation=[['home','Home'],['movies','Movies'],['shows','TV Shows'],['liv
 function App() {
   const route=useRoute(),identity=useApi<Principal&{libraries?:Library[]}>('/me'),setup=useApi<{plexConfigured:boolean;bootstrapTokenRequired?:boolean}>('/setup'),scrolled=useScrolled();
   const me=identity.error&&[401,403].includes(identity.error.status)?undefined:identity.data;
+  // A provider sign-in imports its catalogue after the session exists; the shell follows that work
+  // so the first import reads as progress rather than an empty guide.
+  const refreshImported=useCallback(()=>{invalidate('/guide');invalidate('/iptv/channels');},[]);
+  const imports=useImportProgress(!!me&&me.accountId.startsWith('local:xtream:'),refreshImported);
   const catalog=useApi<{libraries:Library[]}>(me&&!identity.data?.libraries?'/libraries':undefined),libraries=(identity.data?.libraries??catalog.data?.libraries??[]).filter(l=>['movie','show'].includes(l.type));
   const [session,setSession]=useState<Session>(),[error,setError]=useState(''),[busy,setBusy]=useState(false),[switching,setSwitching]=useState<'audio'|'quality'>(),[authUrl,setAuthUrl]=useState('');
   const failover=useRef(new LiveFailover()),[switchingLive,setSwitchingLive]=useState(false);
@@ -190,7 +196,7 @@ function App() {
   const content=!me?signIn:route.page==='home'?<Home libraries={libraries} onOpen={openItem} onPlay={play} onWatch={watchChannel} busy={busy}/>
     :libraryPage?<LibraryView key={`${me.accountId}-${route.page}`} accountId={me.accountId} type={route.page==='movies'?'movie':'show'} libraries={libraries} params={route.params} onOpen={openItem} onPlay={play} onPlayAll={playAll}/>
     :route.page==='search'?<Search libraries={libraries} params={route.params} onOpen={openItem} onPlay={play} onSearchChange={changeSearch}/>
-    :route.page==='live'?<Live key={me.accountId} admin={me.role==='admin'} params={route.params} accountId={me.accountId} onWatch={watchChannel} busy={busy} playing={session?.kind==='live'?session.channel.id:undefined}/>
+    :route.page==='live'?<Live key={me.accountId} admin={me.role==='admin'} params={route.params} accountId={me.accountId} onWatch={watchChannel} busy={busy} playing={session?.kind==='live'?session.channel.id:undefined} importing={!!imports.active&&!imports.channels?.length}/>
     :route.page==='settings'?<div className="page"><Suspense fallback={<Loading/>}><Settings me={me} onLogout={logout}/></Suspense></div>
     :watching?(native?<div className="page native-playing"><Empty title={native.title??'Playing on your TV'}><p>Playback is running in the TV player. Press Back to return to channels.</p><button className="primary" onClick={()=>void action(async()=>{await stop();window.location.hash=returnTo.current;})}>Stop and browse channels</button></Empty></div>:!session&&<div className="page"><Empty title="Nothing is playing"><a href="#home">Find something to watch</a></Empty></div>)
     :<div className="page"><Empty title="Page not found"><a href="#home">Return home</a></Empty></div>;
@@ -203,6 +209,7 @@ function App() {
     </header>}
     <main id="main-content" tabIndex={-1}>
       <ActionNotice/>
+      {me&&!watching&&<XtreamImportBanner progress={imports}/>}
       {error&&<div className="toast"><ErrorNotice message={error} dismiss={()=>setError('')}/></div>}
       {identity.loading&&!me?<div className="page"><Loading/></div>:<>{catalog.error&&<div className="page"><ErrorNotice message={catalog.error.message} retry={catalog.reload}/></div>}{content}</>}
     </main>

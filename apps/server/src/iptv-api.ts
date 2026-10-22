@@ -8,25 +8,38 @@ import { ChannelLogos } from './providers/channel-logos.js';
 import { LogoLibrary } from './providers/logo-library.js';
 import { sportIcon } from './providers/sport-icons.js';
 import type { CustomChannelStore } from './persistence/custom-channels.js';
+import type { XtreamImports } from './services/xtream-imports.js';
 
 type Access=(req:FastifyRequest)=>Promise<{grant:{accountId:string}}>;
 type Image={type:string;bytes:Buffer};
 // A Plex title's artwork, read with the viewer's own grant so it never shows a library they can't see.
 type PlexArtwork=(req:FastifyRequest,id:string,kind:'logo'|'poster')=>Promise<Image>;
-export function registerIptv(app:FastifyInstance,store:IptvStore,refresh:SourceRefresh,auth:Access,admin:Access,logos=new ChannelLogos(),library=new LogoLibrary(),custom?:CustomChannelStore,plexArtwork?:PlexArtwork) {
+export function registerIptv(app:FastifyInstance,store:IptvStore,refresh:SourceRefresh,auth:Access,admin:Access,logos=new ChannelLogos(),library=new LogoLibrary(),custom?:CustomChannelStore,plexArtwork?:PlexArtwork,imports?:XtreamImports) {
   const id=z.string().uuid(), revision=z.number().int().nonnegative();
   const sourceParams=(p:unknown)=>z.object({id}).parse(p).id;
   const channelParams=(p:unknown)=>z.object({id}).parse(p).id;
-  app.get('/api/v1/admin/iptv/sources',async req=>{await admin(req);return {sources:store.list().map(s=>({...s,running:refresh.active(s.id)}))};});
+  // An Xtream source's work runs through the import manager, so its running flag comes from there.
+  const running=(s:{id:string;xtreamAccountId?:string|null})=>refresh.active(s.id)||(s.xtreamAccountId?!!imports?.activeImport(s.xtreamAccountId):false);
+  app.get('/api/v1/admin/iptv/sources',async req=>{await admin(req);return {sources:store.list().map(s=>({...s,running:running(s)}))};});
   app.post('/api/v1/admin/iptv/sources',async req=>{const {grant}=await admin(req);return store.create(grant.accountId,sourceCreate.parse(req.body));});
-  app.put('/api/v1/admin/iptv/sources/order',async req=>{const {grant}=await admin(req);return {sources:store.reorder(grant.accountId,sourceOrder.parse(req.body)).map(s=>({...s,running:refresh.active(s.id)}))};});
+  app.put('/api/v1/admin/iptv/sources/order',async req=>{const {grant}=await admin(req);return {sources:store.reorder(grant.accountId,sourceOrder.parse(req.body)).map(s=>({...s,running:running(s)}))};});
   app.delete('/api/v1/admin/iptv/sources/:id',async req=>{
     const {grant}=await admin(req),input=z.object({expectedRevision:revision}).strict().parse(req.body);
     return refresh.remove(grant.accountId,sourceParams(req.params),input.expectedRevision);
   });
   app.patch('/api/v1/admin/iptv/sources/:id',async req=>{const {grant}=await admin(req);return store.policy(grant.accountId,sourceParams(req.params),sourcePolicy.parse(req.body));});
   app.put('/api/v1/admin/iptv/sources/:id/endpoint',async req=>{const {grant}=await admin(req),input=z.object({expectedRevision:revision,endpoint:sourceEndpoint}).strict().parse(req.body);return store.replaceEndpoint(grant.accountId,sourceParams(req.params),input.expectedRevision,input.endpoint);});
-  app.post('/api/v1/admin/iptv/sources/:id/refresh',async req=>{const {grant}=await admin(req);z.object({}).strict().parse(req.body);return refresh.refresh(grant.accountId,sourceParams(req.params));});
+  // An Xtream source's import is long; accept it and let the caller read the provider import's
+  // status, rather than holding the request open for the whole catalogue and guide.
+  app.post('/api/v1/admin/iptv/sources/:id/refresh',async (req,reply)=>{
+    const {grant}=await admin(req);z.object({}).strict().parse(req.body);
+    const id=sourceParams(req.params),accountId=store.xtreamAccountFor(id);
+    if(!accountId)return refresh.refresh(grant.accountId,id);
+    if(!imports)throw new AppError('XTREAM_IMPORT_UNAVAILABLE','The import service is unavailable.',503);
+    const job=imports.schedule(grant.accountId,accountId,true);
+    reply.code(202);
+    return {import:job,source:store.status(id)};
+  });
   app.post('/api/v1/admin/iptv/sources/:id/upload',{bodyLimit:17*1024*1024},async req=>{
     const {grant}=await admin(req),input=z.object({expectedRevision:revision,text:z.string().max(16*1024*1024)}).strict().parse(req.body);
     const id=sourceParams(req.params),result=store.ingest(grant.accountId,id,input.expectedRevision,Buffer.from(input.text));refresh.published(id);return result;

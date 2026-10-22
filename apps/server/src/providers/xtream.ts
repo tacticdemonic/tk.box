@@ -299,8 +299,10 @@ export class XtreamClient {
     ensure(/^[\w.:-]{1,128}$/.test(channelId), 'XTREAM_INVALID_RESPONSE', 'Invalid guide channel identifier.');
     return parseShortEpg(await this.json(this.endpointUrl('player_api.php', 'get_short_epg', {stream_id: channelId}), signal), channelId);
   }
-  async catalogue(options: { includeEpg?: boolean; signal?: AbortSignal; now?: number } = {}): Promise<XtreamCatalogue> {
-    const account = await this.authenticate(options.signal);
+  async catalogue(options: { includeEpg?: boolean; signal?: AbortSignal; now?: number; account?: XtreamAccount } = {}): Promise<XtreamCatalogue> {
+    // A sign-in has just authenticated this account; repeating that call would put a second
+    // provider round trip in the same login sequence for no new information.
+    const account = options.account ?? await this.authenticate(options.signal);
     const categories = await this.liveCategories(options.signal);
     const { streams, ignored } = await this.liveStreams(undefined, options.signal);
     const catalogue: XtreamCatalogue = {

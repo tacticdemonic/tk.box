@@ -122,22 +122,35 @@ export function parseXmltv(input: Buffer | string): XmlSnapshot {
 
 const normalized = (s: string) => s.normalize('NFKC').toLocaleLowerCase('en').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 export type GuideMapping = { sourceId: string; feedId: string; channelId: string; xmlId: string; method: 'exact_id' | 'admin'; reviewedBy?: string; revision: number };
-export function resolveGuideMapping(scope: {sourceId: string; feedId: string; channelId: string}, channel: M3uChannel, sourceChannels: M3uChannel[], xml: XmlSnapshot, current?: GuideMapping): GuideMapping | undefined {
+// Guide resolution runs for every channel of a source. Indexing the provider ids once per pass
+// keeps that linear: without it, a large lineup compares every channel against every other.
+export type GuideIndex = { byTvgId: Map<string, M3uChannel[]>; xmlCounts: Map<string, number> };
+export function guideIndex(sourceChannels: M3uChannel[], xml: XmlSnapshot): GuideIndex {
+  const byTvgId = new Map<string, M3uChannel[]>(), xmlCounts = new Map<string, number>();
+  for (const c of sourceChannels) {
+    const list = byTvgId.get(c.tvgId);
+    if (list) list.push(c); else byTvgId.set(c.tvgId, [c]);
+  }
+  for (const c of xml.channels) xmlCounts.set(c.id, (xmlCounts.get(c.id) ?? 0) + 1);
+  return { byTvgId, xmlCounts };
+}
+export function resolveGuideMapping(scope: {sourceId: string; feedId: string; channelId: string}, channel: M3uChannel, sourceChannels: M3uChannel[], xml: XmlSnapshot, current?: GuideMapping, index?: GuideIndex): GuideMapping | undefined {
+  const counts = index?.xmlCounts;
   if (current) {
-    const valid = current.sourceId === scope.sourceId && current.feedId === scope.feedId && current.channelId === scope.channelId && xml.channels.filter(c => c.id === current.xmlId).length === 1;
+    const valid = current.sourceId === scope.sourceId && current.feedId === scope.feedId && current.channelId === scope.channelId && (counts ? counts.get(current.xmlId) === 1 : xml.channels.filter(c => c.id === current.xmlId).length === 1);
     if (current.method === 'admin') return valid ? current : undefined;
   }
-  const exactId = exactGuideId(channel, sourceChannels, xml);
+  const exactId = exactGuideId(channel, sourceChannels, xml, index);
   return exactId ? {...scope, xmlId: exactId, method: 'exact_id', revision: current?.xmlId === exactId ? current.revision : (current?.revision ?? 0) + 1} : undefined;
 }
 // Multiple feeds may share one guide ID. It is automatic only when their station names agree;
 // unrelated stations reusing an ID still require a manual guide choice. Resolving runs for every channel on
 // each sports rematch, so it skips mappingCandidates' name suggestions, which normalize every guide name.
-function exactGuideId(channel: M3uChannel, sourceChannels: M3uChannel[], xml: XmlSnapshot) {
+function exactGuideId(channel: M3uChannel, sourceChannels: M3uChannel[], xml: XmlSnapshot, index?: GuideIndex) {
   if (!channel.tvgId) return undefined;
-  const station=stackKey(channel.name),siblings=sourceChannels.filter(c=>c.tvgId===channel.tvgId);
+  const station=stackKey(channel.name),siblings=index?.byTvgId.get(channel.tvgId)??sourceChannels.filter(c=>c.tvgId===channel.tvgId);
   if(siblings.length>1&&(!station||siblings.some(c=>stackKey(c.name)!==station)))return undefined;
-  return xml.channels.filter(c => c.id === channel.tvgId).length === 1 ? channel.tvgId : undefined;
+  return (index?.xmlCounts.get(channel.tvgId) ?? xml.channels.filter(c => c.id === channel.tvgId).length) === 1 ? channel.tvgId : undefined;
 }
 export function mappingCandidates(channel: M3uChannel, sourceChannels: M3uChannel[], xml: XmlSnapshot) {
   const counts = new Map<string, number>(); for (const c of xml.channels) counts.set(c.id, (counts.get(c.id) ?? 0) + 1);

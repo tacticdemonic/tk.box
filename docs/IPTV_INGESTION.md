@@ -31,7 +31,7 @@ These rules apply to source **metadata**, not to HLS manifests, nested playlists
 
 ## Refresh and guide behavior
 
-Remote sources are due immediately after creation; persisted independent defaults are 12h for M3U and 6h for XMLTV. Intervals accept whole hours from 1 through 168. The application checks due work at startup and every 15 seconds. Scheduled and manual refreshes coalesce per source; at most four source fetches run globally. This registry assumes one application process, consistent with the native service design. Uploaded sources have no automatic due time and report `STATIC_SOURCE` for Refresh Now.
+An Xtream source's manual refresh is accepted, not awaited: the response is `202` and its progress comes from the provider import, so a large catalogue never occupies a browser request. Remote M3U/XMLTV sources are due immediately after creation; persisted independent defaults are 12h for M3U and 6h for XMLTV. Intervals accept whole hours from 1 through 168. The application checks due work at startup and every 15 seconds. Scheduled and manual refreshes coalesce per source; at most four source fetches run globally. This registry assumes one application process, consistent with the native service design. Uploaded sources have no automatic due time and report `STATIC_SOURCE` for Refresh Now.
 
 Failures retain the last success/snapshot and saved interval, with a sanitized diagnostic and next attempt at the saved cadence. HTTP 429/503 Retry-After is honored with a minimum one-minute backoff and maximum seven-day guard; next due never precedes either that backoff or the saved cadence. Manual refresh cannot bypass active provider backoff. There is no automatic in-request retry loop. Shutdown aborts active work and preserves its due time for the next process. Policy/endpoint edits win over stale fetch results.
 
@@ -49,7 +49,7 @@ Use the configured application origin and an existing authenticated owner cookie
 | PATCH `/api/v1/admin/iptv/sources/:id` | `{expectedRevision,intervalHours}` |
 | PUT `/api/v1/admin/iptv/sources/:id/endpoint` | `{expectedRevision,endpoint}`; protected credential/origin replacement, retains source identity |
 | POST `/api/v1/admin/iptv/sources/:id/upload` | `{expectedRevision,text}`; UTF-8 M3U/XMLTV, including uploaded fixture files |
-| POST `/api/v1/admin/iptv/sources/:id/refresh` | `{}`; fetch saved endpoint, coalescing scheduled/manual work |
+| POST `/api/v1/admin/iptv/sources/:id/refresh` | `{}`; M3U/XMLTV: fetch the saved endpoint, coalescing scheduled/manual work. Xtream: `202 Accepted` with `{import, source}`; poll `GET /api/v1/xtream/accounts/:id/imports` |
 | GET `/api/v1/admin/iptv/sources/:id/candidate` | Review held snapshot's sanitized incoming/missing records and digest |
 | POST `/api/v1/admin/iptv/sources/:id/candidate/accept` | `{expectedRevision,digest}`; publish only that reviewed candidate |
 | GET `/api/v1/admin/iptv/sources/:id/channels` | Channels with listing override, listing state (why each is or is not listed), presence/conflicts, first/last seen, missing time and curation; plus a count per state |

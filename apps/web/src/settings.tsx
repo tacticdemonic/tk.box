@@ -389,7 +389,7 @@ function SourceDetail({source,sources,changed,removed,back}:{source:Source;sourc
     <button className="back-link" onClick={back}><Icon name="back" size={16}/>All sources</button>
     <div className="source-head">
       <div className="source-title"><span className={`status-dot ${source.lastError?'danger':source.lastSuccess?'ok':''}`} aria-hidden="true"/><div><h2>{source.name}</h2><p className="muted small">{source.remote?`Remote playlist · refreshes every ${source.intervalHours}h`:'Uploaded playlist'} · {channels.data?`${listedCount(summary)} of ${plural(total,'channel')} listed`:'Loading channels…'}</p></div></div>
-      {source.remote&&<div className="button-row"><button disabled={source.running||mutation.busy} onClick={()=>void mutation.run(()=>api(`/admin/iptv/sources/${source.id}/refresh`,'POST',{}))}><Icon name="restart" size={16}/>{source.running?'Refreshing…':'Refresh now'}</button></div>}
+      {source.remote&&<div className="button-row"><button disabled={source.running||mutation.busy} onClick={()=>void mutation.run(async()=>{await api(`/admin/iptv/sources/${source.id}/refresh`,'POST',{});changed();})}><Icon name="restart" size={16}/>{source.running?'Refreshing…':'Refresh now'}</button></div>}
     </div>
     {mutation.error&&<ErrorNotice message={mutation.error}/>}
     <div className="subtabs" role="tablist" aria-label={`${source.name} settings`}>{sourceTabs.map(([id,label])=><button key={id} role="tab" aria-selected={tab===id} onClick={()=>setTab(id)}>{label}{id==='channels'&&channels.data?<span className="count">{total}</span>:null}</button>)}</div>
