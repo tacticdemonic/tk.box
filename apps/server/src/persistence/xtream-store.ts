@@ -13,6 +13,20 @@ type AccountRow = {
   last_validated: number | null; last_error: string | null; enabled: number; created_at: number; updated_at: number;
 };
 
+type ImportRow = {
+  id: string; account_id: string; actor: string; include_epg: number; revision: number;
+  state: XtreamImportState; stage: string | null; error: string | null; guide_error: string | null;
+  created_at: number; started_at: number | null; finished_at: number | null;
+};
+export type XtreamImportState = 'queued' | 'running' | 'completed' | 'failed' | 'interrupted';
+// The observable state of one catalogue/guide import. Account-scoped, so it exists before the
+// provider has ever published an iptv_sources row.
+export type XtreamImport = {
+  id: string; accountId: string; state: XtreamImportState; stage: string | null;
+  error: string | null; guideError: string | null; includeEpg: boolean;
+  createdAt: number; startedAt: number | null; finishedAt: number | null;
+};
+
 export const xtreamAccountCreate = z.object({ name: z.string().trim().min(1).max(120), credentials: xtreamCredentials }).strict();
 export const xtreamAccountUpdate = z.object({
   expectedRevision: z.number().int().nonnegative(),
@@ -37,6 +51,73 @@ export class XtreamStore {
   }
   private audit(actor: string, event: string, id: string, now: number) {
     this.db.prepare('INSERT INTO audit(actor,event,at,detail) VALUES(?,?,?,?)').run(actor, event, now, JSON.stringify({ id }));
+  }
+  private importOf(row: ImportRow): XtreamImport {
+    return { id: row.id, accountId: row.account_id, state: row.state, stage: row.stage, error: row.error,
+      guideError: row.guide_error, includeEpg: !!row.include_epg, createdAt: row.created_at, startedAt: row.started_at, finishedAt: row.finished_at };
+  }
+  private importRow(id: string) {
+    const row = this.db.prepare('SELECT * FROM xtream_imports WHERE id=?').get(id) as ImportRow | undefined;
+    requireThat(row, 'XTREAM_IMPORT_NOT_FOUND', 'Import not found.', 404);
+    return row;
+  }
+  // A repeated sign-in or refresh joins the active import instead of creating a second one. The
+  // partial unique index is the real guarantee; this returns the row it collided with.
+  queueImport(actor: string, id: string, includeEpg: boolean, now = Date.now()) {
+    const account = this.row(id);
+    requireThat(account.enabled, 'XTREAM_ACCOUNT_DISABLED', 'This provider is disabled.', 409);
+    return this.db.transaction(() => {
+      const active = this.db.prepare("SELECT * FROM xtream_imports WHERE account_id=? AND state IN ('queued','running')").get(id) as ImportRow | undefined;
+      if (active) return { import: this.importOf(active), created: false };
+      const job = randomUUID();
+      this.db.prepare('INSERT INTO xtream_imports(id,account_id,actor,include_epg,revision,state,created_at) VALUES(?,?,?,?,?,?,?)')
+        .run(job, id, actor, Number(includeEpg), account.revision, 'queued', now);
+      this.audit(actor, 'xtream_import_queued', id, now);
+      return { import: this.importOf(this.importRow(job)), created: true };
+    })();
+  }
+  // Takes the oldest queued job for an account that is not already running. The claim is a
+  // conditional update, so two pumps (or a restart racing a tick) cannot both start it.
+  claimImport(now = Date.now()) {
+    return this.db.transaction(() => {
+      const row = this.db.prepare(`SELECT * FROM xtream_imports i WHERE i.state='queued'
+        AND NOT EXISTS (SELECT 1 FROM xtream_imports r WHERE r.account_id=i.account_id AND r.state='running')
+        ORDER BY i.created_at,i.rowid LIMIT 1`).get() as ImportRow | undefined;
+      if (!row) return undefined;
+      const claimed = this.db.prepare("UPDATE xtream_imports SET state='running',started_at=?,stage='catalogue' WHERE id=? AND state='queued'").run(now, row.id);
+      return claimed.changes === 1 ? { import: this.importOf(this.importRow(row.id)), actor: row.actor } : undefined;
+    })();
+  }
+  importStage(id: string, stage: string) {
+    this.db.prepare("UPDATE xtream_imports SET stage=? WHERE id=? AND state='running'").run(stage, id);
+  }
+  finishImport(id: string, result: { state: 'completed' | 'failed' | 'interrupted'; error?: string; guideError?: string }, now = Date.now()) {
+    this.db.prepare("UPDATE xtream_imports SET state=?,stage=NULL,error=?,guide_error=?,finished_at=? WHERE id=? AND state IN ('queued','running')")
+      .run(result.state, result.error ?? null, result.guideError ?? null, now, id);
+    return this.importOf(this.importRow(id));
+  }
+  import(id: string) { return this.importOf(this.importRow(id)); }
+  // Import rows belong to the provider account, so they outlive the first publication and are
+  // visible to whoever may read that account.
+  imports(accountId: string, limit = 5) {
+    this.row(accountId);
+    return (this.db.prepare('SELECT * FROM xtream_imports WHERE account_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?').all(accountId, limit) as ImportRow[]).map(row => this.importOf(row));
+  }
+  // The active import plus the most recent finished one, which is what a client polls.
+  importStatus(accountId: string) {
+    const jobs = this.imports(accountId, 5);
+    return { active: jobs.find(job => job.state === 'queued' || job.state === 'running') ?? null, latest: jobs[0] ?? null };
+  }
+  // Shutdown and restart: nothing survives in memory, so unfinished rows are reported as
+  // interrupted rather than left "running" forever.
+  interruptStaleImports(now = Date.now()) {
+    const changed = this.db.prepare("UPDATE xtream_imports SET state='interrupted',stage=NULL,error='IMPORT_INTERRUPTED',finished_at=? WHERE state IN ('queued','running')").run(now);
+    return changed.changes;
+  }
+  // True while the account still has the revision and access the import was queued against.
+  importCurrent(job: XtreamImport) {
+    const row = this.db.prepare('SELECT revision,enabled FROM xtream_accounts WHERE id=?').get(job.accountId) as { revision: number; enabled: number } | undefined;
+    return !!row && row.enabled === 1 && row.revision === this.importRow(job.id).revision;
   }
   private statusOf(row: AccountRow) {
     return {

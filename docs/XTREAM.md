@@ -73,19 +73,79 @@ control-stripped, collapsed and bounded. Logos must be `http(s)` without userinf
 and `ts` are relayed as live. Duplicate stream ids keep the first row. A catalogue is capped at
 20,000 channels, 2,000 categories.
 
-## Refresh and last-known-good
+## Refresh, import lifecycle and last-known-good
 
-`XtreamService.refresh`:
+Catalogue and guide retrieval is **not** part of a sign-in response. `POST /auth/xtream/login`
+performs exactly one bounded provider call — account authentication — then issues the session,
+records the provider account and asks `XtreamImports` for an import. The response returns while
+that import is still queued or running.
 
-1. authenticates (`XTREAM_AUTH_FAILED`, `XTREAM_ACCOUNT_INACTIVE`, `XTREAM_ACCOUNT_EXPIRED` fail closed),
+`XtreamImports` (`apps/server/src/services/xtream-imports.ts`) owns every import, whichever caller
+started it:
+
+| Caller | Behaviour |
+| --- | --- |
+| Sign-in | queues an import, returns immediately |
+| `POST /xtream/accounts/:id/refresh` and the admin equivalent | answers `202 Accepted` with the job, does not wait |
+| Scheduled source refresh | awaits the job, so the existing source backoff applies |
+| `POST /xtream/accounts` with `validate` | validation only; never reported as an import |
+
+Lifecycle, persisted in `xtream_imports` (fork migration 1003):
+
+| State | Meaning |
+| --- | --- |
+| `queued` | recorded, not started; the account already has another import or the server is at its limit |
+| `running` | fetching; `stage` is `catalogue` then `publish` |
+| `completed` | catalogue sealed and published; `guide_error` may still name a guide-only failure |
+| `failed` | terminal `error` is a stable code (`XTREAM_TIMEOUT`, `XTREAM_UNREACHABLE`, `XTREAM_EMPTY_CATALOGUE`, `XTREAM_CREDENTIALS_CHANGED`, …) |
+| `interrupted` | the process restarted or shut down mid-import; `error` is `IMPORT_INTERRUPTED` |
+
+- **Deduplication** is a database rule: a partial unique index allows one `queued`/`running` row
+  per provider account, so a repeated sign-in or a refresh click joins the existing job.
+- **Concurrency** is two imports server-wide, claimed with a conditional update, and still one
+  provider operation per account (a validation excludes an import and vice versa; the import is
+  re-queued rather than failed).
+- **Staleness** is checked after the fetch and before anything is sealed or published: a
+  credential change, disable or removal that happened during the fetch fails the job with
+  `XTREAM_CREDENTIALS_CHANGED` and leaves the previous catalogue and channels untouched.
+- **Restart** marks every inherited `queued`/`running` row `interrupted`; shutdown aborts in-flight
+  work, waits for it, and marks anything left.
+- **First import** needs no `iptv_sources` row: the job is keyed by the provider account, so a
+  first-ever catalogue is observable before it is published.
+
+A failed import records the stable code on the provider account and job and keeps the last good
+catalogue, channels, guide, numbers, listings and favourites. It is never presented as a rejected
+sign-in: genuine expiry, revocation and invalid credentials still fail the sign-in itself.
+
+`XtreamService.import` (behind the manager):
+
+1. reuses the account already authenticated by the sign-in, instead of validating it twice,
 2. fetches categories, channels and (optionally) guide,
 3. rejects an empty channel list (`XTREAM_EMPTY_CATALOGUE`) rather than wiping a working lineup,
-4. seals the catalogue, updates account metadata, then publishes into `iptv_sources`.
+4. checks staleness, seals the catalogue, updates account metadata, then publishes into `iptv_sources`.
 
-A failure at any step records the stable code on the account and leaves the previous catalogue,
-channels, guide, numbers and favourites untouched. Scheduled refreshes run every 12 hours through
-`SourceRefresh`, which routes `kind='xtream'` sources back to the account. Credential changes
-clear the catalogue, hide the old channels and stop their relays.
+## Import API and UI
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/v1/xtream/accounts/:id/refresh` | accept an import; `202 Accepted`, body `{import, account, usage}` |
+| `GET` | `/api/v1/xtream/accounts/:id/imports` | `{imports, active, latest}` for that provider |
+| `GET` | `/api/v1/xtream/accounts/:id/imports/:importId` | one job |
+| `POST` | `/api/v1/admin/xtream/accounts/:id/refresh` | the same contract under the admin surface |
+| `GET` | `/api/v1/admin/xtream/accounts/:id/imports` | the same status under the admin surface |
+
+Every one of these authorises through the same provider access check as the account itself, so a
+foreign account gets `404`, exactly like an unknown provider. The login response adds
+`import: {id, state, includeEpg}` or `import: null` plus `importError` when the job could not be
+recorded — it never claims an import was queued when scheduling failed.
+
+The web client leaves the sign-in form as soon as the session exists and follows the job with
+bounded polling (`apps/web/src/import-progress.ts`): 3-second interval, one request in flight,
+stops on terminal state, unmount, logout and account change. It shows *"Signed in. Loading
+channels…"*, *"Refreshing channels…"*, the publish stage, guide-only failure, import failure with
+**Retry**, and interruption — never a percentage. Cached channels stay browsable while a refresh
+runs, and the guide shows a progress state instead of "No channels" during a first import.
+
 
 ## Application identity
 
@@ -161,7 +221,12 @@ they appear in the guide without waiting for a first passing probe.
 - **Authorisation** — provider routes answer 404 for a provider the caller cannot use; account
   mutation needs ownership or administrator. Cross-account isolation is covered by tests.
 - **Provider limits** — one in-flight catalogue operation per account, four server-wide, plus the
-  playback/check leases described above.
+  playback/check leases described above. Imports run at most two at a time and are claimed with a
+  conditional update, so a duplicate cannot start.
+- **Responsiveness** — a published catalogue is built from one indexed pass. `iptv_sources` rows
+  are read without their sealed payloads and guide resolution uses a per-pass index, so an
+  8,436-channel import no longer blocks the event loop while it publishes (measured 38 s → 1.1 s
+  for the publish step on the synthetic 8,436-channel catalogue).
 - **Scope** — documented provider APIs only. No DRM circumvention, no panel scraping.
 
 ## Configuration
@@ -179,6 +244,12 @@ and the optional per-provider checks are configured under the source's Checks ta
 - `tests/xtream-playback.test.ts` (1): a synthetic Xtream panel with a real FFmpeg MPEG-TS stream;
   remux, segment fetch, per-provider connection refusal, revocation and disabled-account
   termination.
+- `tests/xtream-imports.test.ts` (11): sign-in returns while a deliberately delayed import is
+  pending, `/me` works before it completes, rejected credentials and a wrong bootstrap token issue
+  no session or job, repeated sign-ins and refreshes join one job, status is account-scoped,
+  catalogue and guide failures keep the last known channels, a credential change mid-import
+  publishes nothing, a restart reports interrupted, an 8,436-channel import keeps health/status/UI
+  reads responsive, and a validation is never mistaken for a completed import.
 
 ## Limitations
 

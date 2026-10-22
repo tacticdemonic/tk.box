@@ -11,7 +11,7 @@ import type { SourceEndpoint } from '../apps/server/src/providers/source-fetch.j
 import { PlexAdapter } from '../apps/server/src/providers/plex.js';
 import { IdentityService } from '../apps/server/src/services/identity.js';
 import { buildApp } from '../apps/server/src/app.js';
-import { config, fakePlex } from './fixtures.js';
+import { config, fakePlex, settle } from './fixtures.js';
 
 const credentials = {serverUrl: 'https://provider.example:8443', username: 'viewer-name', password: 'secret-pass'};
 const future = () => String(Math.floor(Date.now() / 1000) + 86400);
@@ -223,8 +223,12 @@ test('admin API stores providers, hides credentials, and exposes a URL-free cata
     assert.equal(list.json().accounts.length, 1); assert.ok(!list.body.includes('secret-pass'));
 
     const refreshed = await app.inject({method: 'POST', url: `/api/v1/admin/xtream/accounts/${account.id}/refresh`, headers, payload: {includeEpg: false}});
-    assert.equal(refreshed.statusCode, 200, refreshed.body);
-    assert.equal(refreshed.json().channels, 2); assert.ok(!refreshed.body.includes('secret-pass'));
+    // Refresh accepts work and answers immediately; the import reports its own progress.
+    assert.equal(refreshed.statusCode, 202, refreshed.body);
+    assert.equal(refreshed.json().import.state, 'queued');
+    assert.ok(!refreshed.body.includes('secret-pass'));
+    const finished = await settle(app, account.id, headers);
+    assert.equal(finished.state, 'completed', JSON.stringify(finished));
     const catalogue = await app.inject({url: `/api/v1/admin/xtream/accounts/${account.id}/catalogue`, headers});
     assert.equal(catalogue.statusCode, 200);
     assert.equal(catalogue.json().total, 2); assert.equal(catalogue.json().channels[0].name, 'UK: News HD');

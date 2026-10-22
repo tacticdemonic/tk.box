@@ -200,6 +200,29 @@ export function openDatabase(path: string) {
             updated_at INTEGER NOT NULL);`);
         db.prepare('INSERT INTO migrations VALUES(1002)').run();
     }
+    // Fork migration 1003: catalogue/guide imports are tracked work, not a side effect of a
+    // login request. Rows are account-scoped so a first import is observable before any
+    // iptv_sources row is published. The partial unique index makes "one active import per
+    // provider" a database rule, not a promise in memory. A restart cannot leave a job
+    // running: the import service marks leftovers interrupted when it starts.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=1003').get()) {
+      db.exec(`CREATE TABLE IF NOT EXISTS xtream_imports(
+        id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL REFERENCES xtream_accounts(id) ON DELETE CASCADE,
+        actor TEXT NOT NULL,
+        include_epg INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('queued','running','completed','failed','interrupted')),
+        stage TEXT,
+        error TEXT,
+        guide_error TEXT,
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        finished_at INTEGER);
+        CREATE UNIQUE INDEX IF NOT EXISTS xtream_imports_active ON xtream_imports(account_id) WHERE state IN ('queued','running');
+        CREATE INDEX IF NOT EXISTS xtream_imports_recent ON xtream_imports(account_id,created_at);`);
+      db.prepare('INSERT INTO migrations VALUES(1003)').run();
+    }
   })();
   } finally {
     db.pragma('foreign_keys = ON');

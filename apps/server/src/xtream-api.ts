@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { AppError, requireThat } from './errors.js';
 import { xtreamAccess, xtreamAccountCreate, xtreamAccountUpdate, type XtreamStore } from './persistence/xtream-store.js';
 import type { XtreamService } from './services/xtream-service.js';
+import type { XtreamImports } from './services/xtream-imports.js';
 import { cataloguePage } from './providers/xtream.js';
 
 type Access = (req: FastifyRequest) => Promise<{grant: {accountId: string; role?: string}}>;
@@ -19,7 +20,7 @@ const page = z.object({
 // Xtream surface. Provider accounts are a resource, so every viewer route authorises through
 // `xtream_access`, while account management is limited to an administrator or the account's
 // owner. No route returns a username, password or stream address.
-export function registerXtream(app: FastifyInstance, store: XtreamStore, service: XtreamService, admin: Access, viewer: Access) {
+export function registerXtream(app: FastifyInstance, store: XtreamStore, service: XtreamService, imports: XtreamImports, admin: Access, viewer: Access) {
   const params = (value: unknown) => z.object({id}).parse(value).id;
   // Administrators reach every provider; everyone else only what was granted to them. A
   // provider account the caller cannot see is reported as missing, not forbidden.
@@ -61,11 +62,24 @@ export function registerXtream(app: FastifyInstance, store: XtreamStore, service
     z.object({}).strict().parse(req.body ?? {});
     return validation(accountId, caller);
   });
-  app.post('/api/v1/xtream/accounts/:id/refresh', async req => {
+  app.post('/api/v1/xtream/accounts/:id/refresh', async (req, reply) => {
     const {accountId, caller} = await readable(req);
     const input = z.object({includeEpg: z.boolean().default(true)}).strict().parse(req.body ?? {});
-    const result = await service.refresh(caller, accountId, {includeEpg: input.includeEpg});
-    return {...result, account: store.status(accountId), usage: service.usage()};
+    // Accepted work, not a finished import: the browser gets its answer now and polls status.
+    const job = imports.schedule(caller, accountId, input.includeEpg);
+    reply.code(202);
+    return {import: job, account: store.status(accountId), usage: service.usage()};
+  });
+  app.get('/api/v1/xtream/accounts/:id/imports', async req => {
+    const {accountId} = await readable(req);
+    return {imports: store.imports(accountId), ...store.importStatus(accountId)};
+  });
+  app.get('/api/v1/xtream/accounts/:id/imports/:importId', async req => {
+    const {accountId} = await readable(req);
+    const importId = z.object({id, importId: z.string().uuid()}).parse(req.params).importId;
+    // Scoped the same way as the account itself: a foreign import is reported as missing.
+    requireThat(store.import(importId).accountId === accountId, 'XTREAM_IMPORT_NOT_FOUND', 'Import not found.', 404);
+    return store.import(importId);
   });
   app.get('/api/v1/xtream/accounts/:id/catalogue', async req => {
     const {accountId} = await readable(req), catalogue = store.catalogue(accountId);
@@ -96,11 +110,17 @@ export function registerXtream(app: FastifyInstance, store: XtreamStore, service
     z.object({}).strict().parse(req.body ?? {});
     return validation(params(req.params), grant.accountId);
   });
-  app.post('/api/v1/admin/xtream/accounts/:id/refresh', async req => {
+  app.post('/api/v1/admin/xtream/accounts/:id/refresh', async (req, reply) => {
     const {grant} = await admin(req), accountId = params(req.params);
     const input = z.object({includeEpg: z.boolean().default(true)}).strict().parse(req.body ?? {});
-    const result = await service.refresh(grant.accountId, accountId, {includeEpg: input.includeEpg});
-    return {...result, account: store.status(accountId)};
+    const job = imports.schedule(grant.accountId, accountId, input.includeEpg);
+    reply.code(202);
+    return {import: job, account: store.status(accountId)};
+  });
+  app.get('/api/v1/admin/xtream/accounts/:id/imports', async req => {
+    await admin(req);
+    const accountId = params(req.params);
+    return {imports: store.imports(accountId), ...store.importStatus(accountId)};
   });
   app.get('/api/v1/admin/xtream/accounts/:id/catalogue', async req => {
     await admin(req);

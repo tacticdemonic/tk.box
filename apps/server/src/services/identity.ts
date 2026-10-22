@@ -2,7 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import type { Db } from '../persistence/database.js';
 import type { PlexAdapter, PlexGrant } from '../providers/plex.js';
 import { Vault, opaque, digest } from '../security/vault.js';
-import { normalizeXtreamEndpoint } from '../providers/xtream.js';
+import { normalizeXtreamEndpoint, type XtreamAccount } from '../providers/xtream.js';
 import { requireThat } from '../errors.js';
 
 export type BootstrapGuard = boolean | { enabled: boolean; requiredToken?: string; suppliedToken?: string; reachable?: boolean };
@@ -22,7 +22,7 @@ export class IdentityService {
   // username, so the same subscription always resumes the same local identity. A provider
   // password never becomes an application credential and is never stored in a session.
   hasLocalAdmin() { return !!this.db.prepare("SELECT 1 FROM xtream_identities WHERE role='admin'").get(); }
-  async xtreamLogin(input: {serverUrl: string; username: string; password: string; allowInsecureHttp?: boolean}, authenticate: () => Promise<unknown>, bootstrap: BootstrapGuard = false, now = Date.now()) {
+  async xtreamLogin(input: {serverUrl: string; username: string; password: string; allowInsecureHttp?: boolean}, authenticate: () => Promise<XtreamAccount>, bootstrap: BootstrapGuard = false, now = Date.now()) {
     const boot = typeof bootstrap === 'boolean' ? { enabled: bootstrap } : bootstrap;
     if (boot.enabled && !this.hasLocalAdmin()) {
       requireThat(!boot.reachable || !!boot.requiredToken, 'BOOTSTRAP_LOCKED', 'A deployment reachable from another device requires INITIAL_ADMIN_TOKEN.', 403);
