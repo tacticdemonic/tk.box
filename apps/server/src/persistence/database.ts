@@ -233,6 +233,13 @@ export function openDatabase(path: string) {
     if (!hasColumn('iptv_sources', 'guide_status')) db.exec('ALTER TABLE iptv_sources ADD COLUMN guide_status TEXT');
     if (!hasColumn('xtream_imports', 'guide_status')) db.exec('ALTER TABLE xtream_imports ADD COLUMN guide_status TEXT');
     db.prepare('INSERT OR IGNORE INTO migrations VALUES(1004)').run();
+    // Fork migration 1005: each channel's guide icon is derived when the guide is published, so a
+    // logo request reads one small row instead of decrypting the programme guide. Existing databases
+    // are backfilled by `IptvStore.relistAll()` on the next startup; no reimport is required.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=1005').get()) {
+      db.exec('CREATE TABLE IF NOT EXISTS iptv_channel_icons(channel_id TEXT PRIMARY KEY REFERENCES iptv_channels(id) ON DELETE CASCADE, icon TEXT NOT NULL)');
+      db.prepare('INSERT INTO migrations VALUES(1005)').run();
+    }
   })();
   } finally {
     db.pragma('foreign_keys = ON');

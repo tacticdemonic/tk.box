@@ -1,13 +1,35 @@
 # tk.box implementation status
 
-Updated October 22, 2026. **M03.4 repairs Xtream guide retrieval. The missing EPG was two
-application defects — a 16 MiB decompression ceiling and an unconditional XMLTV DTD rejection —
-not provider unreachability. Node tests, typecheck, the production build and the compiled server
-are locally verified, and the real provider feed now reaches the rendered guide. Hosted CI and an
-M03.4 physical retest remain open. M03.3 physical acceptance was reported by the user/Hermes; see
+Updated October 22, 2026. **M03.5 removes the guide read-path stall that blocked paging on a
+populated EPG. The dominant defect was not repeated guide decryption but `IS NOT NULL` on the
+guide blob, which made every source-metadata read walk 37 MB of overflow pages. A 50-row page went
+from ~50 s to ~185 ms on the same compiled server and dataset. M03.4 physical retest and the M03.5
+physical retest both remain open. M03.3 physical acceptance was reported by the user/Hermes; see
 its record.**
 
-## Latest pass: M03.4 — Xtream EPG diagnosed and repaired
+## Latest pass: M03.5 — guide and logo read-path stalls
+
+- **Measured cause.** `IptvStore.source()` projected `encrypted_guide IS NOT NULL`. SQLite evaluates
+  that by reading the value, so every call walked the whole 37 MB guide: 20.8 ms per call, on a
+  projection the guide page made hundreds of times. `typeof(encrypted_guide)='text'` reads only the
+  header (0.01 ms) with identical semantics.
+- **Duplicate work removed.** Xtream channel metadata now comes from the published snapshot rather
+  than the catalogue that also carries the guide; per-channel metadata is cached by its own sealed
+  payload; programmes are indexed by guide id once per snapshot instead of being filtered per row;
+  an indexed guide miss no longer rebuilds the station map; and a clock-minute change re-joins
+  cached resolver evidence instead of re-resolving every mapping.
+- **Logos.** Each channel's guide icon is published (migration 1005, backfilled by the existing
+  startup pass) so a logo request decrypts and parses no programme guide. Existing databases need
+  no reimport.
+- **Verified.** `npm run typecheck`, `npm run build`, **255 of 255** Node tests (including 11
+  deterministic work-count tests in `tests/guide-read-path.test.ts`), and a compiled-server
+  benchmark. Warm 50-row page p95 241 ms, cold 667 ms, `/health` p95 33 ms and `/api/v1/me` p95
+  87 ms during a logo burst. Baseline on the same harness reproduced the field report at
+  54,458–74,830 ms. Details and budgets: [M03.5](M03.5-GUIDE-READ-PERFORMANCE.md).
+- **APK.** No native source changed; the installed APK remains valid. M03.5 physical retest is
+  **not** performed.
+
+## Previous pass: M03.4 — Xtream EPG diagnosed and repaired
 
 - **Cause.** The provider answered `200` in 522 ms with a valid gzip XMLTV feed, 2.87 MB compressed
   and 20.6 MiB inflated. The shared 16 MiB decompression ceiling made `gunzipSync` throw, the

@@ -8,10 +8,10 @@ import { readSportsSettings, eventRank } from './sports-store.js';
 import { listed, listingState, listingPolicy, readListingPolicy, alwaysOnMatch, type Listing, type ListingState } from './listing.js';
 import { byGroup, eventChannelName, channelTag, sportOf, SPORTS, type Sport } from '../services/sports-match.js';
 import { stackKey, quality, feedRank } from '../services/channel-stacks.js';
-import { scheduleStackKeys } from '../services/schedule-stacks.js';
+import { scheduleStackKeys, type Candidate } from '../services/schedule-stacks.js';
 import { entryKey, planFeeds } from '../services/feed-identity.js';
 import type { CustomChannelStore } from './custom-channels.js';
-import { parseM3u, parseXmltv, resolveGuideMapping, guideIndex, approveMapping, mappingCandidates, guideWindow, type GuideIndex, type GuideMapping, type M3uChannel, type M3uSnapshot, type Program, type XmlSnapshot } from '../providers/iptv.js';
+import { parseM3u, parseXmltv, resolveGuideMapping, guideIndex, approveMapping, mappingCandidates, guideWindow, indexedWindow, programmeIndex, type GuideIndex, type ProgrammeIndex, type GuideMapping, type M3uChannel, type M3uSnapshot, type Program, type XmlSnapshot } from '../providers/iptv.js';
 import type { GuideStatus, XtreamCatalogue } from '../providers/xtream.js';
 
 type Kind='m3u'|'xmltv'|'xtream';
@@ -29,6 +29,9 @@ type SourceData={snapshot?:M3uSnapshot;xml?:XmlSnapshot;index?:GuideIndex};
 // parameter, so a viewer with no account sees no Xtream channels.
 const viewable=`${listed} AND (c.source_id NOT IN (SELECT id FROM iptv_sources WHERE xtream_account_id IS NOT NULL) OR c.source_id IN (SELECT s.id FROM iptv_sources s JOIN xtream_accounts a ON a.id=s.xtream_account_id JOIN xtream_access x ON x.xtream_id=a.id WHERE x.account_id=@account AND a.enabled=1 AND (a.account_status IS NULL OR a.account_status='active') AND (a.expires_at IS NULL OR a.expires_at>@now)))`;
 const hours=z.number().int().min(1).max(168);
+// Decrypted source snapshots and guides. Bounded so repeated imports cannot retain every revision;
+// two full guides plus their channel snapshots fit, which is what a multi-provider lineup needs.
+const DATA_CACHE_BYTES=96*1024*1024;
 export const sourceCreate=z.object({kind:z.enum(['m3u','xmltv']),name:z.string().trim().min(1).max(120),endpoint:sourceEndpoint.optional()}).strict();
 export const sourceOrder=z.object({ids:z.array(z.string().uuid()).max(64)}).strict();
 export const sourcePolicy=z.object({expectedRevision:z.number().int().nonnegative(),intervalHours:hours}).strict();
@@ -41,17 +44,38 @@ export const identityResolution=z.object({expectedRevision:z.number().int().nonn
 // Guide placeholders that do not count as a program for "has guide data".
 const GUIDE_FILLER=/^\s*(no (program(me)?s?|programming|information|info|data|listings?|epg)( available)?|to be (announced|determined)|tba|tbd|off ?air|sign ?off|close ?down|channel off ?air)\s*\.?\s*$/i;
 export class IptvStore {
-  private scheduleStackCache=new Map<string,{version:string;keys:Map<string,string>}>();
+  private scheduleStackCache=new Map<string,{immutable:string;now:number;keys:Map<string,string>;candidates:Candidate[]}>();
+  // Decrypted source snapshots and guides, bounded by sealed-payload bytes rather than entry count:
+  // a large guide is exactly what must not be re-read per logo or per page row. Entries are keyed by
+  // the revisions that produced them, so an import, mapping change or revocation invalidates them.
+  private dataCache=new Map<string,{data:SourceData;bytes:number}>();
+  private dataCacheBytes=0;
+  // Decrypted per-channel metadata, keyed by its own sealed payload so a replaced feed is a new
+  // entry rather than a stale hit. Bounded well above any supported lineup (8,436 feeds here).
+  private providerCache=new Map<string,M3uChannel>();
   constructor(private db:Db,private vault:Vault) {}
+  // `typeof(column)` reads only the value's header. `column IS NOT NULL` has to walk the whole value,
+  // and on the guide blob that is 37 MB of overflow pages — 20 ms per call, on a projection the guide
+  // page ran once per channel.
   private source(id:string) {const row=this.db.prepare(`SELECT id,kind,name,revision,interval_hours,auto_add,encrypted_endpoint,
-      encrypted_snapshot IS NOT NULL AS has_snapshot,encrypted_candidate IS NOT NULL AS has_candidate,candidate_digest,
-      last_attempt,last_success,next_due,last_error,retry_after,sort_order,xtream_account_id,encrypted_guide IS NOT NULL AS has_guide
+      typeof(encrypted_snapshot)='text' AS has_snapshot,typeof(encrypted_candidate)='text' AS has_candidate,candidate_digest,
+      last_attempt,last_success,next_due,last_error,retry_after,sort_order,xtream_account_id,typeof(encrypted_guide)='text' AS has_guide
       FROM iptv_sources WHERE id=?`).get(id) as SourceRow|undefined;requireThat(row,'SOURCE_NOT_FOUND','Source not found.',404);return row;}
   // The sealed payload itself. `column` is a fixed union, never caller text.
   private blob(id:string,column:SourceBlob) {return (this.db.prepare(`SELECT ${column} AS value FROM iptv_sources WHERE id=?`).get(id) as {value:string|null}|undefined)?.value??null;}
   private channel(id:string) {const row=this.db.prepare('SELECT c.*,n.number,n.position FROM iptv_channels c LEFT JOIN lineup_numbers n ON n.channel_id=c.id WHERE c.id=?').get(id) as ChannelRow|undefined;requireThat(row,'CHANNEL_NOT_FOUND','Channel not found.',404);return row;}
   private channels(sourceId:string) {return this.db.prepare('SELECT c.*,n.number,n.position FROM iptv_channels c LEFT JOIN lineup_numbers n ON n.channel_id=c.id WHERE source_id=? ORDER BY first_seen,c.rowid').all(sourceId) as ChannelRow[];}
-  private provider(c:ChannelRow) {return JSON.parse(this.vault.open(c.encrypted_provider,`iptv:channel:${c.id}`)) as M3uChannel;}
+  // Channel metadata is sealed per row, so a full lineup would otherwise be decrypted and parsed once
+  // per channel per request. It is immutable for a source revision and a channel row's payload is
+  // replaced whenever the feed changes, so caching by the payload itself stays correct by construction.
+  private provider(c:ChannelRow) {
+    const cached=this.providerCache.get(c.encrypted_provider);
+    if(cached)return cached;
+    const parsed=JSON.parse(this.vault.open(c.encrypted_provider,`iptv:channel:${c.id}`)) as M3uChannel;
+    if(this.providerCache.size>=20000)this.providerCache.clear();
+    this.providerCache.set(c.encrypted_provider,parsed);
+    return parsed;
+  }
   private identityPlan(sourceId:string,snapshot:M3uSnapshot) {return planFeeds(this.channels(sourceId).map(c=>({id:c.id,identity:c.identity,provider:this.provider(c)})),snapshot.channels);}
   private audit(actor:string,event:string,id:string,now:number) {this.db.prepare('INSERT INTO audit(actor,event,at,detail) VALUES(?,?,?,?)').run(actor,event,now,JSON.stringify({id}));}
   private check(row:SourceRow,expected:number) {requireThat(row.revision===expected,'REVISION_CONFLICT','Source changed. Reload and retry.',409);}
@@ -238,15 +262,19 @@ export class IptvStore {
     for(const c of channels){const event=Number(sports&&(events.get(c.group)??c.row.event===1)),exempt=Number(!!settings.get(c.group)?.guide_exempt||always(c.name)||always(c.group));put.run(event,exempt,c.row.id,event,exempt);if(event&&!c.row.event)release.run(c.row.id,c.row.id);}
   }
   // Merged intervals of real programs on each channel's guide, so the listing rule can ask "anything on soon?" in SQL.
+  // The same pass publishes each channel's guide icon, so the logo route never needs the guide itself.
   coverage(sourceId:string) {
     this.db.prepare('DELETE FROM iptv_guide_coverage WHERE channel_id IN (SELECT id FROM iptv_channels WHERE source_id=?)').run(sourceId);
+    this.db.prepare('DELETE FROM iptv_channel_icons WHERE channel_id IN (SELECT id FROM iptv_channels WHERE source_id=?)').run(sourceId);
     const source=this.source(sourceId),feedId=this.status(sourceId).feedId??(source.xtream_account_id?sourceId:undefined);if(!feedId)return;
     const kind=this.source(feedId).kind;requireThat(kind==='xmltv'||kind==='xtream','MAPPING_SCOPE','Select an XMLTV feed.');
-    const cache=new Map<string,SourceData>(),byXml=new Map<string,Program[]>(),put=this.db.prepare('INSERT INTO iptv_guide_coverage VALUES(?,?,?)');
+    const cache=new Map<string,SourceData>(),byXml=new Map<string,Program[]>(),put=this.db.prepare('INSERT INTO iptv_guide_coverage VALUES(?,?,?)'),putIcon=this.db.prepare('INSERT INTO iptv_channel_icons VALUES(?,?)');
     let indexed=false;
     for(const c of this.channels(sourceId)){
       if(!c.present||c.conflict)continue;
       const data=this.guideDataFor(c,feedId,cache),xmlId=data.mapping?.xmlId;if(!xmlId||!data.xml)continue;
+      // The projected icon belongs to the guide channel, so a mapping change replaces it below.
+      const icon=data.index?.icons.get(xmlId);if(icon)putIcon.run(c.id,icon);
       if(!indexed&&(indexed=true))for(const p of data.xml.programs)if(!GUIDE_FILLER.test(p.title)){const list=byXml.get(p.channelId);if(list)list.push(p);else byXml.set(p.channelId,[p]);}
       const spans=(byXml.get(xmlId)??[]).map(p=>[p.start,p.end] as [number,number]).sort((a,b)=>a[0]-b[0]),merged:[number,number][]=[];
       for(const [start,end] of spans){const last=merged.at(-1);if(last&&start<=last[1]+60000)last[1]=Math.max(last[1],end);else merged.push([start,end]);}
@@ -289,23 +317,34 @@ export class IptvStore {
     const revision=this.source(sourceId).revision,guideRevision=this.source(feedId).revision;
     // Guide mapping edits have their own revision, independent of the playlist revision.
     const mappings=this.db.prepare('SELECT channel_id,value FROM iptv_mappings WHERE feed_id=? AND channel_id IN (SELECT id FROM iptv_channels WHERE source_id=?) ORDER BY channel_id').all(feedId,sourceId) as {channel_id:string;value:string}[];
-    const now=Math.floor(Date.now()/60000)*60000,version=JSON.stringify([revision,feedId,guideRevision,now,mappings]);
-    const cached=this.scheduleStackCache.get(sourceId);if(cached?.version===version)return cached.keys;
-    // Include health-hidden feeds so a primary failing does not change the station's stack key.
-    const channels=this.channels(sourceId).filter(c=>c.present&&!c.conflict&&!c.event),manual=new Map(mappings.map(m=>[m.channel_id,JSON.parse(m.value) as GuideMapping]));
-    let keys=new Map<string,string>();
-    if(channels.some(c=>c.stack_key===null)) {
-      const cache=new Map<string,SourceData>(),snapshot=this.sourceData(sourceId,cache).snapshot,xml=this.sourceData(feedId,cache).xml;
-      if(snapshot&&xml) {
-        const candidates=channels.map(c=>{const p=this.provider(c),mapping=c.stack_key===null?resolveGuideMapping({sourceId,feedId,channelId:c.id},p,snapshot.channels,xml,manual.get(c.id)):undefined;
-          return {id:c.id,key:this.stackOf(c,p),automatic:c.stack_key===null,xmlId:mapping?.xmlId};});
-        const ids=new Set(candidates.flatMap(c=>c.xmlId?[c.xmlId]:[])),programs=new Map<string,Program[]>();
-        for(const p of xml.programs)if(ids.has(p.channelId)){const list=programs.get(p.channelId);if(list)list.push(p);else programs.set(p.channelId,[p]);}
-        keys=scheduleStackKeys(candidates.map(c=>({...c,...(c.xmlId?{programs:programs.get(c.xmlId)??[]}:{} )})),now);
+    // The resolved candidates and their programmes are immutable for a revision. Only the schedule
+    // comparison depends on the clock, so a minute change re-joins cached evidence instead of
+    // re-resolving every mapping and regrouping the guide.
+    const immutable=JSON.stringify([revision,feedId,guideRevision,mappings]),now=Math.floor(Date.now()/60000)*60000;
+    const cached=this.scheduleStackCache.get(sourceId);
+    if(cached?.immutable===immutable&&cached.now===now)return cached.keys;
+    let candidates=cached?.immutable===immutable?cached.candidates:undefined;
+    if(!candidates) {
+      candidates=[];
+      // Include health-hidden feeds so a primary failing does not change the station's stack key.
+      const channels=this.channels(sourceId).filter(c=>c.present&&!c.conflict&&!c.event),manual=new Map(mappings.map(m=>[m.channel_id,JSON.parse(m.value) as GuideMapping]));
+      if(channels.some(c=>c.stack_key===null)) {
+        const cache=new Map<string,SourceData>(),source=this.sourceData(sourceId,cache),snapshot=source.snapshot,xml=this.sourceData(feedId,cache).xml;
+        if(snapshot&&xml) {
+          // One index for the whole pass. Without it every channel rebuilt the station map.
+          if(!source.index)source.index=guideIndex(snapshot.channels,xml);
+          const index=source.index,byId=new Map<string,Program[]>();
+          const resolved=channels.map(c=>{const p=this.provider(c),mapping=c.stack_key===null?resolveGuideMapping({sourceId,feedId,channelId:c.id},p,snapshot.channels,xml,manual.get(c.id),index):undefined;
+            return {id:c.id,key:this.stackOf(c,p),automatic:c.stack_key===null,xmlId:mapping?.xmlId};});
+          const ids=new Set(resolved.flatMap(c=>c.xmlId?[c.xmlId]:[]));
+          for(const p of xml.programs)if(ids.has(p.channelId)){const list=byId.get(p.channelId);if(list)list.push(p);else byId.set(p.channelId,[p]);}
+          candidates=resolved.map(c=>({...c,...(c.xmlId?{programs:byId.get(c.xmlId)??[]}:{})}));
+        }
       }
     }
+    const keys=scheduleStackKeys(candidates,now);
     if(this.scheduleStackCache.size>=64)this.scheduleStackCache.clear();
-    this.scheduleStackCache.set(sourceId,{version,keys});return keys;
+    this.scheduleStackCache.set(sourceId,{immutable,now,keys,candidates});return keys;
   }
   // The viewer's account scopes Xtream sources: an empty account sees only server-wide sources.
   private feeds(account=''):Feed[] {const stacks=new Map<string,Map<string,string>>();return (this.db.prepare(`SELECT c.id,c.source_id,c.display_name,c.stack_key,c.encrypted_provider,n.number,n.position,(SELECT h.status FROM iptv_channel_health h WHERE h.channel_id=c.id) AS health,c.event AS sports,(SELECT w.stack_key FROM sports_windows w WHERE w.channel_id=c.id) AS event,ew.sport AS event_sport,ew.league_key AS event_league,ew.start AS event_start FROM iptv_channels c JOIN lineup_numbers n ON n.channel_id=c.id LEFT JOIN sports_windows ew ON ew.channel_id=c.id WHERE ${viewable} ORDER BY n.position,n.number,c.id`).all({account,now:Date.now()}) as (ChannelRow&{health:string|null;sports:number|null;event:string|null;event_sport:string|null;event_league:string|null;event_start:number|null})[]).map(c=>{const p=this.provider(c),q=quality(p.name)??quality(c.display_name??'');
@@ -347,11 +386,12 @@ export class IptvStore {
   // Server-side only: the decrypted upstream URI must never reach an API response.
   tune(id:string,account='') {requireThat(this.isVisible(id,account),'CHANNEL_NOT_FOUND','Channel not found.',404);const c=this.channel(id),p=this.provider(c);return {id:c.id,sourceId:c.source_id,name:this.nameOf(c,p,!!c.event),number:c.number!,streamUrl:p.streamUrl};}
   // Playlist logo first, then the mapped guide channel's icon. Server-side only, like stream URIs.
+  // The guide icon is a published projection, so a logo request never decrypts or parses the guide.
   logo(id:string,account='') {
     requireThat(this.isVisible(id,account),'CHANNEL_NOT_FOUND','Channel not found.',404);const c=this.channel(id),p=this.provider(c);
-    const feedId=this.feedFor(id),data=feedId?this.guideData(id,feedId):undefined;
+    const icon=(this.db.prepare('SELECT icon FROM iptv_channel_icons WHERE channel_id=?').get(id) as {icon:string}|undefined)?.icon;
     // The provider's own name drives library matching; an administrator rename is display-only.
-    return {name:p.name,tvgId:p.tvgId,urls:[/^https?:\/\//i.test(p.logo)?p.logo:undefined,data?.xml?.channels.find(x=>x.id===data.mapping?.xmlId)?.icon].filter((u):u is string=>!!u)};
+    return {name:p.name,tvgId:p.tvgId,urls:[/^https?:\/\//i.test(p.logo)?p.logo:undefined,icon].filter((u):u is string=>!!u)};
   }
   isVisible(id:string,account='') {return !!this.db.prepare(`SELECT 1 FROM iptv_channels c JOIN lineup_numbers n ON n.channel_id=c.id WHERE c.id=@id AND ${viewable}`).get({id,account,now:Date.now()});}
   // Server-side only: which provider account (if any) a source belongs to, for playback budgets.
@@ -577,20 +617,51 @@ export class IptvStore {
   feedFor(channelId:string) {return this.guideSource(this.channel(channelId).source_id);}
   // The guide linked to a source: an explicit XMLTV feed, or an Xtream source's own catalogue.
   private guideSource(sourceId:string) {const row=this.source(sourceId),feed=this.db.prepare('SELECT feed_id FROM iptv_source_feeds WHERE source_id=?').get(sourceId) as {feed_id:string}|undefined;return feed?.feed_id??(row.xtream_account_id?sourceId:undefined);}
-  // What a source knows about channels and guide data. Xtream keeps both in its sealed catalogue;
-  // M3U and XMLTV keep them in their own snapshots. One cache per request avoids re-decrypting megabytes.
+  // What a source knows about channels and guide data. Xtream keeps channel metadata in its
+  // published snapshot and the guide in its own sealed column; M3U and XMLTV keep their snapshots.
+  // The decrypted parse is retained across requests under an explicit byte budget, keyed by the
+  // revisions that produced it: without that, every logo and every page paid for the whole guide.
+  // Only immutable source data lives here, never a viewer, grant or response.
   private sourceData(sourceId:string,cache?:Map<string,SourceData>):SourceData {
     if(cache?.has(sourceId))return cache.get(sourceId)!;
-    const row=this.source(sourceId);
+    const row=this.source(sourceId),key=this.dataKey(row),hit=this.dataCache.get(key);
     let data:SourceData;
-    if(row.kind==='xtream') {
-      const catalogue=row.xtream_account_id?(()=>{const account=this.db.prepare('SELECT encrypted_catalogue FROM xtream_accounts WHERE id=?').get(row.xtream_account_id) as {encrypted_catalogue:string|null}|undefined;return account?.encrypted_catalogue?JSON.parse(this.vault.open(account.encrypted_catalogue,`xtream:catalogue:${row.xtream_account_id}`)) as XtreamCatalogue:undefined;})():undefined;
-      const sealed=row.has_guide?this.blob(sourceId,'encrypted_guide'):null;
-      const guide=sealed?JSON.parse(this.vault.open(sealed,`iptv:guide:${sourceId}`)) as XmlSnapshot:undefined;
-      data={...(catalogue?{snapshot:{channels:catalogue.channels,ignoredNonLive:0} as M3uSnapshot}:{}),...(guide?{xml:guide}:{})};
-    } else if(row.kind==='m3u') data={snapshot:this.snapshot<M3uSnapshot>(row)};
-    else data={xml:this.snapshot<XmlSnapshot>(row)};
+    if(hit){this.dataCache.delete(key);this.dataCache.set(key,hit);data=hit.data;}
+    else {
+      const loaded=this.loadSourceData(row);
+      data=loaded.data;
+      // A superseded revision can never be read again, and retaining it would let repeated imports
+      // grow the process without bound. The byte budget backstops the per-source eviction.
+      const prefix=`${row.id}:`;
+      for(const stale of this.dataCache.keys())if(stale.startsWith(prefix)){this.dataCacheBytes-=this.dataCache.get(stale)!.bytes;this.dataCache.delete(stale);}
+      if(this.dataCache.size>=64)this.dataCache.clear();
+      this.dataCache.set(key,loaded);this.dataCacheBytes+=loaded.bytes;
+      while(this.dataCacheBytes>DATA_CACHE_BYTES&&this.dataCache.size>1){const oldest=this.dataCache.keys().next().value!;this.dataCacheBytes-=this.dataCache.get(oldest)!.bytes;this.dataCache.delete(oldest);}
+    }
     cache?.set(sourceId,data);return data;
+  }
+  // A source revision changes whenever its snapshot, guide, credentials or disable state does, so
+  // an entry can never be read after an import replaced or revoked it.
+  private dataKey(row:SourceRow) {
+    if(row.kind!=='xtream')return `${row.id}:${row.kind}:${row.revision}`;
+    const account=row.xtream_account_id?this.db.prepare('SELECT catalogue_at FROM xtream_accounts WHERE id=?').get(row.xtream_account_id) as {catalogue_at:number|null}|undefined:undefined;
+    return `${row.id}:xtream:${row.revision}:${account?.catalogue_at??0}`;
+  }
+  private loadSourceData(row:SourceRow):{data:SourceData;bytes:number} {
+    // Sealed payload bytes are the honest measure of what the entry holds; the decrypted text is
+    // of the same order, and this avoids re-serialising megabytes just to weigh them.
+    const sealed=row.has_snapshot?this.blob(row.id,'encrypted_snapshot'):null;
+    const bytes=(sealed?.length??0)*0.75;
+    if(row.kind==='xtream') {
+      // The published snapshot is the small authoritative channel list. The catalogue also carries
+      // its own copy of the guide, so parsing it here duplicated every programme in memory and time.
+      const snapshot=sealed?JSON.parse(this.vault.open(sealed,`iptv:snapshot:${row.id}`)) as M3uSnapshot:undefined;
+      const guideSealed=row.has_guide?this.blob(row.id,'encrypted_guide'):null;
+      const guide=guideSealed?JSON.parse(this.vault.open(guideSealed,`iptv:guide:${row.id}`)) as XmlSnapshot:undefined;
+      return {data:{...(snapshot?{snapshot}:{}),...(guide?{xml:guide}:{})},bytes:bytes+(guideSealed?.length??0)*0.75};
+    }
+    if(row.kind==='m3u') return {data:{snapshot:sealed?JSON.parse(this.vault.open(sealed,`iptv:snapshot:${row.id}`)) as M3uSnapshot:undefined},bytes};
+    return {data:{xml:sealed?JSON.parse(this.vault.open(sealed,`iptv:snapshot:${row.id}`)) as XmlSnapshot:undefined},bytes};
   }
   private guideData(id:string,feedId:string,cache?:Map<string,SourceData>) {
     requireThat(this.feedFor(id)===feedId,'MAPPING_SCOPE','The feed is not linked to this source.');
@@ -607,7 +678,7 @@ export class IptvStore {
     // The index is built once per cached source, so resolving every channel stays linear.
     if(xml&&snapshot&&!source.index)source.index=guideIndex(snapshot.channels,xml);
     const mapping=xml&&snapshot&&!c.conflict&&c.present?resolveGuideMapping(scope,this.provider(c),snapshot.channels,xml,manual,source.index):undefined;
-    return {c,xml,manual,mapping,scope,snapshot};
+    return {c,xml,manual,mapping,scope,snapshot,index:source.index};
   }
   mappingReview(id:string,feedId:string) {const {c,xml,manual,mapping,snapshot}=this.guideData(id,feedId);return {mapping,reviewRevision:manual?.revision??0,candidates:xml&&snapshot&&!c.conflict?mappingCandidates(this.provider(c),snapshot.channels,xml):{suggestions:[]}};}
   map(actor:string,id:string,feedId:string,xmlId:string,expectedRevision:number,now=Date.now()) {
@@ -644,13 +715,22 @@ export class IptvStore {
     const sources=[...(customs.length?[{id:'custom',name:'Plex Channels',count:customs.length,guideStatus:null}]:[]),...[...counts].map(([id,count])=>({id,name:this.source(id).name,count,guideStatus:this.guideStatus(id)}))];
     const total=customs.length+channels.length;
     const customRows=customs.slice(offset,offset+limit).map(c=>({...c,programs:custom!.programs(c.id,start,end)}));
-    return {start,end,offset,limit,total,hasMore:offset+limit<total,sources,channels:[...customRows,...channels.slice(Math.max(0,offset-customs.length),Math.max(0,offset+limit-customs.length)).map(channel=>{
+    const page=channels.slice(Math.max(0,offset-customs.length),Math.max(0,offset+limit-customs.length));
+    // One programme index per guide snapshot, shared by the whole page. Filtering the full collection
+    // once per displayed row was the page's dominant cost: fifty rows scanned every programme each.
+    const programmes=new Map<XmlSnapshot,ProgrammeIndex>();
+    const windowFor=(xml:XmlSnapshot|undefined,xmlId:string|undefined,name:string)=>{
+      if(!xml)return guideWindow([],undefined,start,end,name);
+      let index=programmes.get(xml);if(!index){index=programmeIndex(xml.programs);programmes.set(xml,index);}
+      return indexedWindow(index,xmlId,start,end,name);
+    };
+    return {start,end,offset,limit,total,hasMore:offset+limit<total,sources,channels:[...customRows,...page.map(channel=>{
       // Feeds of one station share a schedule: use the first feed with a guide match.
       let data:ReturnType<IptvStore['guideData']>|undefined;
       for(const feed of channel.feeds){const feedId=this.feedFor(feed.id),candidate=feedId?this.guideData(feed.id,feedId,cache):undefined;data??=candidate;if(candidate?.mapping){data=candidate;break;}}
       // Any channel may match the logo library, so the logo route decides; the UI falls back to a monogram.
       const {hasLogo:_,...rest}=channel,logo=true;
-      return {...rest,logo,type:'iptv' as const,favorite:channel.feeds.some(f=>favorites.has(f.id)),programs:this.eventRows(channel.id,start,end)??guideWindow(data?.xml?.programs??[],data?.mapping?.xmlId,start,end,channel.name)};
+      return {...rest,logo,type:'iptv' as const,favorite:channel.feeds.some(f=>favorites.has(f.id)),programs:this.eventRows(channel.id,start,end)??windowFor(data?.xml,data?.mapping?.xmlId,channel.name)};
     })]};
   }
 }
