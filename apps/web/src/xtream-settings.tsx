@@ -1,7 +1,7 @@
 import {useEffect,useState} from 'react';
 import {api} from './api.js';
 import {useApi,invalidate} from './hooks.js';
-import {type ImportStatus} from './import-progress.js';
+import {type GuideStatus, type ImportStatus} from './import-progress.js';
 import {Card,SectionHead,useMutation} from './settings-ui.js';
 import {Empty,ErrorNotice,Icon,Loading,Modal} from './components.js';
 
@@ -27,6 +27,16 @@ const state = (account: XtreamAccount) => {
 
 // Provider accounts granted to the signed-in account. Adding one is a provider login, not a new
 // application identity: the existing session and grants stay unchanged.
+export // What the guide is, in the words the viewer needs. A partial fallback never reads as complete.
+function guideLine(guide: GuideStatus) {
+  if (guide.state === 'available') return `Guide: ${guide.parsedPrograms ?? 0} listings for ${guide.mappedChannels ?? 0} channels.`;
+  if (guide.state === 'partial') return `Partial guide: listings cover ${guide.mappedChannels ?? 0} of ${guide.requested ?? 0} provider channels. Remaining channels show no guide data.`;
+  if (guide.state === 'unmatched') return 'Guide downloaded, but none of its channel ids match this lineup.';
+  if (guide.state === 'empty') return 'Guide downloaded, but it has no current listings.';
+  if (guide.state === 'failed' && guide.code === 'XTREAM_GUIDE_RETAINED') return 'Guide refresh failed. The last known guide is still shown.';
+  if (guide.state === 'disabled') return 'Guide retrieval was not requested for this import.';
+  return `Guide failed: ${(guide.code ?? 'unknown').replaceAll('_', ' ').toLowerCase()}${guide.httpStatus ? ` (HTTP ${guide.httpStatus})` : ''}.`;
+}
 export function XtreamSettings() {
   const view = useApi<AccountsView>('/xtream/accounts'), [adding, setAdding] = useState(false), mutation = useMutation(view.reload);
   const accounts = view.data?.accounts ?? [];
@@ -87,7 +97,8 @@ function AccountCard({account, changed, mutation}:{account: XtreamAccount; chang
     {active && <p className="small" role="status">{active.state === 'queued' ? 'Import queued.' : active.stage === 'publish' ? 'Saving the channel list…' : 'Loading channels and guide…'} Cached channels stay available meanwhile.</p>}
     {!active && job?.latest?.state === 'failed' && <p className="small danger" role="status">Import failed: {(job.latest.error ?? 'XTREAM_UNREACHABLE').replaceAll('_', ' ').toLowerCase()}. The last known channel list is still in use.</p>}
     {!active && job?.latest?.state === 'interrupted' && <p className="small danger" role="status">Import was interrupted. Refresh again to restart it.</p>}
-    {!active && job?.latest?.state === 'completed' && job.latest.guideError && <p className="small warning-text" role="status">Guide problem: {job.latest.guideError.replaceAll('_', ' ').toLowerCase()}. Channels are unaffected.</p>}
+    {!active && job?.latest?.state === 'completed' && job.latest.guide && <p className={`small ${job.latest.guide.state === 'available' ? '' : 'warning-text'}`} role="status">{guideLine(job.latest.guide)}</p>}
+    {!active && job?.latest?.state === 'completed' && !job.latest.guide && job.latest.guideError && <p className="small warning-text" role="status">Guide problem: {job.latest.guideError.replaceAll('_', ' ').toLowerCase()}. Channels are unaffected.</p>}
     {account.lastError && <p className="small warning-text">Last problem: {account.lastError.replaceAll('_', ' ').toLowerCase()}. The last known channel list stays in use until a refresh succeeds.</p>}
     {mutation.error && <p className="small danger">{mutation.error}</p>}
     {editing && <EditProvider account={account} onClose={() => setEditing(false)} changed={changed}/>}

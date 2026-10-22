@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { Db } from './database.js';
 import { Vault, digest } from '../security/vault.js';
 import { requireThat } from '../errors.js';
-import { normalizeXtreamEndpoint, xtreamCredentials, type XtreamAccount, type XtreamCatalogue } from '../providers/xtream.js';
+import { normalizeXtreamEndpoint, xtreamCredentials, type GuideStatus, type XtreamAccount, type XtreamCatalogue } from '../providers/xtream.js';
 
 type AccountRow = {
   id: string; name: string; server_origin: string; revision: number; encrypted_credentials: string;
@@ -16,6 +16,7 @@ type AccountRow = {
 type ImportRow = {
   id: string; account_id: string; actor: string; include_epg: number; revision: number;
   state: XtreamImportState; stage: string | null; error: string | null; guide_error: string | null;
+  guide_status: string | null;
   created_at: number; started_at: number | null; finished_at: number | null;
 };
 export type XtreamImportState = 'queued' | 'running' | 'completed' | 'failed' | 'interrupted';
@@ -24,6 +25,8 @@ export type XtreamImportState = 'queued' | 'running' | 'completed' | 'failed' | 
 export type XtreamImport = {
   id: string; accountId: string; state: XtreamImportState; stage: string | null;
   error: string | null; guideError: string | null; includeEpg: boolean;
+  // Structured guide outcome. Absent only for imports recorded before it existed.
+  guide: GuideStatus | null;
   createdAt: number; startedAt: number | null; finishedAt: number | null;
 };
 
@@ -54,7 +57,9 @@ export class XtreamStore {
   }
   private importOf(row: ImportRow): XtreamImport {
     return { id: row.id, accountId: row.account_id, state: row.state, stage: row.stage, error: row.error,
-      guideError: row.guide_error, includeEpg: !!row.include_epg, createdAt: row.created_at, startedAt: row.started_at, finishedAt: row.finished_at };
+      guideError: row.guide_error, includeEpg: !!row.include_epg,
+      guide: row.guide_status ? JSON.parse(row.guide_status) as GuideStatus : null,
+      createdAt: row.created_at, startedAt: row.started_at, finishedAt: row.finished_at };
   }
   private importRow(id: string) {
     const row = this.db.prepare('SELECT * FROM xtream_imports WHERE id=?').get(id) as ImportRow | undefined;
@@ -93,9 +98,9 @@ export class XtreamStore {
   }
   // Undefined when the provider was removed while its import ran: the row cascaded away with it,
   // and there is nothing left to report. Callers must not treat that as a failure.
-  finishImport(id: string, result: { state: 'completed' | 'failed' | 'interrupted'; error?: string; guideError?: string }, now = Date.now()) {
-    const changed = this.db.prepare("UPDATE xtream_imports SET state=?,stage=NULL,error=?,guide_error=?,finished_at=? WHERE id=? AND state IN ('queued','running')")
-      .run(result.state, result.error ?? null, result.guideError ?? null, now, id);
+  finishImport(id: string, result: { state: 'completed' | 'failed' | 'interrupted'; error?: string; guideError?: string; guide?: GuideStatus }, now = Date.now()) {
+    const changed = this.db.prepare("UPDATE xtream_imports SET state=?,stage=NULL,error=?,guide_error=?,guide_status=?,finished_at=? WHERE id=? AND state IN ('queued','running')")
+      .run(result.state, result.error ?? null, result.guideError ?? null, result.guide ? JSON.stringify(result.guide) : null, now, id);
     return changed.changes ? this.importOf(this.importRow(id)) : undefined;
   }
   import(id: string) { return this.importOf(this.importRow(id)); }

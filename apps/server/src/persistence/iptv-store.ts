@@ -12,7 +12,7 @@ import { scheduleStackKeys } from '../services/schedule-stacks.js';
 import { entryKey, planFeeds } from '../services/feed-identity.js';
 import type { CustomChannelStore } from './custom-channels.js';
 import { parseM3u, parseXmltv, resolveGuideMapping, guideIndex, approveMapping, mappingCandidates, guideWindow, type GuideIndex, type GuideMapping, type M3uChannel, type M3uSnapshot, type Program, type XmlSnapshot } from '../providers/iptv.js';
-import type { XtreamCatalogue } from '../providers/xtream.js';
+import type { GuideStatus, XtreamCatalogue } from '../providers/xtream.js';
 
 type Kind='m3u'|'xmltv'|'xtream';
 // Source metadata without its sealed payloads. Those run to megabytes; selecting them on every
@@ -56,7 +56,16 @@ export class IptvStore {
   private audit(actor:string,event:string,id:string,now:number) {this.db.prepare('INSERT INTO audit(actor,event,at,detail) VALUES(?,?,?,?)').run(actor,event,now,JSON.stringify({id}));}
   private check(row:SourceRow,expected:number) {requireThat(row.revision===expected,'REVISION_CONFLICT','Source changed. Reload and retry.',409);}
   private snapshot<T>(row:SourceRow):T|undefined {const value=row.has_snapshot?this.blob(row.id,'encrypted_snapshot'):null;return value ? JSON.parse(this.vault.open(value,`iptv:snapshot:${row.id}`)) as T : undefined;}
-  status(id:string) {const r=this.source(id),feed=this.db.prepare('SELECT feed_id FROM iptv_source_feeds WHERE source_id=?').get(id) as {feed_id:string}|undefined;return {id:r.id,kind:r.kind,name:r.name,revision:r.revision,intervalHours:r.interval_hours,remote:!!r.encrypted_endpoint,lastAttempt:r.last_attempt,lastSuccess:r.last_success,nextDue:r.next_due,lastError:r.last_error,retryAfter:r.retry_after,candidateDigest:r.candidate_digest,feedId:feed?.feed_id,xtreamAccountId:r.xtream_account_id};}
+  status(id:string) {const r=this.source(id),feed=this.db.prepare('SELECT feed_id FROM iptv_source_feeds WHERE source_id=?').get(id) as {feed_id:string}|undefined;return {id:r.id,kind:r.kind,name:r.name,revision:r.revision,intervalHours:r.interval_hours,remote:!!r.encrypted_endpoint,lastAttempt:r.last_attempt,lastSuccess:r.last_success,nextDue:r.next_due,lastError:r.last_error,retryAfter:r.retry_after,candidateDigest:r.candidate_digest,feedId:feed?.feed_id,xtreamAccountId:r.xtream_account_id,
+      // What the guide is, as opposed to whether the last import ran: a retained guide after a
+      // failed refresh must not read as a current failure.
+      guideStatus:this.guideStatus(r.id)};}
+  // Read separately from `source()`: that projection runs once per channel in the guide page, and
+  // a JSON column there would be copied thousands of times per request.
+  private guideStatus(id:string):GuideStatus|null {
+    const row=this.db.prepare('SELECT guide_status FROM iptv_sources WHERE id=?').get(id) as {guide_status:string|null}|undefined;
+    return row?.guide_status?JSON.parse(row.guide_status) as GuideStatus:null;
+  }
   private sourceOrder() {return (this.db.prepare('SELECT id FROM iptv_sources ORDER BY sort_order,rowid').all() as {id:string}[]).map(r=>r.id);}
   list() {return this.sourceOrder().map(id=>this.status(id));}
   // The guide lists each playlist's channels together, in this order.
@@ -527,14 +536,22 @@ export class IptvStore {
   // so the last good channels and guide survive.
   publishXtream(actor:string,accountId:string,name:string,catalogue:XtreamCatalogue,now=Date.now()) {
     return this.db.transaction(()=>{
-      const existing=this.db.prepare("SELECT * FROM iptv_sources WHERE kind='xtream' AND xtream_account_id=?").get(accountId) as SourceRow|undefined;
+      // `SELECT *` has the real `encrypted_guide` column, not the computed `has_guide` alias.
+      const existing=this.db.prepare("SELECT *,encrypted_guide IS NOT NULL AS has_guide FROM iptv_sources WHERE kind='xtream' AND xtream_account_id=?").get(accountId) as SourceRow|undefined;
       const id=existing?.id??randomUUID();
       const snapshot:M3uSnapshot={channels:catalogue.channels.map(c=>({tvgId:c.tvgId,name:c.name,group:c.group,logo:c.logo,streamUrl:c.streamUrl})),ignoredNonLive:0};
       // Reuse the stored guide only when this pass brings no new one, without decoding the old copy.
+      // A guide-only failure keeps the guide already published: listings that were valid when they
+      // were fetched stay on screen until a new guide replaces them.
       const guide=catalogue.epg?this.vault.seal(JSON.stringify(catalogue.epg),`iptv:guide:${id}`):existing?.has_guide?this.blob(id,'encrypted_guide'):null;
-      if(!existing) this.db.prepare(`INSERT INTO iptv_sources(id,kind,name,revision,interval_hours,next_due,sort_order,xtream_account_id,encrypted_guide)
-        VALUES(?,?,?,0,12,?, (SELECT COALESCE(MAX(sort_order),-1)+1 FROM iptv_sources),?,?)`).run(id,'xtream',name,now+12*3600000,accountId,guide);
-      else this.db.prepare('UPDATE iptv_sources SET name=?,encrypted_guide=?,revision=revision+1 WHERE id=?').run(name,guide,id);
+      // Retained-guide reporting: the status describes the guide in use, so a failed refresh that
+      // kept the old guide says so instead of claiming the new import produced it.
+      const guideStatus:GuideStatus|undefined=catalogue.guide?{...catalogue.guide,
+        ...(catalogue.guide.state==='failed'&&guide?{state:'partial',code:'XTREAM_GUIDE_RETAINED'}:{})}:undefined;
+      const sealedStatus=guideStatus?JSON.stringify(guideStatus):null;
+      if(!existing) this.db.prepare(`INSERT INTO iptv_sources(id,kind,name,revision,interval_hours,next_due,sort_order,xtream_account_id,encrypted_guide,guide_status)
+        VALUES(?,?,?,0,12,?, (SELECT COALESCE(MAX(sort_order),-1)+1 FROM iptv_sources),?,?,?)`).run(id,'xtream',name,now+12*3600000,accountId,guide,sealedStatus);
+      else this.db.prepare('UPDATE iptv_sources SET name=?,encrypted_guide=?,guide_status=?,revision=revision+1 WHERE id=?').run(name,guide,sealedStatus,id);
       // A subscription's channels list as soon as they are published: background checks are off by
       // default for Xtream, so the "wait for a first check" rule would hide every channel.
       this.db.prepare('INSERT OR IGNORE INTO iptv_listing_policies(source_id,require_check,require_guide,guide_hours,always_on) VALUES(?,0,0,2,?)')
@@ -622,7 +639,9 @@ export class IptvStore {
     const channels=filter==='custom'?[]:this.stacks(account).filter(c=>(filter!=='favorites'||c.feeds.some(f=>favorites.has(f.id)))&&(!channelId||c.feeds.some(f=>f.id===channelId))&&(!search||c.name.toLocaleLowerCase().includes(search)||c.feeds.some(f=>f.name.toLocaleLowerCase().includes(search)||String(f.number).includes(search)))),cache=new Map<string,SourceData>();
     // Every source with a matching channel, in guide order, so the client can head each group (across pages too).
     const counts=new Map<string,number>();for(const c of channels)counts.set(c.sourceId,(counts.get(c.sourceId)??0)+1);
-    const sources=[...(customs.length?[{id:'custom',name:'Plex Channels',count:customs.length}]:[]),...[...counts].map(([id,count])=>({id,name:this.source(id).name,count}))];
+    // Each heading carries its source's guide state, so the guide can say "partial guide" or
+    // "last known guide" instead of leaving the viewer to infer it from empty rows.
+    const sources=[...(customs.length?[{id:'custom',name:'Plex Channels',count:customs.length,guideStatus:null}]:[]),...[...counts].map(([id,count])=>({id,name:this.source(id).name,count,guideStatus:this.guideStatus(id)}))];
     const total=customs.length+channels.length;
     const customRows=customs.slice(offset,offset+limit).map(c=>({...c,programs:custom!.programs(c.id,start,end)}));
     return {start,end,offset,limit,total,hasMore:offset+limit<total,sources,channels:[...customRows,...channels.slice(Math.max(0,offset-customs.length),Math.max(0,offset+limit-customs.length)).map(channel=>{

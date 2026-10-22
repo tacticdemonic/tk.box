@@ -1,10 +1,55 @@
 # tk.box implementation status
 
-Updated October 22, 2026. **M03.3 separates Xtream sign-in from catalogue import. Node tests,
-typecheck, the production build and a real-browser sign-in against a deliberately slow synthetic
-panel are locally verified. Hosted CI and physical Stick acceptance remain open.**
+Updated October 22, 2026. **M03.4 repairs Xtream guide retrieval. The missing EPG was two
+application defects — a 16 MiB decompression ceiling and an unconditional XMLTV DTD rejection —
+not provider unreachability. Node tests, typecheck, the production build and the compiled server
+are locally verified, and the real provider feed now reaches the rendered guide. Hosted CI and an
+M03.4 physical retest remain open. M03.3 physical acceptance was reported by the user/Hermes; see
+its record.**
 
-## Latest pass: M03.3 — Xtream sign-in no longer waits for the catalogue
+## Latest pass: M03.4 — Xtream EPG diagnosed and repaired
+
+- **Cause.** The provider answered `200` in 522 ms with a valid gzip XMLTV feed, 2.87 MB compressed
+  and 20.6 MiB inflated. The shared 16 MiB decompression ceiling made `gunzipSync` throw, the
+  fetcher classified that as an unknown failure, and `transportFailure()` collapsed it to
+  `XTREAM_UNREACHABLE`. Three further defects sat behind it: `parseXmltv` rejected the conventional
+  `<!DOCTYPE tv SYSTEM "xmltv.dtd">` prologue; it also required a guide id to be declared exactly
+  once, so the provider's four declarations of `bbc1.uk` (`SD`, `FHD`, `HD`, `Catchup Backup`)
+  quarantined the listings for the most-watched stations; and the fallback sent `tvgId` as
+  `stream_id`, which this provider answers with zero rows.
+- **Guide identity.** `guideStations()` now decides usability from station agreement rather than a
+  declaration count, so a station listed several times under one id maps, while `bbc2.uk` — shared
+  by BBC Two and BBC Two NI — stays ambiguous and honestly shows no guide data instead of being
+  silently merged. Parsing, automatic mapping, suggestions and manual approval all use that one
+  rule.
+- **Transport diagnostics.** `SourceFetchError` now carries a structured code and safe numeric
+  detail (HTTP status, byte counts, limits, elapsed time, compression, network class). Each maps to
+  its own `XTREAM_*` code; only an unknown failure remains `XTREAM_UNREACHABLE`. Guide limits are
+  per call, so only the guide path is raised, and both compressed and inflated sizes stay bounded.
+- **Short-EPG fallback corrected.** It asked with `tvgId`; the provider answers by `streamId` and
+  returns zero rows for the guide id. Request identity and guide identity are now separate, and a
+  listing is stored under the guide id. Timestamps accept validated Unix seconds, numeric strings,
+  XMLTV offsets, ISO offsets and provider-zone wall clocks — never the host's zone. Base64 text is
+  decoded only when it round-trips exactly; plain titles are untouched.
+- **Fallback budget.** ≤40 channels, 4 concurrent, 20 s wall clock, abort-aware, stopping on the
+  first rate-limit/HTTP/timeout refusal, reporting requested/succeeded/skipped/mapped coverage.
+- **Honest guide state.** New `guide_status` (migration 1004, column-presence checked because 1002
+  rebuilds `iptv_sources`) distinguishes available, partial, unmatched, empty, failed and
+  retained, with the primary diagnostic preserved. A guide-only failure keeps the previously
+  published guide; the UI says so instead of "the guide did not load". Fixed `publishXtream`
+  reading a `has_guide` alias that `SELECT *` never produced, which silently dropped retained
+  guides.
+- **Evidence.** `tests/xtream-epg.test.ts` (15) covers every finding. Full suite: **243 tests, 0
+  failures**. Typecheck and the production build are clean. The compiled server passed health,
+  frontend, protected-route and port-collision checks manually (`smoke:built` needs a longer
+  readiness window and a WAL-capable temp directory in this environment). An authorised,
+  bounded real-provider read now yields `guide: available`, 62,553 programmes, 1,850 usable guide
+  ids and 956 with programmes in the current window, with real listings on the rendered guide
+  payload (previously "No guide data").
+- **APK.** No native source changed; the installed APK remains valid. M03.4 physical retest is
+  **not** performed. Details: [M03.4](M03.4-XTREAM-EPG.md).
+
+## Previous pass: M03.3 — Xtream sign-in no longer waits for the catalogue
 
 - **Confirmed mechanism.** `POST /api/v1/auth/xtream/login` authenticated the provider, then ran
   the full catalogue + EPG import inline before setting the session cookie. The web client's
@@ -41,7 +86,12 @@ panel are locally verified. Hosted CI and physical Stick acceptance remain open.
   delays every catalogue call past 30 s signed in in ~120 ms, showed "Signed in. Loading
   channels…", never showed "No channels", and filled the 8,432-channel guide without a reload.
 - **APK.** No native Android source change was needed; the currently installed APK remains valid.
-  Physical acceptance on the AFTMM is still pending.
+  Physical acceptance on the AFTMM was **reported by the user/Hermes** (AFTMM, Fire OS 6.7.1.1,
+  API 25): normal form sign-in in ~0.54 s without seeded cookies, catalogue import running
+  independently, guide/channel navigation, native playback, audible audio, Back releasing the
+  relay and the session surviving relaunch. OMP did not perform those steps; see the
+  [M03.3 record](M03.3-XTREAM-LOGIN-TIMEOUT.md#physical-acceptance--reported-by-the-userhermes-not-performed-by-omp).
+  The guide "No guide data" problem reported alongside it is diagnosed and repaired in M03.4.
 
 ## Previous pass: M03.2 — physical Fire Stick CSRF rejection
 
@@ -167,7 +217,7 @@ panel are locally verified. Hosted CI and physical Stick acceptance remain open.
 
 | Check | Observed result |
 | --- | --- |
-| `npm test` | **62 passed**, including catalog/genre queries, guide search, atomic bulk review, access control, durable IPTV, local HTTP, scheduler, policy and Plex fixtures |
+| `npm test` | **243 passed** at M03.4, including catalog/genre queries, guide search, atomic bulk review, access control, durable IPTV, local HTTP, scheduler, policy, Plex fixtures and the 14 new Xtream guide tests |
 | `npm run typecheck` | Passed |
 | `npm run build` | Passed; app about 298 KiB and lazy hls.js about 595 KiB; existing hls.js chunk-size warning |
 | `npm run smoke:built` | Passed: compiled listener/frontend, protected Plex/IPTV APIs, shutdown and explicit port collision failure |

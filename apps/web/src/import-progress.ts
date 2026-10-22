@@ -4,7 +4,11 @@ import {invalidate} from './hooks.js';
 
 // One provider import, as the server reports it. No percentage exists, so none is shown.
 export type ImportState='queued'|'running'|'completed'|'failed'|'interrupted';
-export type ImportJob={id:string;accountId:string;state:ImportState;stage:string|null;error:string|null;guideError:string|null;includeEpg:boolean;createdAt:number;startedAt:number|null;finishedAt:number|null};
+// The guide outcome, reported separately from the import outcome: a guide can be complete,
+// a partial fallback, unmatched, empty, or retained from an earlier import.
+export type GuideState='available'|'partial'|'unmatched'|'empty'|'failed'|'disabled';
+export type GuideStatus={source:'xmltv'|'short_epg'|'none';state:GuideState;code?:string;requested?:number;succeeded?:number;skipped?:number;mappedChannels?:number;parsedPrograms?:number;rejected?:number;httpStatus?:number;elapsedMs?:number;limit?:number;bytes?:number;primary?:{state:'available'|'unmatched'|'failed';code?:string;httpStatus?:number;elapsedMs?:number}};
+export type ImportJob={id:string;accountId:string;state:ImportState;stage:string|null;error:string|null;guideError:string|null;guide?:GuideStatus|null;includeEpg:boolean;createdAt:number;startedAt:number|null;finishedAt:number|null};
 export type ImportStatus={active:ImportJob|null;latest:ImportJob|null};
 
 export const IMPORT_POLL_MS=3000;
@@ -80,6 +84,18 @@ export function importMessage(status:ImportStatus|undefined,hasChannels:boolean)
       :last.error==='XTREAM_EMPTY_CATALOGUE'?'The provider returned no channels. The last known list is still in use.'
       :'The provider import did not finish. Your sign-in still stands.'};
   if(last?.state==='interrupted')return {tone:'error' as const,text:'The channel import was interrupted.',detail:'The server restarted or the import was cancelled. Retry when ready.'};
-  if(last?.state==='completed'&&last.guideError)return {tone:'warning' as const,text:'Channels loaded, but the guide did not.',detail:`Guide problem: ${last.guideError.replaceAll('_',' ').toLowerCase()}. Channels are unaffected.`};
+  // A guide problem is described by what the viewer has, not by which request failed.
+  const guide=last?.state==='completed'?last.guide:undefined;
+  if(guide){
+    const coverage=guide.mappedChannels&&guide.requested?` Covering ${guide.mappedChannels} of ${guide.requested} requested channels.`:'';
+    if(guide.state==='available')return undefined;
+    if(guide.state==='partial')return {tone:'warning' as const,text:'Guide partially loaded.',detail:`The provider guide could not be used, so listings cover only part of the lineup.${coverage||' Some channels will show no guide data.'}`};
+    if(guide.state==='unmatched')return {tone:'warning' as const,text:'Guide loaded, but no channels matched.',detail:'The provider returned a guide whose channel ids do not match this lineup. Channels are unaffected; a manual guide match may fix it.'};
+    if(guide.state==='empty')return {tone:'warning' as const,text:'Guide loaded, but it has no listings.',detail:'The provider returned a valid guide without current programmes. Channels are unaffected.'};
+    if(guide.state==='failed'&&guide.code==='XTREAM_GUIDE_RETAINED')return {tone:'warning' as const,text:'The guide could not be refreshed. The last known guide is still shown.',detail:`Reason: ${code(guide.primary?.code??guide.code)}. Previously loaded listings are unchanged.`};
+    return {tone:'warning' as const,text:'Channels loaded, but the guide did not.',detail:`Reason: ${code(guide.code??last?.guideError??'')}${guide.httpStatus?` (HTTP ${guide.httpStatus})`:''}. Channels are unaffected.`};
+  }
+  if(last?.state==='completed'&&last.guideError)return {tone:'warning' as const,text:'Channels loaded, but the guide did not.',detail:`Guide problem: ${code(last.guideError)}. Channels are unaffected.`};
   return undefined;
 }
+const code=(value:string)=>value.replaceAll('_',' ').toLowerCase();
