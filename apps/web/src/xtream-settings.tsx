@@ -47,6 +47,8 @@ export function XtreamSettings() {
 
 function AccountCard({account, changed, mutation}:{account: XtreamAccount; changed: () => void; mutation: ReturnType<typeof useMutation>}) {
   const [editing, setEditing] = useState(false), badge = state(account), [job, setJob] = useState<ImportStatus>();
+  // Bumped after a refresh is accepted, so the poll re-reads status for work this card just started.
+  const [poll, setPoll] = useState(0);
   // The refresh route accepts work and answers at once; the import's own status is polled here and
   // stops as soon as it reaches a terminal state.
   useEffect(() => {
@@ -61,11 +63,12 @@ function AccountCard({account, changed, mutation}:{account: XtreamAccount; chang
     };
     void read().catch(() => {});
     return () => { live = false; stop(); };
-  }, [account.id]);
+  }, [account.id, poll]);
   const active = job?.active ?? null;
   const refresh = () => void mutation.run(async () => {
     await api(`/xtream/accounts/${account.id}/refresh`, 'POST', {includeEpg: true});
     invalidate('/xtream/accounts');
+    setPoll(value => value + 1);
   });
   const toggle = () => void mutation.run(async () => {
     await api(`/xtream/accounts/${account.id}`, 'PATCH', {expectedRevision: account.revision, enabled: !account.enabled});
