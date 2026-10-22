@@ -223,6 +223,16 @@ export function openDatabase(path: string) {
         CREATE INDEX IF NOT EXISTS xtream_imports_recent ON xtream_imports(account_id,created_at);`);
       db.prepare('INSERT INTO migrations VALUES(1003)').run();
     }
+    // Fork migration 1004: the guide outcome is recorded separately from the import outcome, so a
+    // partial or empty guide is never mistaken for a failed channel import, and a later recovery
+    // can be told apart from an import where the primary feed was healthy all along. The check is
+    // column presence, not just the ledger: migration 1002 rebuilds iptv_sources, which would
+    // otherwise silently drop a column added after it.
+    const hasColumn = (table: string, column: string) =>
+      (db.prepare(`PRAGMA table_info(${table})`).all() as {name: string}[]).some(row => row.name === column);
+    if (!hasColumn('iptv_sources', 'guide_status')) db.exec('ALTER TABLE iptv_sources ADD COLUMN guide_status TEXT');
+    if (!hasColumn('xtream_imports', 'guide_status')) db.exec('ALTER TABLE xtream_imports ADD COLUMN guide_status TEXT');
+    db.prepare('INSERT OR IGNORE INTO migrations VALUES(1004)').run();
   })();
   } finally {
     db.pragma('foreign_keys = ON');

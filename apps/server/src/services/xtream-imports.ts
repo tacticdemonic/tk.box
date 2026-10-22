@@ -88,7 +88,9 @@ export class XtreamImports {
           requireThat(this.store.importCurrent(job), 'XTREAM_CREDENTIALS_CHANGED', 'The provider changed while it was being read.', 409);
         }
       });
-      final = this.store.finishImport(job.id, { state: 'completed', ...(result.epgError ? { guideError: result.epgError } : {}) }) ?? final;
+      // A guide problem never fails the import: the channels are published and the guide outcome
+      // is recorded beside them, with the primary diagnostic retained for context.
+      final = this.store.finishImport(job.id, { state: 'completed', ...(result.epgError ? { guideError: result.epgError } : {}), ...(result.guide ? { guide: result.guide } : {}) }) ?? final;
       this.published(result.sourceId);
     } catch (error) {
       const code = error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : 'XTREAM_UNREACHABLE';

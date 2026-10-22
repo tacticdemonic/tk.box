@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { AppError } from '../errors.js';
-import { RestrictedSourceFetcher, type SourceEndpoint } from './source-fetch.js';
+import { RestrictedSourceFetcher, SourceFetchError, type SourceDetail, type SourceEndpoint, type SourceLimits } from './source-fetch.js';
 import { parseXmltv, xmltvTime, type M3uChannel, type M3uSnapshot, type Program, type XmlSnapshot } from './iptv.js';
 
 // Xtream Codes provider adapter. It speaks only the documented player_api.php and
@@ -12,7 +12,7 @@ const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
 const hasControl = (value: string) => /[\u0000-\u001f\u007f-\u009f]/.test(value);
 
 export class XtreamError extends AppError {
-  constructor(code: string, message: string, status = 502, retryable = false) { super(code, message, status, retryable); }
+  constructor(code: string, message: string, status = 502, retryable = false, public detail: SourceDetail = {}) { super(code, message, status, retryable); }
 }
 // Every rejection in this adapter is an XtreamError, so callers can tell provider failures
 // apart from internal faults without inspecting messages.
@@ -60,38 +60,165 @@ export type XtreamCatalogue = {
   version: 1; fetchedAt: number; account: XtreamAccount;
   categories: XtreamCategory[]; channels: XtreamChannel[]; ignoredStreams: number;
   epg?: XmlSnapshot; epgError?: string;
+  // The guide outcome, kept separate from the catalogue outcome. Present on every import that
+  // considered a guide, so a partial fallback is never presented as a complete guide.
+  guide?: GuideStatus;
 };
 export type XtreamCataloguePage = {
   categories: XtreamCategory[]; total: number; offset: number; limit: number; hasMore: boolean;
   channels: { streamId: string; name: string; group: string; tvgId: string; logo: string }[];
   fetchedAt: number; ignoredStreams: number; epgPrograms: number;
 };
+// What actually happened to the guide, separately from the catalogue. A guide failure never
+// becomes an account or catalogue failure, and a partial fallback is never reported as complete.
+export type GuideState = 'available' | 'partial' | 'unmatched' | 'empty' | 'failed' | 'disabled';
+export type GuideDiagnostic = {
+  // Sanitised code only: never a URL, body or upstream message.
+  code?: string;
+  httpStatus?: number;
+  elapsedMs?: number;
+  bytes?: number;
+  limit?: number;
+  compression?: string;
+  parsedChannels?: number;
+  parsedPrograms?: number;
+  rejected?: number;
+};
+export type GuideStatus = {
+  // The guide actually in use.
+  source: 'xmltv' | 'short_epg' | 'none';
+  state: GuideState;
+  code?: string;
+  elapsedMs?: number;
+  parsedChannels?: number;
+  parsedPrograms?: number;
+  rejected?: number;
+  // Fallback accounting: requests attempted, answered, refused, and channels left uncovered.
+  requested?: number;
+  succeeded?: number;
+  skipped?: number;
+  mappedChannels?: number;
+  // The primary XMLTV attempt, kept even when a fallback succeeded, so a recovery is visible and
+  // an old failure is not repeated as a current one.
+  primary?: GuideDiagnostic & {state: 'available' | 'unmatched' | 'empty' | 'failed'};
+};
+// Transport-level fields are merged into a diagnostic without ever carrying a URL or a body.
+const numericDetail = (detail: SourceDetail): GuideDiagnostic => ({
+  ...(detail.httpStatus ? {httpStatus: detail.httpStatus} : {}),
+  ...(detail.elapsedMs !== undefined ? {elapsedMs: detail.elapsedMs} : {}),
+  ...(detail.bytes !== undefined ? {bytes: detail.bytes} : {}),
+  ...(detail.limit !== undefined ? {limit: detail.limit} : {}),
+  ...(detail.compression ? {compression: detail.compression} : {})
+});
+// A short-EPG request is bounded in count, concurrency and wall time, so a large lineup cannot
+// turn one refresh into thousands of provider calls.
+const SHORT_EPG_CHANNELS = 40;
+const SHORT_EPG_CONCURRENCY = 4;
+const SHORT_EPG_BUDGET_MS = 20000;
+// The provider's XMLTV feed is legitimately larger than a playlist. These are explicit ceilings,
+// measured against a real 20.6 MiB feed, and apply only to this fetch path.
+const XMLTV_GUIDE_LIMITS = {maxBytes: 16 * 1024 * 1024, maxInflatedBytes: 64 * 1024 * 1024};
+const XMLTV_PARSE_LIMITS = {maxBytes: 64 * 1024 * 1024, maxProgrammes: 500000};
+
 // get_short_epg returns a channel's listings as JSON, sometimes base64-encoded. Only the
 // documented fields are read; malformed rows are dropped rather than failing the refresh.
 const shortEpgSchema = z.object({ epg_listings: z.array(z.record(z.string(), z.unknown())) }).passthrough();
-export function parseShortEpg(input: unknown, channelId: string): Program[] {
+// Provider text arrives either as plain UTF-8 or as base64 of it. Base64 has no spaces, is a
+// multiple of four characters and round-trips exactly, so all three must hold before decoding:
+// a plain title such as "Midday News" or "News" is otherwise valid base64 alphabetically.
+const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
+export function decodeGuideText(value: unknown, max = 4096): string | undefined {
+  const raw = textOf(value, max);
+  if (!raw) return undefined;
+  if (raw.length % 4 !== 0 || !BASE64.test(raw)) return raw;
+  const bytes = Buffer.from(raw, 'base64');
+  if (bytes.toString('base64') !== raw) return raw;
+  let decoded: string;
+  // A fatal decoder is what keeps plain text safe: lenient decoding turns stray bytes into
+  // replacement characters that would pass a printable-character check.
+  try { decoded = new TextDecoder('utf-8', {fatal: true}).decode(bytes); }
+  catch { return raw; }
+  if (!decoded || CONTROL.test(decoded)) return raw;
+  return decoded.slice(0, max);
+}
+// A guide instant is accepted only from an unambiguous representation. A wall-clock string with
+// no offset is resolved in the provider's own timezone, never this machine's.
+const PLAUSIBLE_MIN = Date.UTC(2000, 0, 1) / 1000;
+const PLAUSIBLE_MAX = Date.UTC(2100, 0, 1) / 1000;
+function unixSeconds(value: unknown) {
+  const number = typeof value === 'number' ? value : typeof value === 'string' && /^\d{1,12}$/.test(value.trim()) ? Number(value) : undefined;
+  return number !== undefined && Number.isSafeInteger(number) && number >= PLAUSIBLE_MIN && number < PLAUSIBLE_MAX ? number * 1000 : undefined;
+}
+// Offset of `timeZone` at `instant`, in milliseconds. Intl is the only timezone data available here.
+function zoneOffset(instant: number, timeZone: string) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(new Date(instant));
+    const at = (name: string) => Number(parts.find(part => part.type === name)?.value);
+    const asUtc = Date.UTC(at('year'), at('month') - 1, at('day'), at('hour'), at('minute'), at('second'));
+    return Number.isFinite(asUtc) ? asUtc - instant : undefined;
+  } catch { return undefined; }
+}
+// Wall-clock time in a named zone to an instant. Two passes settle the offset across a DST edge.
+function localTime(value: string, timeZone?: string | null) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value);
+  if (!m || !timeZone) return undefined;
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(part => Number(part ?? 0)) as [number, number, number, number, number, number];
+  const naive = Date.UTC(year, month - 1, day, hour, minute, second);
+  if (new Date(naive).getUTCDate() !== day || hour > 23 || minute > 59 || second > 59) return undefined;
+  const first = zoneOffset(naive, timeZone);
+  if (first === undefined) return undefined;
+  const settled = zoneOffset(naive - first, timeZone);
+  return naive - (settled ?? first);
+}
+export function guideInstant(value: unknown, timeZone?: string | null) {
+  if (typeof value === 'number') return unixSeconds(value);
+  if (typeof value !== 'string') return undefined;
+  const raw = value.trim();
+  if (!raw) return undefined;
+  if (/^\d{10,12}$/.test(raw)) return unixSeconds(raw);
+  if (/^\d{14}\s+[+-]\d{4}$/.test(raw)) { try { return xmltvTime(raw); } catch { return undefined; } }
+  // ISO 8601 with an explicit offset is self-describing and needs no provider timezone.
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})$/.test(raw)) {
+    const instant = Date.parse(raw);
+    return Number.isFinite(instant) ? instant : undefined;
+  }
+  return localTime(raw, timeZone);
+}
+export type ShortEpgParse = {programs: Program[]; rejected: number; ambiguous: number};
+// `xmlId` is the provider's guide identity (tvgId), never the stream id used to request the data.
+export function parseShortEpgDetailed(input: unknown, xmlId: string, timeZone?: string | null, now = Date.now()): ShortEpgParse {
   const parsed = shortEpgSchema.safeParse(input);
   ensure(parsed.success, 'XTREAM_INVALID_RESPONSE', 'The provider returned an unexpected guide response.');
-  const decode = (value: unknown) => {
-    const text = textOf(value, 4096);
-    if (!text) return undefined;
-    try { const bytes = Buffer.from(text, 'base64'); return /^[\x09\x0a\x0d\x20-\x7e\u00a0-\uffff]+$/.test(bytes.toString('utf8')) ? bytes.toString('utf8') : text; }
-    catch { return text; }
-  };
-  const programs: Program[] = [];
+  const programs: Program[] = []; let rejected = 0, ambiguous = 0;
   for (const row of parsed.data.epg_listings.slice(0, 2000)) {
-    const start = xmltvTimeOf(row.start), end = xmltvTimeOf(row.end), title = decode(row.title);
-    if (start === undefined || end === undefined || end <= start || !title) continue;
-    const description = decode(row.description);
-    programs.push({channelId, start, end, title: title.slice(0, 300), ...(description ? {description} : {})});
+    const title = decodeGuideText(row.title, 300);
+    // Unix seconds are the provider's own field and win over a wall-clock rendering of the same slot.
+    const start = unixSeconds(row.start_timestamp) ?? guideInstant(row.start, timeZone);
+    const end = unixSeconds(row.stop_timestamp) ?? guideInstant(row.end, timeZone);
+    if (start === undefined || end === undefined) {
+      if (!timeZone && row.start !== undefined) ambiguous++; else rejected++;
+      continue;
+    }
+    if (!(end > start) || !title) { rejected++; continue; }
+    const description = decodeGuideText(row.description, 1200);
+    programs.push({channelId: xmlId, start, end, title, ...(description ? {description} : {})});
   }
-  return programs;
+  // Two listings for one channel claiming the same airtime are ambiguous, exactly as in the
+  // primary parser: keep the earliest and drop the rest rather than invent an ordering.
+  const unique = [...new Map(programs.map(program => [`${program.start}:${program.end}:${program.title}`, program])).values()]
+    .filter(program => program.end > now - 86400000)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  const accepted: Program[] = []; let overlap = 0;
+  for (const program of unique) {
+    if (accepted.length && program.start < accepted[accepted.length - 1]!.end) { overlap++; continue; }
+    accepted.push(program);
+  }
+  return {programs: accepted, rejected: rejected + (programs.length - accepted.length), ambiguous};
+}
+export function parseShortEpg(input: unknown, xmlId: string, timeZone?: string | null): Program[] {
+  return parseShortEpgDetailed(input, xmlId, timeZone).programs;
 }
 const textOf = (value: unknown, max: number) => typeof value === 'string' || typeof value === 'number' ? text(value, max) : undefined;
-const xmltvTimeOf = (value: unknown) => {
-  if (typeof value !== 'string' || !/^\d{14}\s+[+-]\d{4}$/.test(value.trim())) return undefined;
-  try { return xmltvTime(value.trim()); } catch { return undefined; }
-};
 
 const numberish = (value: unknown) => {
   if (typeof value === 'number' && Number.isInteger(value)) return value;
@@ -181,20 +308,37 @@ export function cataloguePage(catalogue: XtreamCatalogue, page: {offset: number;
     channels: slice, fetchedAt: catalogue.fetchedAt, ignoredStreams: catalogue.ignoredStreams, epgPrograms: catalogue.epg?.programs.length ?? 0 };
 }
 
-export type XtreamTransport = (endpoint: SourceEndpoint, signal?: AbortSignal) => Promise<Buffer>;
-const defaultTransport: XtreamTransport = (endpoint, signal) => new RestrictedSourceFetcher().fetch(endpoint, signal);
+export type XtreamTransport = (endpoint: SourceEndpoint, signal?: AbortSignal, limits?: SourceLimits) => Promise<Buffer>;
+const defaultTransport: XtreamTransport = (endpoint, signal, limits) => new RestrictedSourceFetcher().fetch(endpoint, signal, limits);
 
 // Never let an upstream message reach a log or a response: it may quote the request URL,
-// which contains the provider's username and password.
-function transportFailure(error: unknown): AppError {
+// which contains the provider's username and password. Only our own codes and numeric
+// diagnostics survive this boundary.
+export function transportFailure(error: unknown): XtreamError {
+  const detail = (error instanceof SourceFetchError ? error.detail : {}) as SourceDetail;
+  const fail = (code: string, message: string, status = 502, retryable = false) => new XtreamError(code, message, status, retryable, detail);
   if (error instanceof AppError) {
-    if (error.code === 'SOURCE_RATE_LIMITED') return new XtreamError('XTREAM_RATE_LIMITED', 'The provider is rate limiting requests. Try again later.', 429, true);
-    if (error.code === 'SOURCE_TIMEOUT') return new XtreamError('XTREAM_TIMEOUT', 'The provider did not respond in time.', 504, true);
-    if (['SOURCE_ADDRESS_REJECTED', 'SOURCE_ENDPOINT_REJECTED', 'SOURCE_REDIRECT_REJECTED', 'SOURCE_HEADERS_REJECTED'].includes(error.code)) {
-      return new XtreamError('XTREAM_ENDPOINT_REJECTED', 'The provider address is not a permitted public HTTPS endpoint.', 400);
+    switch (error.code) {
+      case 'SOURCE_RATE_LIMITED': return fail('XTREAM_RATE_LIMITED', 'The provider is rate limiting requests. Try again later.', 429, true);
+      case 'SOURCE_TIMEOUT': return fail('XTREAM_TIMEOUT', 'The provider did not respond in time.', 504, true);
+      case 'SOURCE_ADDRESS_REJECTED':
+      case 'SOURCE_ENDPOINT_REJECTED':
+      case 'SOURCE_REDIRECT_REJECTED':
+      case 'SOURCE_HEADERS_REJECTED': return fail('XTREAM_ENDPOINT_REJECTED', 'The provider address is not a permitted public HTTPS endpoint.', 400);
+      // A rejection or an oversized body is a provider-side answer, not an unreachable host.
+      case 'SOURCE_HTTP_STATUS': return fail('XTREAM_HTTP_STATUS', 'The provider refused the request.', 502);
+      case 'SOURCE_TOO_LARGE':
+      case 'SOURCE_DECOMPRESSION_LIMIT': return fail('XTREAM_RESPONSE_TOO_LARGE', 'The provider response exceeds the configured limit.', 502);
+      case 'SOURCE_ENCODING_REJECTED': return fail('XTREAM_ENCODING_UNSUPPORTED', 'The provider used an unsupported compression.', 502);
+      case 'SOURCE_INVALID_GZIP': return fail('XTREAM_INVALID_COMPRESSION', 'The provider response was not valid gzip.', 502);
+      case 'SOURCE_INVALID_TEXT': return fail('XTREAM_INVALID_ENCODING', 'The provider response was not valid UTF-8.', 502);
+      case 'SOURCE_INCOMPLETE': return fail('XTREAM_INCOMPLETE_RESPONSE', 'The provider response ended early.', 502, true);
+      case 'SOURCE_DNS_FAILED': return fail('XTREAM_DNS_FAILED', 'The provider address could not be resolved.', 502, true);
+      case 'SOURCE_TLS_FAILED': return fail('XTREAM_TLS_FAILED', 'The provider connection could not be secured.', 502, true);
+      case 'SOURCE_NETWORK_FAILED': return fail('XTREAM_NETWORK_FAILED', 'The provider connection failed.', 502, true);
     }
   }
-  return new XtreamError('XTREAM_UNREACHABLE', 'The provider could not be reached.', 502, true);
+  return fail('XTREAM_UNREACHABLE', 'The provider could not be reached.', 502, true);
 }
 
 const playerApi = z.object({ user_info: z.record(z.string(), z.unknown()), server_info: z.record(z.string(), z.unknown()).optional() }).passthrough();
@@ -219,8 +363,8 @@ export class XtreamClient {
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
     return url.toString();
   }
-  private async bytes(url: string, signal?: AbortSignal) {
-    try { return await this.transport({ url, headers: {}, allowInsecureHttp: this.endpoint.allowInsecureHttp }, signal); }
+  private async bytes(url: string, signal?: AbortSignal, limits?: SourceLimits) {
+    try { return await this.transport({ url, headers: {}, allowInsecureHttp: this.endpoint.allowInsecureHttp }, signal, limits); }
     catch (error) { throw transportFailure(error); }
   }
   private async json(url: string, signal?: AbortSignal): Promise<unknown> {
@@ -288,16 +432,71 @@ export class XtreamClient {
     ensure(/^\d{1,20}$/.test(seriesId), 'XTREAM_INVALID_RESPONSE', 'Invalid series identifier.');
     return this.json(this.endpointUrl('player_api.php', 'get_series_info', { series_id: seriesId }), signal);
   }
+  // The provider's XMLTV feed. Its limits are larger than a playlist's but still explicit: a real
+  // feed inflates to ~20.6 MiB, so a 16 MiB ceiling rejected a valid guide as unreachable.
   async epg(signal?: AbortSignal): Promise<XmlSnapshot> {
-    const bytes = await this.bytes(this.endpointUrl('xmltv.php'), signal);
-    try { return parseXmltv(bytes); }
+    const bytes = await this.bytes(this.endpointUrl('xmltv.php'), signal, XMLTV_GUIDE_LIMITS);
+    try { return parseXmltv(bytes, XMLTV_PARSE_LIMITS); }
     catch (error) { throw error instanceof AppError ? error : new XtreamError('XTREAM_INVALID_RESPONSE', 'The provider guide could not be read.'); }
   }
-  // One channel's listings, for providers that publish no XMLTV feed. The channel id is the
-  // provider's own EPG id, so callers must never pass an arbitrary stream address.
-  async shortEpg(channelId: string, signal?: AbortSignal): Promise<Program[]> {
-    ensure(/^[\w.:-]{1,128}$/.test(channelId), 'XTREAM_INVALID_RESPONSE', 'Invalid guide channel identifier.');
-    return parseShortEpg(await this.json(this.endpointUrl('player_api.php', 'get_short_epg', {stream_id: channelId}), signal), channelId);
+  // One channel's listings, for panels that publish no usable XMLTV feed. `streamId` is what the
+  // provider accepts on get_short_epg; `xmlId` is the guide identity the listing is stored under.
+  // These are different namespaces and must never be substituted for one another.
+  async shortEpg(streamId: string, xmlId: string, timeZone?: string | null, signal?: AbortSignal, now = Date.now()): Promise<ShortEpgParse> {
+    ensure(/^\d{1,20}$/.test(streamId), 'XTREAM_INVALID_RESPONSE', 'Invalid stream identifier.');
+    ensure(/^[\w.:-]{1,128}$/.test(xmlId), 'XTREAM_INVALID_RESPONSE', 'Invalid guide channel identifier.');
+    return parseShortEpgDetailed(await this.json(this.endpointUrl('player_api.php', 'get_short_epg', {stream_id: streamId}), signal), xmlId, timeZone, now);
+  }
+  // The fallback is bounded in every dimension: how many channels are asked for, how many run at
+  // once, how long the whole pass may take, and how it stops once the provider pushes back.
+  private async fallbackGuide(channels: XtreamChannel[], timeZone: string | null, signal?: AbortSignal, now = Date.now()): Promise<{epg?: XmlSnapshot; status: GuideStatus}> {
+    const targets: {streamId: string; xmlId: string}[] = [], seen = new Set<string>();
+    for (const channel of channels) {
+      if (!channel.tvgId || !/^[\w.:-]{1,128}$/.test(channel.tvgId)) continue;
+      if (seen.has(channel.tvgId)) continue;
+      seen.add(channel.tvgId);
+      targets.push({streamId: channel.streamId, xmlId: channel.tvgId});
+      if (targets.length >= SHORT_EPG_CHANNELS) break;
+    }
+    // The budget is wall-clock time. `now` is the caller's catalogue timestamp and may be any
+    // instant, so it must not decide how long the pass may run.
+    const deadline = Date.now() + SHORT_EPG_BUDGET_MS;
+    const programs: Program[] = []; let succeeded = 0, skipped = 0, rejected = 0, ambiguous = 0, refused = 0;
+    const answered = new Set<string>();
+    let next = 0, stopped = false;
+    // A provider that rate-limits or refuses one request is not asked the remaining 39 times.
+    const worker = async () => {
+      while (!stopped && next < targets.length && Date.now() < deadline && !signal?.aborted) {
+        const target = targets[next++]!;
+        try {
+          const parsed = await this.shortEpg(target.streamId, target.xmlId, timeZone, signal, now);
+          succeeded++; answered.add(target.xmlId); rejected += parsed.rejected; ambiguous += parsed.ambiguous;
+          programs.push(...parsed.programs);
+        } catch (error) {
+          refused++;
+          const code = error instanceof AppError ? error.code : '';
+          if (code === 'XTREAM_RATE_LIMITED' || code === 'XTREAM_HTTP_STATUS' || code === 'XTREAM_TIMEOUT') stopped = true;
+        }
+      }
+    };
+    await Promise.all(Array.from({length: Math.min(SHORT_EPG_CONCURRENCY, targets.length)}, worker));
+    skipped = targets.length - next;
+    // Coverage is honest: a 40-channel fallback for an 8,000-channel lineup is partial, not complete.
+    const eligible = new Set(channels.map(channel => channel.tvgId).filter(id => id && /^[\w.:-]{1,128}$/.test(id))).size;
+    const complete = answered.size >= eligible;
+    const base: GuideStatus = {source: 'short_epg', state: 'failed', requested: targets.length, succeeded, skipped, mappedChannels: answered.size};
+    if (!programs.length) {
+      // Channels were asked and answered but carry no listings: an empty guide, not a broken one.
+      if (succeeded) return {status: {...base, state: 'empty', code: 'XTREAM_GUIDE_EMPTY', rejected: rejected + ambiguous}};
+      return {status: {...base, code: refused ? 'XTREAM_SHORT_EPG_REFUSED' : 'XTREAM_GUIDE_EMPTY'}};
+    }
+    const epg: XmlSnapshot = {
+      channels: [...answered].map(id => ({id, name: channels.find(channel => channel.tvgId === id)?.name ?? id})),
+      programs, quarantined: 0
+    };
+    return {epg, status: {...base, state: complete ? 'available' : 'partial',
+      ...(complete ? {} : {code: stopped ? 'XTREAM_SHORT_EPG_STOPPED' : 'XTREAM_SHORT_EPG_PARTIAL'}),
+      rejected: rejected + ambiguous}};
   }
   async catalogue(options: { includeEpg?: boolean; signal?: AbortSignal; now?: number; account?: XtreamAccount } = {}): Promise<XtreamCatalogue> {
     // A sign-in has just authenticated this account; repeating that call would put a second
@@ -310,19 +509,55 @@ export class XtreamClient {
       channels: buildLiveSnapshot(this.endpoint.serverUrl, { username: this.username, password: this.password }, streams, categories).channels,
       ignoredStreams: ignored
     };
-    if (options.includeEpg) {
-      try { catalogue.epg = await this.epg(options.signal); }
-      catch (error) { catalogue.epgError = error instanceof AppError ? error.code : 'XTREAM_INVALID_RESPONSE'; }
-      // Some panels publish no XMLTV feed. For those, ask for each channel's short guide instead,
-      // bounded so a large lineup cannot turn one refresh into thousands of requests.
-      if (!catalogue.epg) {
-        const ids = [...new Set(catalogue.channels.map(channel => channel.tvgId).filter(Boolean))].slice(0, 40), programs: Program[] = [];
-        for (const id of ids) {
-          try { programs.push(...await this.shortEpg(id, options.signal)); }
-          catch { /* one channel's guide is optional */ }
-        }
-        if (programs.length) catalogue.epg = {channels: catalogue.channels.filter(channel => ids.includes(channel.tvgId)).map(channel => ({id: channel.tvgId, name: channel.name})), programs, quarantined: 0};
-      }
+    if (!options.includeEpg) { catalogue.guide = {source: 'none', state: 'disabled'}; return catalogue; }
+    const started = Date.now();
+    let primary: GuideStatus['primary'];
+    try {
+      catalogue.epg = await this.epg(options.signal);
+      // Coverage is measured against what the guide actually contains, not how many channels exist:
+      // a valid feed whose ids match nothing is "unmatched", not "available".
+      const counts = new Map<string, number>();
+      for (const channel of catalogue.epg.channels) counts.set(channel.id, (counts.get(channel.id) ?? 0) + 1);
+      const matched = new Set(catalogue.channels.map(channel => channel.tvgId).filter(id => id && counts.get(id) === 1)).size;
+      // A matched id with nothing airing around now is a valid guide with no current programmes,
+      // which is different from a feed that matches no channel at all.
+      const from = (options.now ?? catalogue.fetchedAt) - 86400000, to = from + 8 * 86400000;
+      const current = matched ? catalogue.epg.programs.some(program => program.end > from && program.start < to) : false;
+      const state = matched ? (current ? 'available' : 'empty') : 'unmatched';
+      primary = {state, elapsedMs: Date.now() - started,
+        parsedChannels: catalogue.epg.channels.length, parsedPrograms: catalogue.epg.programs.length,
+        rejected: catalogue.epg.quarantined};
+      catalogue.guide = {source: 'xmltv', state, elapsedMs: Date.now() - started,
+        parsedChannels: catalogue.epg.channels.length, parsedPrograms: catalogue.epg.programs.length,
+        mappedChannels: matched, rejected: catalogue.epg.quarantined, primary};
+      // Any parsed feed ends the guide work. A valid guide with nothing current is reported as
+      // empty rather than spending the bounded fallback's request budget on a healthy provider.
+      return catalogue;
+    } catch (error) {
+      const code = error instanceof AppError ? error.code : 'XTREAM_INVALID_RESPONSE';
+      catalogue.epgError = code;
+      const detail = error instanceof XtreamError ? numericDetail(error.detail) : {};
+      // The code names the stage that actually failed: a refused request, an oversized feed and a
+      // malformed document are not the same fault, and none of them is "unreachable" by default.
+      primary = {state: 'failed', code, ...detail, elapsedMs: Date.now() - started};
+      catalogue.guide = {source: 'xmltv', state: 'failed', code, ...detail, elapsedMs: Date.now() - started, primary};
+    }
+    // Some panels publish no XMLTV feed or publish one the parser cannot accept. For those, ask
+    // for each channel's short guide instead, within the bounded pass above.
+    const fallback = await this.fallbackGuide(catalogue.channels, catalogue.account.timezone, options.signal, options.now ?? Date.now());
+    // The primary failure stays recorded, so a later recovery is distinguishable from an import
+    // where the primary feed was fine all along.
+    // The fallback's own numbers replace the primary's: a successful fallback must not inherit the
+    // primary's HTTP status or byte counts. The primary attempt is kept under `primary`.
+    if (fallback.epg) {
+      catalogue.epg = fallback.epg;
+      catalogue.guide = {...fallback.status, primary};
+    } else {
+      // Neither source produced listings, and the primary itself failed. Say so, keeping the
+      // fallback's request accounting so the failure is actionable.
+      catalogue.guide = {source: 'none', state: 'failed', code: fallback.status.code ?? primary?.code,
+        requested: fallback.status.requested, succeeded: fallback.status.succeeded, skipped: fallback.status.skipped,
+        mappedChannels: fallback.status.mappedChannels, primary};
     }
     return catalogue;
   }

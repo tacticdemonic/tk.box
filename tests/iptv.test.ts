@@ -29,8 +29,12 @@ test('guide exact ID automatic candidates; approximate matches require source-sc
   assert.throws(() => approveMapping({...input, role: 'viewer'}, undefined, scope, x));
   assert.throws(() => approveMapping({...input, feedId: 'other'}, undefined, scope, x));
   assert.throws(() => approveMapping(input, approved, scope, x));
-  const duplicate = {...x, channels: [...x.channels, x.channels[0]!]};
-  assert.equal(mappingCandidates(s.channels[0]!, s.channels, duplicate).exactId, undefined);
+  // A provider that declares one station several times under one guide id ("BBC One | SD |",
+  // "| FHD |") is ordinary and usable. Only an id shared by *different* stations is ambiguous.
+  const repeatedDeclaration = {...x, channels: [...x.channels, x.channels[0]!]};
+  assert.equal(mappingCandidates(s.channels[0]!, s.channels, repeatedDeclaration).exactId, 'news.uk');
+  const conflictingDeclaration = {...x, channels: [...x.channels, {...x.channels[0]!, name: 'A different station'}]};
+  assert.equal(mappingCandidates(s.channels[0]!, s.channels, conflictingDeclaration).exactId, undefined);
   assert.equal(mappingCandidates(s.channels[0]!, [...s.channels, s.channels[0]!], x).exactId, 'news.uk');
   const unrelated={...s.channels[0]!,name:'Unrelated station'};
   assert.equal(mappingCandidates(s.channels[0]!, [...s.channels, unrelated], x).exactId, undefined);

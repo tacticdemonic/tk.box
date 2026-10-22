@@ -1,11 +1,14 @@
 import type { XtreamStore } from '../persistence/xtream-store.js';
 import type { IptvStore } from '../persistence/iptv-store.js';
-import { XtreamClient, type XtreamAccount, type XtreamCatalogue } from '../providers/xtream.js';
+import { XtreamClient, type GuideStatus, type XtreamAccount, type XtreamCatalogue } from '../providers/xtream.js';
 import { AppError, requireThat } from '../errors.js';
 
 export type XtreamRefreshResult = {
   account: XtreamAccount; categories: number; channels: number; ignoredStreams: number;
   epgPrograms: number; epgError?: string; sourceId: string;
+  // What the guide actually is: complete, partial fallback, unmatched or absent. Separate from
+  // the catalogue result, which succeeded whenever this object exists.
+  guide?: GuideStatus;
 };
 
 export type XtreamOperation = 'validate' | 'import';
@@ -85,6 +88,7 @@ export class XtreamService {
   private summary(catalogue: XtreamCatalogue): Omit<XtreamRefreshResult, 'sourceId'> {
     return { account: catalogue.account, categories: catalogue.categories.length, channels: catalogue.channels.length,
       ignoredStreams: catalogue.ignoredStreams, epgPrograms: catalogue.epg?.programs.length ?? 0,
-      ...(catalogue.epgError ? { epgError: catalogue.epgError } : {}) };
+      ...(catalogue.epgError ? { epgError: catalogue.epgError } : {}),
+      ...(catalogue.guide ? { guide: catalogue.guide } : {}) };
   }
 }
