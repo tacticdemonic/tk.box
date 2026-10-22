@@ -240,8 +240,11 @@ test('upstream migrations still apply after the fork migration on a populated da
     db = openDatabase(file);
     try {
       const versions = (db.prepare('SELECT version FROM migrations ORDER BY version').all() as {version: number}[]).map(row => row.version);
-      assert.ok(versions.includes(10) && versions.includes(11) && versions.includes(1001) && versions.includes(1002));
+      assert.ok(versions.includes(10) && versions.includes(11) && versions.includes(1001) && versions.includes(1002) && versions.includes(1003));
       assert.equal(new Set(versions).size, versions.length, 'every migration records once');
+      // 1003 adds import tracking only; it must not disturb the provider catalogue that predates it.
+      assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='xtream_imports'").get());
+      assert.equal(new IptvStore(db, vault).visible().length, 1);
       const kept = new IptvStore(db, vault);
       assert.equal(kept.status(source.id).kind, 'm3u');
       assert.equal(kept.status(source.id).feedId, guide.id, 'the linked guide survived the rebuild');

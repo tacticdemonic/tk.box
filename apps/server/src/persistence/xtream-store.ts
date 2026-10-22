@@ -91,10 +91,12 @@ export class XtreamStore {
   importStage(id: string, stage: string) {
     this.db.prepare("UPDATE xtream_imports SET stage=? WHERE id=? AND state='running'").run(stage, id);
   }
+  // Undefined when the provider was removed while its import ran: the row cascaded away with it,
+  // and there is nothing left to report. Callers must not treat that as a failure.
   finishImport(id: string, result: { state: 'completed' | 'failed' | 'interrupted'; error?: string; guideError?: string }, now = Date.now()) {
-    this.db.prepare("UPDATE xtream_imports SET state=?,stage=NULL,error=?,guide_error=?,finished_at=? WHERE id=? AND state IN ('queued','running')")
+    const changed = this.db.prepare("UPDATE xtream_imports SET state=?,stage=NULL,error=?,guide_error=?,finished_at=? WHERE id=? AND state IN ('queued','running')")
       .run(result.state, result.error ?? null, result.guideError ?? null, now, id);
-    return this.importOf(this.importRow(id));
+    return changed.changes ? this.importOf(this.importRow(id)) : undefined;
   }
   import(id: string) { return this.importOf(this.importRow(id)); }
   // Import rows belong to the provider account, so they outlive the first publication and are

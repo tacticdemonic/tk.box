@@ -287,3 +287,39 @@ test('the import manager never mistakes a validation promise for a finished impo
     assert.equal(store.catalogue(account.id)?.channels.length, 2);
   } finally {await imports.close(); db.close();}
 });
+
+test('H. disabling or removing a provider during an import publishes nothing and strands no job', async () => {
+  for (const action of ['disable', 'remove'] as const) {
+    const fixture = panel(), db = openDatabase(':memory:'), vault = new Vault(randomBytes(32)), c = config();
+    const app = await buildApp(c, db, vault, new PlexAdapter(c, `imports-h-${action}`, fakePlex({accountId: 1}).transport), false, 'tk.box', fixture.transport);
+    try {
+      const first = await login(app), session = {origin, cookie: `tk.box_local=${cookieOf(first)}`}, account = accountOf(db);
+      const body = action === 'disable'
+        ? {expectedRevision: 0, enabled: false}
+        : {expectedRevision: 0};
+      const changed = await app.inject({method: action === 'disable' ? 'PATCH' : 'DELETE', url: `/api/v1/xtream/accounts/${account}`, headers: session, payload: body});
+      assert.equal(changed.statusCode, 200, changed.body);
+      fixture.release();
+      // Wait for the fetch to finish, then read the outcome where the provider must still be
+      // inspectable: the database. A disabled or removed provider's routes correctly close.
+      for (let attempt = 0; attempt < 80; attempt++) {
+        const running = (db.prepare("SELECT COUNT(*) AS n FROM xtream_imports WHERE state IN ('queued','running')").get() as {n: number}).n;
+        if (!running) break;
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      const job = action === 'disable'
+        ? db.prepare('SELECT state,error FROM xtream_imports ORDER BY created_at DESC LIMIT 1').get() as {state: string; error: string | null} | undefined
+        : undefined;
+      if (action === 'disable') {
+        // The fetch finished against a disabled provider: it failed instead of publishing.
+        assert.equal(job?.state, 'failed');
+        assert.equal(job?.error, 'XTREAM_CREDENTIALS_CHANGED');
+      } else {
+        // Removing the provider removes its jobs with it.
+        assert.equal((db.prepare('SELECT COUNT(*) AS n FROM xtream_imports').get() as {n: number}).n, 0);
+      }
+      assert.equal((await app.inject({url: '/api/v1/iptv/channels', headers: session})).json().channels.length, 0, `${action}: nothing stale is published`);
+      assert.equal((db.prepare("SELECT COUNT(*) AS n FROM xtream_imports WHERE state IN ('queued','running')").get() as {n: number}).n, 0, `${action}: no job is left running`);
+    } finally {await app.close(); db.close();}
+  }
+});

@@ -100,6 +100,9 @@ Lifecycle, persisted in `xtream_imports` (fork migration 1003):
 | `failed` | terminal `error` is a stable code (`XTREAM_TIMEOUT`, `XTREAM_UNREACHABLE`, `XTREAM_EMPTY_CATALOGUE`, `XTREAM_CREDENTIALS_CHANGED`, …) |
 | `interrupted` | the process restarted or shut down mid-import; `error` is `IMPORT_INTERRUPTED` |
 
+A provider removed while its import runs takes its job rows with it (the foreign key cascades), so
+the finished worker reports nothing rather than raising an unhandled rejection.
+
 - **Deduplication** is a database rule: a partial unique index allows one `queued`/`running` row
   per provider account, so a repeated sign-in or a refresh click joins the existing job.
 - **Concurrency** is two imports server-wide, claimed with a conditional update, and still one
@@ -244,12 +247,13 @@ and the optional per-provider checks are configured under the source's Checks ta
 - `tests/xtream-playback.test.ts` (1): a synthetic Xtream panel with a real FFmpeg MPEG-TS stream;
   remux, segment fetch, per-provider connection refusal, revocation and disabled-account
   termination.
-- `tests/xtream-imports.test.ts` (11): sign-in returns while a deliberately delayed import is
+- `tests/xtream-imports.test.ts` (12): sign-in returns while a deliberately delayed import is
   pending, `/me` works before it completes, rejected credentials and a wrong bootstrap token issue
   no session or job, repeated sign-ins and refreshes join one job, status is account-scoped,
-  catalogue and guide failures keep the last known channels, a credential change mid-import
-  publishes nothing, a restart reports interrupted, an 8,436-channel import keeps health/status/UI
-  reads responsive, and a validation is never mistaken for a completed import.
+  catalogue and guide failures keep the last known channels, a credential change or a
+  disable/removal mid-import publishes nothing and strands no job, a restart reports interrupted,
+  an 8,436-channel import keeps health/status/UI reads responsive, and a validation is never
+  mistaken for a completed import.
 
 ## Limitations
 

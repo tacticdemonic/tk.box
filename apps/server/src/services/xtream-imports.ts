@@ -88,13 +88,13 @@ export class XtreamImports {
           requireThat(this.store.importCurrent(job), 'XTREAM_CREDENTIALS_CHANGED', 'The provider changed while it was being read.', 409);
         }
       });
-      final = this.store.finishImport(job.id, { state: 'completed', ...(result.epgError ? { guideError: result.epgError } : {}) });
+      final = this.store.finishImport(job.id, { state: 'completed', ...(result.epgError ? { guideError: result.epgError } : {}) }) ?? final;
       this.published(result.sourceId);
     } catch (error) {
       const code = error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : 'XTREAM_UNREACHABLE';
       const aborted = controller.signal.aborted || code === 'IMPORT_INTERRUPTED';
       const state = aborted ? 'interrupted' : 'failed';
-      final = this.store.finishImport(job.id, { state, error: aborted ? 'IMPORT_INTERRUPTED' : code });
+      final = this.store.finishImport(job.id, { state, error: aborted ? 'IMPORT_INTERRUPTED' : code }) ?? final;
       // Stable code only: an upstream message could quote the provider URL and credentials.
       this.log('xtream import did not complete', { importId: job.id, code, state });
     } finally {
