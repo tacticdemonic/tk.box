@@ -86,9 +86,14 @@ export function seed(dir: string) {
   // A session in the shape the Xtream sign-in issues, so the HTTP benchmark authenticates like a viewer.
   const cookie = randomBytes(32).toString('base64url');
   db.prepare('INSERT OR REPLACE INTO sessions VALUES(?,?,?,?)').run(digest(cookie), 'owner', vault.seal('xtream', digest(cookie)), now + 12 * 3600000);
+  // Warm the read path once and report its logical cache weight separately from process memory:
+  // the budget counts estimated sealed-payload bytes, never a heap measurement.
+  const start = Date.UTC(2026, 9, 22, 0);
+  iptv.guidePage('owner', 'all', start, start + 6 * 3600000, 0, 50);
+  const cache = iptv.cacheStats();
   db.close();
   writeFileSync(join(dir, 'bench-cookie'), cookie);
-  return { sourceId: published.source.id, feeds: channels.length, programmes: programs.length };
+  return { sourceId: published.source.id, feeds: channels.length, programmes: programs.length, cache };
 }
 
 // Counts real vault decryptions and JSON parses without changing production code paths.

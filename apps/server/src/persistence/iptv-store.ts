@@ -31,7 +31,13 @@ const viewable=`${listed} AND (c.source_id NOT IN (SELECT id FROM iptv_sources W
 const hours=z.number().int().min(1).max(168);
 // Decrypted source snapshots and guides. Bounded so repeated imports cannot retain every revision;
 // two full guides plus their channel snapshots fit, which is what a multi-provider lineup needs.
+// Sealed-payload bytes, not measured object memory: a decrypted snapshot can be a different size
+// from its ciphertext, and this never re-serialises megabytes just to weigh them. It is an estimated
+// payload budget, not a process-heap ceiling.
 const DATA_CACHE_BYTES=96*1024*1024;
+// The derived icon is a guide URL, which can carry a provider access token. It is sealed with the
+// channel it belongs to, so a row copied onto another channel fails to open rather than leaking.
+const ICON_SEAL='sealed:';
 export const sourceCreate=z.object({kind:z.enum(['m3u','xmltv']),name:z.string().trim().min(1).max(120),endpoint:sourceEndpoint.optional()}).strict();
 export const sourceOrder=z.object({ids:z.array(z.string().uuid()).max(64)}).strict();
 export const sourcePolicy=z.object({expectedRevision:z.number().int().nonnegative(),intervalHours:hours}).strict();
@@ -44,16 +50,24 @@ export const identityResolution=z.object({expectedRevision:z.number().int().nonn
 // Guide placeholders that do not count as a program for "has guide data".
 const GUIDE_FILLER=/^\s*(no (program(me)?s?|programming|information|info|data|listings?|epg)( available)?|to be (announced|determined)|tba|tbd|off ?air|sign ?off|close ?down|channel off ?air)\s*\.?\s*$/i;
 export class IptvStore {
-  private scheduleStackCache=new Map<string,{immutable:string;now:number;keys:Map<string,string>;candidates:Candidate[]}>();
+  // Candidates keep programme arrays alive, so each entry names the data-cache keys it borrowed.
+  // Evicting or replacing either source releases it, instead of a superseded guide staying pinned.
+  private scheduleStackCache=new Map<string,{immutable:string;now:number;keys:Map<string,string>;candidates:Candidate[];dataKeys:string[]}>();
   // Decrypted source snapshots and guides, bounded by sealed-payload bytes rather than entry count:
   // a large guide is exactly what must not be re-read per logo or per page row. Entries are keyed by
   // the revisions that produced them, so an import, mapping change or revocation invalidates them.
   private dataCache=new Map<string,{data:SourceData;bytes:number}>();
   private dataCacheBytes=0;
+  private readonly cacheBytes:number;
   // Decrypted per-channel metadata, keyed by its own sealed payload so a replaced feed is a new
   // entry rather than a stale hit. Bounded well above any supported lineup (8,436 feeds here).
   private providerCache=new Map<string,M3uChannel>();
-  constructor(private db:Db,private vault:Vault) {}
+  // `dataCacheBytes` is a test seam for the budget: a unit test must not allocate hundreds of
+  // megabytes to exercise eviction. Production always uses DATA_CACHE_BYTES.
+  constructor(private db:Db,private vault:Vault,options:{dataCacheBytes?:number}={}) {this.cacheBytes=options.dataCacheBytes??DATA_CACHE_BYTES;}
+  // Logical cache weight, for tests and for reporting alongside (never instead of) process RSS.
+  // `bytes` estimates sealed payload size; it is not a heap measurement.
+  cacheStats() {return {entries:this.dataCache.size,bytes:this.dataCacheBytes,budget:this.cacheBytes,schedules:this.scheduleStackCache.size};}
   // `typeof(column)` reads only the value's header. `column IS NOT NULL` has to walk the whole value,
   // and on the guide blob that is 37 MB of overflow pages — 20 ms per call, on a projection the guide
   // page ran once per channel.
@@ -138,6 +152,7 @@ export class IptvStore {
       this.db.prepare('DELETE FROM iptv_source_feeds WHERE source_id=? OR feed_id=?').run(id,id);
       this.db.prepare('DELETE FROM iptv_channels WHERE source_id=?').run(id);
       this.db.prepare('DELETE FROM iptv_sources WHERE id=?').run(id);
+      this.evictSource(id);
       this.audit(actor,'iptv_source_removed',id,now);
       if(ownFeed&&!this.db.prepare('SELECT 1 FROM iptv_source_feeds WHERE feed_id=?').get(ownFeed))this.remove(actor,ownFeed,this.source(ownFeed).revision,now);
       return {status:'removed' as const,id};
@@ -274,7 +289,7 @@ export class IptvStore {
       if(!c.present||c.conflict)continue;
       const data=this.guideDataFor(c,feedId,cache),xmlId=data.mapping?.xmlId;if(!xmlId||!data.xml)continue;
       // The projected icon belongs to the guide channel, so a mapping change replaces it below.
-      const icon=data.index?.icons.get(xmlId);if(icon)putIcon.run(c.id,icon);
+      const icon=data.index?.icons.get(xmlId);if(icon)putIcon.run(c.id,ICON_SEAL+this.vault.seal(icon,`iptv:icon:${c.id}`));
       if(!indexed&&(indexed=true))for(const p of data.xml.programs)if(!GUIDE_FILLER.test(p.title)){const list=byXml.get(p.channelId);if(list)list.push(p);else byXml.set(p.channelId,[p]);}
       const spans=(byXml.get(xmlId)??[]).map(p=>[p.start,p.end] as [number,number]).sort((a,b)=>a[0]-b[0]),merged:[number,number][]=[];
       for(const [start,end] of spans){const last=merged.at(-1);if(last&&start<=last[1]+60000)last[1]=Math.max(last[1],end);else merged.push([start,end]);}
@@ -344,7 +359,9 @@ export class IptvStore {
     }
     const keys=scheduleStackKeys(candidates,now);
     if(this.scheduleStackCache.size>=64)this.scheduleStackCache.clear();
-    this.scheduleStackCache.set(sourceId,{immutable,now,keys,candidates});return keys;
+    // These arrays are owned by the data cache; naming the keys lets eviction drop this entry
+    // rather than leaving an old guide alive through a candidate reference.
+    this.scheduleStackCache.set(sourceId,{immutable,now,keys,candidates,dataKeys:[this.dataKey(this.source(sourceId)),this.dataKey(this.source(feedId))]});return keys;
   }
   // The viewer's account scopes Xtream sources: an empty account sees only server-wide sources.
   private feeds(account=''):Feed[] {const stacks=new Map<string,Map<string,string>>();return (this.db.prepare(`SELECT c.id,c.source_id,c.display_name,c.stack_key,c.encrypted_provider,n.number,n.position,(SELECT h.status FROM iptv_channel_health h WHERE h.channel_id=c.id) AS health,c.event AS sports,(SELECT w.stack_key FROM sports_windows w WHERE w.channel_id=c.id) AS event,ew.sport AS event_sport,ew.league_key AS event_league,ew.start AS event_start FROM iptv_channels c JOIN lineup_numbers n ON n.channel_id=c.id LEFT JOIN sports_windows ew ON ew.channel_id=c.id WHERE ${viewable} ORDER BY n.position,n.number,c.id`).all({account,now:Date.now()}) as (ChannelRow&{health:string|null;sports:number|null;event:string|null;event_sport:string|null;event_league:string|null;event_start:number|null})[]).map(c=>{const p=this.provider(c),q=quality(p.name)??quality(c.display_name??'');
@@ -389,7 +406,11 @@ export class IptvStore {
   // The guide icon is a published projection, so a logo request never decrypts or parses the guide.
   logo(id:string,account='') {
     requireThat(this.isVisible(id,account),'CHANNEL_NOT_FOUND','Channel not found.',404);const c=this.channel(id),p=this.provider(c);
-    const icon=(this.db.prepare('SELECT icon FROM iptv_channel_icons WHERE channel_id=?').get(id) as {icon:string}|undefined)?.icon;
+    const stored=(this.db.prepare('SELECT icon FROM iptv_channel_icons WHERE channel_id=?').get(id) as {icon:string}|undefined)?.icon;
+    // A row written before 1006 (or restored from a backup) is not trusted: an unsealed value is
+    // ignored, so a plaintext URL can never leave through the logo route. A record sealed for a
+    // different channel fails authentication and is treated as absent, not as a server fault.
+    const icon=(()=>{try{return stored?.startsWith(ICON_SEAL)?this.vault.open(stored.slice(ICON_SEAL.length),`iptv:icon:${id}`):undefined;}catch{return undefined;}})();
     // The provider's own name drives library matching; an administrator rename is display-only.
     return {name:p.name,tvgId:p.tvgId,urls:[/^https?:\/\//i.test(p.logo)?p.logo:undefined,icon].filter((u):u is string=>!!u)};
   }
@@ -633,17 +654,53 @@ export class IptvStore {
       // A superseded revision can never be read again, and retaining it would let repeated imports
       // grow the process without bound. The byte budget backstops the per-source eviction.
       const prefix=`${row.id}:`;
-      for(const stale of this.dataCache.keys())if(stale.startsWith(prefix)){this.dataCacheBytes-=this.dataCache.get(stale)!.bytes;this.dataCache.delete(stale);}
-      if(this.dataCache.size>=64)this.dataCache.clear();
+      for(const stale of [...this.dataCache.keys()])if(stale.startsWith(prefix))this.evictData(stale);
+      if(this.dataCache.size>=64)this.clearDataCache();
       this.dataCache.set(key,loaded);this.dataCacheBytes+=loaded.bytes;
-      while(this.dataCacheBytes>DATA_CACHE_BYTES&&this.dataCache.size>1){const oldest=this.dataCache.keys().next().value!;this.dataCacheBytes-=this.dataCache.get(oldest)!.bytes;this.dataCache.delete(oldest);}
+      // An entry larger than the whole budget is the only one kept: the request that loaded it
+      // completes, and the next miss replaces it. Evicting it immediately would re-read it on
+      // every request and never make progress.
+      while(this.dataCacheBytes>this.cacheBytes&&this.dataCache.size>1)this.evictData(this.dataCache.keys().next().value!);
     }
     cache?.set(sourceId,data);return data;
   }
+  private evictData(key:string) {
+    const entry=this.dataCache.get(key);if(!entry)return;
+    this.dataCache.delete(key);this.dataCacheBytes-=entry.bytes;
+    this.releaseSchedules([key]);
+  }
+  // Accounted bytes and retained objects always move together: a clear that left the counter alone
+  // made every later eviction evict unrelated sources.
+  private clearDataCache() {
+    this.dataCache.clear();this.dataCacheBytes=0;this.scheduleStackCache.clear();
+  }
+  // A removed source's entries can never be read again; drop them with the rows rather than waiting
+  // for the budget to evict them. Test seam: `clearCache()` below forces the same reset.
+  private evictSource(sourceId:string) {
+    const prefix=`${sourceId}:`;
+    for(const key of [...this.dataCache.keys()])if(key.startsWith(prefix))this.evictData(key);
+    this.scheduleStackCache.delete(sourceId);
+  }
+  // Test seam for the size-cap reset. It keeps no product behaviour; production reaches the same
+  // state when 64 entries accumulate.
+  clearCache() {this.clearDataCache();}
+  // A cached schedule holds arrays borrowed from the snapshots it resolved; once those are gone it
+  // must not keep them alive (or serve them) under a stale key.
+  private releaseSchedules(dataKeys:string[]) {
+    const gone=new Set(dataKeys);
+    for(const [sourceId,entry] of this.scheduleStackCache)if(entry.dataKeys.some(key=>gone.has(key)))this.scheduleStackCache.delete(sourceId);
+  }
   // A source revision changes whenever its snapshot, guide, credentials or disable state does, so
-  // an entry can never be read after an import replaced or revoked it.
+  // an entry can never be read after an import replaced or revoked it. A playlist's snapshot also
+  // carries a guide index derived from a separately versioned XMLTV feed, so the key names that
+  // feed and its revision too: without it a guide-only refresh left icons and mapping decisions at
+  // the previous guide revision. The lookup is one small query per miss, not per channel.
   private dataKey(row:SourceRow) {
-    if(row.kind!=='xtream')return `${row.id}:${row.kind}:${row.revision}`;
+    if(row.kind==='m3u') {
+      const feed=this.db.prepare('SELECT feed_id FROM iptv_source_feeds WHERE source_id=?').get(row.id) as {feed_id:string}|undefined;
+      return `${row.id}:m3u:${row.revision}:${feed?.feed_id??'-'}:${feed?this.source(feed.feed_id).revision:0}`;
+    }
+    if(row.kind==='xmltv')return `${row.id}:xmltv:${row.revision}`;
     const account=row.xtream_account_id?this.db.prepare('SELECT catalogue_at FROM xtream_accounts WHERE id=?').get(row.xtream_account_id) as {catalogue_at:number|null}|undefined:undefined;
     return `${row.id}:xtream:${row.revision}:${account?.catalogue_at??0}`;
   }

@@ -18,14 +18,17 @@ its record.**
   payload; programmes are indexed by guide id once per snapshot instead of being filtered per row;
   an indexed guide miss no longer rebuilds the station map; and a clock-minute change re-joins
   cached resolver evidence instead of re-resolving every mapping.
-- **Logos.** Each channel's guide icon is published (migration 1005, backfilled by the existing
-  startup pass) so a logo request decrypts and parses no programme guide. Existing databases need
-  no reimport.
-- **Verified.** `npm run typecheck`, `npm run build`, **255 of 255** Node tests (including 11
-  deterministic work-count tests in `tests/guide-read-path.test.ts`), and a compiled-server
-  benchmark. Warm 50-row page p95 241 ms, cold 667 ms, `/health` p95 33 ms and `/api/v1/me` p95
-  87 ms during a logo burst. Baseline on the same harness reproduced the field report at
-  54,458–74,830 ms. Details and budgets: [M03.5](M03.5-GUIDE-READ-PERFORMANCE.md).
+- **Logos.** Each channel's guide icon is published as a small sealed, channel-bound row
+  (migrations 1005 and 1006, republished by the existing startup pass) so a logo request decrypts
+  and parses no programme guide and no plaintext provider URL is stored. Existing databases need
+  no reimport; a database that applied 1005 before 1006 drops its plaintext rows on the next
+  startup.
+- **Verified.** `npm run typecheck`, `npm run build`, **270 of 270** Node tests (including 11
+  deterministic work-count tests in `tests/guide-read-path.test.ts` and 15 review-fix tests), and a
+  compiled-server benchmark. Warm 50-row page p95 262 ms, cold 480 ms, `/health` p95 34 ms and
+  `/api/v1/me` p95 93 ms during a logo burst. Baseline on the same harness reproduced the field
+  report at 54,458–74,830 ms. Details and budgets:
+  [M03.5](M03.5-GUIDE-READ-PERFORMANCE.md).
 - **APK.** No native source changed; the installed APK remains valid. M03.5 physical retest is
   **not** performed.
 

@@ -116,6 +116,8 @@ test('logo requests perform no programme-guide decryption or parse', () => {
     });
     assert.equal(counts.opens['iptv:guide'] ?? 0, 0, 'no guide blob is decrypted for any logo');
     assert.ok(counts.parseBytes < 65536, `no guide-sized payload is parsed for ${counts.parses} logos (${counts.parseBytes} bytes)`);
+    // The icon URL is sealed, so each logo pays one small channel-bound record — never a guide read.
+    assert.equal(counts.opens['iptv:icon'] ?? 0, store.visible('viewer').length, 'exactly one small record per logo');
     // Semantics are preserved: playlist logo first, derived guide icon second.
     assert.deepEqual(store.logo(channel.id, 'viewer').urls, ['https://logos.invalid/0.png', 'https://icons.invalid/0.png']);
   } finally { db.close(); }
