@@ -24,12 +24,14 @@ remain open. M03.3 physical acceptance was reported by the user/Hermes; see its 
   and parses no programme guide and no plaintext provider URL is stored. Existing databases need
   no reimport; a database that applied 1005 before 1006 drops its plaintext rows on the next
   startup.
-- **Verified.** `npm run typecheck`, `npm run build`, **270 of 270** Node tests (including 11
-  deterministic work-count tests in `tests/guide-read-path.test.ts` and 15 review-fix tests), and a
-  compiled-server benchmark. Warm 50-row page p95 262 ms, cold 480 ms, `/health` p95 34 ms and
-  `/api/v1/me` p95 93 ms during a logo burst. Baseline on the same harness reproduced the field
-  report at 54,458–74,830 ms. Details and budgets:
-  [M03.5](M03.5-GUIDE-READ-PERFORMANCE.md).
+- **Verified.** `npm run typecheck`, `npm run build`, **270 of 270** Node tests at `73d640c` in this
+  environment (including 11 deterministic work-count tests in `tests/guide-read-path.test.ts` and 15
+  review-fix tests), and a compiled-server benchmark. Warm 50-row page p95 262 ms, cold 480 ms,
+  `/health` p95 34 ms and `/api/v1/me` p95 93 ms during a logo burst. Baseline on the same harness
+  reproduced the field report at 54,458–74,830 ms. The physical deployment of that revision reported
+  **256 passed / 3 failed / 11 skipped**, and its three failures were `local-media` Windows
+  temporary-tree fixtures, not the EPG clock (see the separated test history in M03.5 §12.4).
+  Details and budgets: [M03.5](M03.5-GUIDE-READ-PERFORMANCE.md).
 - **APK.** No native source changed; the installed APK remains valid. M03.5 physical retest is
   **not** performed.
 
@@ -61,14 +63,31 @@ remain open. M03.3 physical acceptance was reported by the user/Hermes; see its 
   aborts it, so timed-out work escaped the cap. `ChannelLogo` now records admission with the address
   it was granted for and clears `src` on its own node when a source is replaced or expires; with four
   real pending responses, unmount aborts 4 of 4.
+- **Review repair: admission belongs to an acquisition, not an address.** Binding the grant to the
+  `src` still let a tile reuse a cancelled acquisition: while a replacement queued, the target's old
+  grant kept `{src: A, shown: true}`, so returning to A rendered a fifth `<img>` with the pool full.
+  Reproduced with the real `ChannelLogo`/`FadeImage` components, React 19.3.1 and jsdom 27, no
+  scheduler calls and no load/error events: **five** unfinished images under a four-slot cap. Each
+  acquisition now takes a token, the grant is dropped during render when the enabled state or
+  address changes (so no stale image is committed and no effect has to undo one), and the token
+  scopes the lease, the rendered node and the callbacks, so an obsolete load, error or cleanup can
+  neither release a newer lease nor cancel a newer node. `tests/channel-logo.test.ts` (6) covers
+  A → queued B → A, same-URL disable/re-enable, ordinary replacement, obsolete callbacks, the
+  deadline and unmount; the two admission-reuse cases fail against the reviewed candidate, and the
+  other four are preservation guards that pass on both.
 - **`xtream-epg` clock repair.** The four failures were fixtures airing on 22 October 2026 meeting a
   real-clock 24-hour lookback, not a product defect. The existing `now` option is injected at the
   client and service boundaries; production retention and availability behaviour are untouched.
-- **Verified.** `npm run typecheck` and `npm run build` clean. Full suite **280 tests: 280 pass, 0
-  fail, 0 skipped**. Real browser through a proxy that holds every logo response: exactly 4 logo
-  connections, 50 monograms, click-to-usable 272–316 ms with 1 ms of queueing, six navigation cycles
-  flat at 4, Details/Back/focus correct with logos pending, no playback. Evidence, the corrected
-  test history and the self-contained Hermes steps: [M03.5 §12](M03.5-GUIDE-READ-PERFORMANCE.md).
+- **Verified.** `npm run typecheck` and `npm run build` clean. Full suite **286 tests: 286 pass, 0
+  fail, 0 skipped**. Rendered-component evidence is separate from browser-network evidence: the new
+  jsdom test fails 2 of 6 against the reviewed candidate's component (the admission-reuse cases) and
+  passes 6/6 after the repair, and the real Chromium probe against the
+  compiled build behind a proxy that holds every logo response shows exactly 4 logo requests and
+  peak 4, 50 → 100 rows in 446 ms while all four are pending, exactly 4 new requests after releasing
+  four, 4/4 aborted on unmount, and Details/Back restoring focus to `US: News 0 FHD details`.
+  Assets: `index-DP3kg7rd.js`, `index-Dnyl-tHx.css`, `settings-W8GP_K-Y.js`, `hls-35SQRWgi.js`.
+  Evidence, the corrected test history and the self-contained Hermes steps:
+  [M03.5 §12](M03.5-GUIDE-READ-PERFORMANCE.md).
 - **Acceptance.** `73d640c` has completed **PASS WITH ISSUES** physical acceptance. This follow-up is
   **pending** physical acceptance.
 - **APK.** Still no native source changed. Physical AFTMM retest of this follow-up remains open.
