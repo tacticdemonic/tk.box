@@ -84,7 +84,10 @@ export function registerIptv(app:FastifyInstance,store:IptvStore,refresh:SourceR
     return store.guidePage(grant.accountId,input.filter,input.start,input.end,input.offset,input.limit,input.q,input.channel,custom);
   });
   // Guide routes are shared by every channel kind; custom channel IDs are answered by the custom store.
-  app.get('/api/v1/iptv/channels/:id/logo',async(req,reply)=>{
+  // A guide page loads 50–60 logos at once, so the global 120/min ceiling would throttle ordinary
+  // browsing. Like the media routes, the image route gets its own ceiling; authorization still runs
+  // for every request.
+  app.get('/api/v1/iptv/channels/:id/logo',{config:{rateLimit:{max:1200,timeWindow:60000}}},async(req,reply)=>{
     const {grant}=await auth(req);
     if(custom?.exists(channelParams(req.params))){      // The logo address, else the Plex title's logo, else its poster.
       const key=z.object({v:z.string().regex(/^\d{1,20}$/).optional()}).parse(req.query).v;

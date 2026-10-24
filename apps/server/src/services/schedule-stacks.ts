@@ -20,7 +20,7 @@ export function scheduleSignature(programs: readonly Program[], now: number): st
   return JSON.stringify(values);
 }
 
-type Candidate = { id: string; key: string; automatic: boolean; programs?: readonly Program[] };
+export type Candidate = { id: string; key: string; automatic: boolean; programs?: readonly Program[] };
 
 // Called separately for each playlist. Move whole name stacks together so untagged backup
 // feeds follow their station, but never bridge conflicting guides or explicit manual stacks.

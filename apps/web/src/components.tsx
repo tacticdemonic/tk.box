@@ -1,4 +1,4 @@
-import {memo,useEffect,useLayoutEffect,useRef,useState,type ImgHTMLAttributes,type KeyboardEvent,type MouseEvent,type ReactNode,type PointerEvent as ReactPointerEvent,type FocusEvent as ReactFocusEvent} from 'react';
+import {memo,useEffect,useLayoutEffect,useRef,useState,type Ref,type ImgHTMLAttributes,type KeyboardEvent,type MouseEvent,type ReactNode,type PointerEvent as ReactPointerEvent,type FocusEvent as ReactFocusEvent} from 'react';
 import type {CatalogItem,CatalogPage} from '../../../packages/contracts/src/index.js';
 import {duration} from './hooks.js';
 import {fullyWatched,partlyWatched,updateWatchState,useNotice,useWithOverride} from './media-actions.js';
@@ -37,11 +37,13 @@ export function Loading({cards=false}:{cards?:boolean}) {return cards?<div class
 export const subtitle=(item:CatalogItem)=>item.type==='episode'?`${item.showTitle??''} · S${item.seasonNumber??'?'}:E${item.episodeNumber??'?'}`:item.type==='season'?`${item.episodeCount??'—'} episodes`:item.seasonCount?`${item.seasonCount} seasons · ${item.episodeCount??'—'} episodes`:String(item.year??(item.type==='show'?'TV series':'Movie'));
 export const meta=(item:CatalogItem)=>[item.year,item.contentRating,item.type==='show'||item.type==='season'?undefined:duration(item.durationMs),item.rating!==undefined?`★ ${item.rating.toFixed(1)}`:undefined].filter(Boolean).join(' · ');
 // Key by source so reused cards fade each new image, including images already in cache.
-export function FadeImage(props:ImgHTMLAttributes<HTMLImageElement>) {return <LoadedImage key={props.src} {...props}/>;}
-function LoadedImage({className='',onLoad,...props}:ImgHTMLAttributes<HTMLImageElement>) {
-  const ref=useRef<HTMLImageElement>(null),[loaded,setLoaded]=useState(false);
-  useLayoutEffect(()=>{if(ref.current?.complete&&ref.current.naturalWidth>0)setLoaded(true);},[]);
-  return <img {...props} ref={ref} className={`art-image${loaded?' art-image-loaded':''}${className?` ${className}`:''}`} onLoad={event=>{setLoaded(true);onLoad?.(event);}}/>;
+export function FadeImage(props:ImgHTMLAttributes<HTMLImageElement>&{ref?:Ref<HTMLImageElement>}) {return <LoadedImage key={props.src} {...props}/>;}
+function LoadedImage({className='',onLoad,ref,...props}:ImgHTMLAttributes<HTMLImageElement>&{ref?:Ref<HTMLImageElement>}) {
+  const node=useRef<HTMLImageElement>(null),[loaded,setLoaded]=useState(false);
+  // A caller's ref must reach the real <img>; a detached image cannot cancel its own request.
+  const attach=(element:HTMLImageElement|null)=>{node.current=element;if(typeof ref==='function')ref(element);else if(ref)ref.current=element;};
+  useLayoutEffect(()=>{if(node.current?.complete&&node.current.naturalWidth>0)setLoaded(true);},[]);
+  return <img {...props} ref={attach} className={`art-image${loaded?' art-image-loaded':''}${className?` ${className}`:''}`} onLoad={event=>{setLoaded(true);onLoad?.(event);}}/>;
 }
 export const Artwork=({src,alt='',fallback,className}:{src?:string;alt?:string;fallback:ReactNode;className?:string})=>{
   const [failed,setFailed]=useState(false);
@@ -244,6 +246,10 @@ export function Pagination({page,onChange}:{page:CatalogPage;onChange:(offset:nu
 }
 export function Modal({title,onClose,children,variant}:{title:string;onClose:()=>void;children:ReactNode;variant?:'media'}) {
   const ref=useRef<HTMLDialogElement>(null),close=useRef(onClose);close.current=onClose;
-  useEffect(()=>{const dialog=ref.current!;dialog.showModal();document.documentElement.classList.add('modal-open');return()=>{dialog.close();document.documentElement.classList.remove('modal-open');};},[]);
+  const opener=useRef<HTMLElement|null>(null);
+  // showModal() moves focus into the dialog, and closing it leaves focus on <body>. Remember the
+  // control that opened it so Back and close put the remote back where the viewer was.
+  useEffect(()=>{const dialog=ref.current!;opener.current=document.activeElement instanceof HTMLElement?document.activeElement:null;dialog.showModal();document.documentElement.classList.add('modal-open');
+    return()=>{dialog.close();document.documentElement.classList.remove('modal-open');const previous=opener.current;opener.current=null;if(previous?.isConnected)previous.focus({preventScroll:true});};},[]);
   return <dialog ref={ref} className={variant==='media'?'media-dialog':''} aria-label={title} onCancel={e=>{e.preventDefault();close.current();}} onClick={e=>{if(e.target===ref.current)close.current();}}><div className="modal-content"><button className="icon-button modal-close" aria-label="Close" onClick={onClose}><Icon name="close"/></button>{children}</div></dialog>;
 }

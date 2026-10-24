@@ -165,23 +165,39 @@ const normalized = (s: string) => s.normalize('NFKC').toLocaleLowerCase('en').re
 export type GuideMapping = { sourceId: string; feedId: string; channelId: string; xmlId: string; method: 'exact_id' | 'admin'; reviewedBy?: string; revision: number };
 // Guide resolution runs for every channel of a source. Indexing the provider ids once per pass
 // keeps that linear: without it, a large lineup compares every channel against every other.
-export type GuideIndex = { byTvgId: Map<string, M3uChannel[]>; xml: Map<string, GuideStationEntry> };
+export type GuideIndex = { byTvgId: Map<string, M3uChannel[]>; xml: Map<string, GuideStationEntry>; icons: Map<string, string> };
 export function guideIndex(sourceChannels: M3uChannel[], xml: XmlSnapshot): GuideIndex {
   const byTvgId = new Map<string, M3uChannel[]>();
   for (const c of sourceChannels) {
     const list = byTvgId.get(c.tvgId);
     if (list) list.push(c); else byTvgId.set(c.tvgId, [c]);
   }
-  return { byTvgId, xml: guideStations(xml.channels) };
+  const icons = new Map<string, string>();
+  for (const channel of xml.channels) if (channel.icon && !icons.has(channel.id)) icons.set(channel.id, channel.icon);
+  return { byTvgId, xml: guideStations(xml.channels), icons };
+}
+// Programmes grouped by guide id, so a page of rows never rescans the whole guide. Snapshots are
+// usually already ordered, but a provider feed need not be.
+export type ProgrammeIndex = Map<string, Program[]>;
+export function programmeIndex(programs: Program[]): ProgrammeIndex {
+  const index = new Map<string, Program[]>();
+  for (const p of programs) {
+    const list = index.get(p.channelId);
+    if (list) list.push(p); else index.set(p.channelId, [p]);
+  }
+  for (const list of index.values()) if (list.length > 1) list.sort((a, b) => a.start - b.start);
+  return index;
 }
 // A guide id resolves automatically when the feed declares it for one station only, and — for a
 // channel whose tvgId is shared by several playlist feeds — when those feeds are that station.
 // A provider's display-name need not match the playlist's name, so the two are not compared: the
 // id is the identifier, and the name is only evidence when the feed itself contradicts it.
 function usableGuideId(xmlId: string, station: string, sourceChannels: M3uChannel[], xml: XmlSnapshot, index?: GuideIndex) {
-  const entry = index?.xml.get(xmlId) ?? guideStations(xml.channels).get(xmlId);
+  // A supplied index is complete for its snapshot: a missing id is a cached miss, not a reason to
+  // rebuild the whole station map for every channel.
+  const entry = index ? index.xml.get(xmlId) : guideStations(xml.channels).get(xmlId);
   if (!entry || entry.ambiguous) return false;
-  const siblings = index?.byTvgId.get(xmlId) ?? sourceChannels.filter(c => c.tvgId === xmlId);
+  const siblings = index ? index.byTvgId.get(xmlId) ?? [] : sourceChannels.filter(c => c.tvgId === xmlId);
   return siblings.length <= 1 || (!!station && siblings.every(c => guideStationKey(c.name) === station));
 }
 export function resolveGuideMapping(scope: {sourceId: string; feedId: string; channelId: string}, channel: M3uChannel, sourceChannels: M3uChannel[], xml: XmlSnapshot, current?: GuideMapping, index?: GuideIndex): GuideMapping | undefined {
@@ -190,7 +206,7 @@ export function resolveGuideMapping(scope: {sourceId: string; feedId: string; ch
     // An administrator's choice outlives name changes; it only needs the id to still name one
     // station. An automatic choice must still pass the same test that produced it.
     if (current.method === 'admin') {
-      const entry = index?.xml.get(current.xmlId) ?? guideStations(xml.channels).get(current.xmlId);
+      const entry = index ? index.xml.get(current.xmlId) : guideStations(xml.channels).get(current.xmlId);
       return scoped && !!entry && !entry.ambiguous ? current : undefined;
     }
     if (!scoped || !usableGuideId(current.xmlId, guideStationKey(channel.name), sourceChannels, xml, index)) return undefined;
@@ -225,10 +241,30 @@ export function approveMapping(input: { role: 'admin' | 'viewer'; accountId: str
 const continuousTitle = (name?: string) => name && /\b24\s*\/\s*7\b/.test(name) ? name.replace(/^[A-Z]{2,3}\s*[:|]\s*/, '') : undefined;
 export function guideWindow(programs: Program[], xmlId: string | undefined, start: number, end: number, channelName?: string) {
   requireThat(Number.isSafeInteger(start) && Number.isSafeInteger(end) && start < end, 'INVALID_WINDOW', 'Invalid guide window.');
+  return windowOf(programs.filter(p => xmlId && p.channelId === xmlId), xmlId, start, end, channelName);
+}
+// The same window from a guide id's already-grouped, already-ordered programmes. `guidePage`
+// uses this so a 50-row page costs 50 slices instead of 50 full-guide scans.
+export function indexedWindow(programs: ProgrammeIndex, xmlId: string | undefined, start: number, end: number, channelName?: string) {
+  requireThat(Number.isSafeInteger(start) && Number.isSafeInteger(end) && start < end, 'INVALID_WINDOW', 'Invalid guide window.');
+  const source = xmlId ? programs.get(xmlId) : undefined;
+  // Grouping preserves ascending start order. Find the first programme starting at or after the
+  // window, step back over any that still overlap it, then walk forward until the window ends.
+  // That is one binary search plus the handful of programmes actually on screen.
+  const length = source?.length ?? 0;
+  let low = 0, high = length;
+  while (low < high) { const mid = (low + high) >> 1; if (source![mid]!.start < start) low = mid + 1; else high = mid; }
+  while (low > 0 && source![low - 1]!.end > start) low--;
+  const hits: Program[] = [];
+  for (let i = low; source && i < length; i++) { const p = source[i]!; if (p.start >= end) break; if (p.end > start) hits.push(p); }
+  return windowOf(hits, xmlId, start, end, channelName);
+}
+function windowOf(programs: Program[], xmlId: string | undefined, start: number, end: number, channelName?: string) {
   const title = continuousTitle(channelName);
   const gap = (from: number, to: number) => ({ start: from, end: to, program: title ? { channelId: xmlId ?? '', start: from, end: to, title, continuous: true } : null });
   const rows: { start: number; end: number; program: Program | null }[] = []; let cursor = start;
-  for (const p of programs.filter(p => xmlId && p.channelId === xmlId && p.start < end && p.end > start).sort((a, b) => a.start - b.start)) {
+  for (const p of programs.slice().sort((a, b) => a.start - b.start)) {
+    if (p.start >= end) break;
     if (p.start > cursor) rows.push(gap(cursor, p.start));
     rows.push({ start: Math.max(start, p.start), end: Math.min(end, p.end), program: p }); cursor = Math.min(end, p.end);
   }
