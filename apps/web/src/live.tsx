@@ -1,6 +1,6 @@
 import {Fragment,useEffect,useRef,useState} from 'react';
 import {useApi,useDebounced,useInfinitePages,clock,link,duration,invalidate} from './hooks.js';
-import {createLogoSlots} from './logo-slots.js';
+import {createLogoSlots,type LogoLease} from './logo-slots.js';
 import {api} from './api.js';
 import {Empty,ErrorNotice,FadeImage,Loading,Icon,Modal,Row} from './components.js';
 import {readPreference} from './storage.js';
@@ -52,20 +52,35 @@ const logoSlots=createLogoSlots(4,15000);
 export function ChannelLogo({channel,size=40}:{channel:{id:string;name:string;logo?:boolean;logoKey?:string};size?:number}) {
   // A custom channel's logoKey changes with the movie airing, giving a new address so the new logo loads.
   const src=`/api/v1/iptv/channels/${channel.id}/logo${channel.logoKey?`?v=${encodeURIComponent(channel.logoKey)}`:''}`;
-  const [failed,setFailed]=useState<string>(),[shown,setShown]=useState(false),label=stationName(channel.name).label,release=useRef<(()=>void)|undefined>(undefined);
-  const settle=()=>{release.current?.();release.current=undefined;};
+  // The admission is recorded with the address it was granted for, so a changed logoKey renders no
+  // image until that new address has a slot of its own; a stale address's status never shows.
+  const [admitted,setAdmitted]=useState<{src:string;shown:boolean}>(),label=stationName(channel.name).label,claim=useRef<{src:string;release:LogoLease}|null>(null),nodes=useRef(new Map<string,HTMLImageElement>());
+  // A cleanup must cancel *its own* source's request, and React may already have attached the
+  // replacement's node by then, so the node is remembered by the address it was rendered for.
+  const attach=(element:HTMLImageElement|null)=>{if(!element)return;const key=element.getAttribute('src');if(key)nodes.current.set(key,element);};
+  // Detaching an <img> does not abort its request (measured: the connection stays open). Clearing
+  // src does, even once detached, so an abandoned source releases its connection instead of holding
+  // one the scheduler has already handed to the next logo.
+  const cancel=(forSrc:string)=>{nodes.current.get(forSrc)?.removeAttribute('src');nodes.current.delete(forSrc);};
   useEffect(()=>{
-    setShown(false);settle();
     if(!channel.logo)return;
-    // A logo that never answers gives its slot back, and unmounting the image is what makes the
-    // browser abort the request. The monogram it leaves behind is the usable fallback.
-    const abandon=()=>{setFailed(src);settle();};
-    release.current=logoSlots(()=>setShown(true),abandon);
-    return settle;
+    let live=true,lease:LogoLease;
+    const drop=()=>{if(claim.current?.release===lease)claim.current=null;};
+    // A deadline must cancel the request as well as retire the slot, or the timed-out fetch keeps
+    // its connection and the next four admissions double the real number in flight.
+    lease=logoSlots(()=>{if(live)setAdmitted({src,shown:true});},()=>{cancel(src);drop();if(live)setAdmitted({src,shown:false});});
+    claim.current={src,release:lease};
+    return ()=>{live=false;lease();drop();cancel(src);};
   },[src,channel.logo]);
+  // Only the source that holds the current admission may free that slot or report its failure.
+  const settled=(forSrc:string,shown:boolean)=>()=>{
+    if(claim.current?.src!==forSrc)return;
+    setAdmitted({src:forSrc,shown});
+    claim.current.release();claim.current=null;
+  };
   // A fixed landscape tile: most station logos are wide, so every logo shares one box and one alignment.
   // The monogram stays underneath while the logo waits or fails, so nothing moves when it arrives.
-  return <span className="channel-logo" style={{width:Math.round(size*1.6),height:size}} aria-hidden="true"><b style={{fontSize:size*.34}}>{label.slice(0,2).toUpperCase()}</b>{channel.logo&&shown&&failed!==src?<FadeImage key={src} src={src} alt="" decoding="async" onLoad={settle} onError={()=>{setFailed(src);settle();}}/>:null}</span>;
+  return <span className="channel-logo" style={{width:Math.round(size*1.6),height:size}} aria-hidden="true"><b style={{fontSize:size*.34}}>{label.slice(0,2).toUpperCase()}</b>{channel.logo&&admitted?.src===src&&admitted.shown?<FadeImage ref={attach} key={src} src={src} alt="" decoding="async" onLoad={settled(src,true)} onError={settled(src,false)}/>:null}</span>;
 }
 const airingNow=(c:Station,now:number)=>c.programs.find(p=>p.program&&p.program.start<=now&&p.program.end>now)?.program??undefined;
 const minutesLeft=(p:Program,now:number)=>Math.max(1,Math.ceil((p.end-now)/60000));

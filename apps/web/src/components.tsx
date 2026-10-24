@@ -1,4 +1,4 @@
-import {memo,useEffect,useLayoutEffect,useRef,useState,type ImgHTMLAttributes,type KeyboardEvent,type MouseEvent,type ReactNode,type PointerEvent as ReactPointerEvent,type FocusEvent as ReactFocusEvent} from 'react';
+import {memo,useEffect,useLayoutEffect,useRef,useState,type Ref,type ImgHTMLAttributes,type KeyboardEvent,type MouseEvent,type ReactNode,type PointerEvent as ReactPointerEvent,type FocusEvent as ReactFocusEvent} from 'react';
 import type {CatalogItem,CatalogPage} from '../../../packages/contracts/src/index.js';
 import {duration} from './hooks.js';
 import {fullyWatched,partlyWatched,updateWatchState,useNotice,useWithOverride} from './media-actions.js';
@@ -37,11 +37,13 @@ export function Loading({cards=false}:{cards?:boolean}) {return cards?<div class
 export const subtitle=(item:CatalogItem)=>item.type==='episode'?`${item.showTitle??''} · S${item.seasonNumber??'?'}:E${item.episodeNumber??'?'}`:item.type==='season'?`${item.episodeCount??'—'} episodes`:item.seasonCount?`${item.seasonCount} seasons · ${item.episodeCount??'—'} episodes`:String(item.year??(item.type==='show'?'TV series':'Movie'));
 export const meta=(item:CatalogItem)=>[item.year,item.contentRating,item.type==='show'||item.type==='season'?undefined:duration(item.durationMs),item.rating!==undefined?`★ ${item.rating.toFixed(1)}`:undefined].filter(Boolean).join(' · ');
 // Key by source so reused cards fade each new image, including images already in cache.
-export function FadeImage(props:ImgHTMLAttributes<HTMLImageElement>) {return <LoadedImage key={props.src} {...props}/>;}
-function LoadedImage({className='',onLoad,...props}:ImgHTMLAttributes<HTMLImageElement>) {
-  const ref=useRef<HTMLImageElement>(null),[loaded,setLoaded]=useState(false);
-  useLayoutEffect(()=>{if(ref.current?.complete&&ref.current.naturalWidth>0)setLoaded(true);},[]);
-  return <img {...props} ref={ref} className={`art-image${loaded?' art-image-loaded':''}${className?` ${className}`:''}`} onLoad={event=>{setLoaded(true);onLoad?.(event);}}/>;
+export function FadeImage(props:ImgHTMLAttributes<HTMLImageElement>&{ref?:Ref<HTMLImageElement>}) {return <LoadedImage key={props.src} {...props}/>;}
+function LoadedImage({className='',onLoad,ref,...props}:ImgHTMLAttributes<HTMLImageElement>&{ref?:Ref<HTMLImageElement>}) {
+  const node=useRef<HTMLImageElement>(null),[loaded,setLoaded]=useState(false);
+  // A caller's ref must reach the real <img>; a detached image cannot cancel its own request.
+  const attach=(element:HTMLImageElement|null)=>{node.current=element;if(typeof ref==='function')ref(element);else if(ref)ref.current=element;};
+  useLayoutEffect(()=>{if(node.current?.complete&&node.current.naturalWidth>0)setLoaded(true);},[]);
+  return <img {...props} ref={attach} className={`art-image${loaded?' art-image-loaded':''}${className?` ${className}`:''}`} onLoad={event=>{setLoaded(true);onLoad?.(event);}}/>;
 }
 export const Artwork=({src,alt='',fallback,className}:{src?:string;alt?:string;fallback:ReactNode;className?:string})=>{
   const [failed,setFailed]=useState(false);

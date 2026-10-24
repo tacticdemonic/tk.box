@@ -49,11 +49,28 @@ remain open. M03.3 physical acceptance was reported by the user/Hermes; see its 
   never match it; `dialog[open]` is the correct locator. Opening it with the keyboard showed the
   right programme, stayed on `#live` and started no playback. The real defect was focus: closing a
   dialog left focus on `<body>`, so `Modal` now returns it to the control that opened it.
-- **Verified.** `npm run typecheck` and `npm run build` clean. Full suite **275 tests: 271 pass, 4
-  fail, 0 skipped**; the same four `xtream-epg` failures reproduce at `73d640c` with this work
-  stashed, so they are baseline. Real-browser measurement on a 5 s logo delay: usable rows in
-  328–418 ms with four logos still in flight. Evidence and the Hermes retest steps:
-  [M03.5 §12](M03.5-GUIDE-READ-PERFORMANCE.md).
+- **Review repair: the scheduler released the same job twice.** The 15 s deadline released the slot
+  internally and then called `giveUp`, which in `ChannelLogo` settled the same lease again, so one job
+  returned two slots: logo connections climbed to 6 with a 4-slot pool, and a drained pool admitted
+  sixteen at once. Each job now carries one lifecycle state shared by completion, deadline and
+  cancellation. Measured in the real app on the same dataset: connections are 4 at first page and 4
+  after every deadline (previously 4 → 6).
+- **Review repair: admission is bound to the source, and abandoned requests are cancelled.** A
+  changed `logoKey` could render before the effect that reset admission, and DOM removal was assumed
+  to abort a request — measured, `img.remove()` leaves the connection open while clearing `src`
+  aborts it, so timed-out work escaped the cap. `ChannelLogo` now records admission with the address
+  it was granted for and clears `src` on its own node when a source is replaced or expires; with four
+  real pending responses, unmount aborts 4 of 4.
+- **`xtream-epg` clock repair.** The four failures were fixtures airing on 22 October 2026 meeting a
+  real-clock 24-hour lookback, not a product defect. The existing `now` option is injected at the
+  client and service boundaries; production retention and availability behaviour are untouched.
+- **Verified.** `npm run typecheck` and `npm run build` clean. Full suite **280 tests: 280 pass, 0
+  fail, 0 skipped**. Real browser through a proxy that holds every logo response: exactly 4 logo
+  connections, 50 monograms, click-to-usable 272–316 ms with 1 ms of queueing, six navigation cycles
+  flat at 4, Details/Back/focus correct with logos pending, no playback. Evidence, the corrected
+  test history and the self-contained Hermes steps: [M03.5 §12](M03.5-GUIDE-READ-PERFORMANCE.md).
+- **Acceptance.** `73d640c` has completed **PASS WITH ISSUES** physical acceptance. This follow-up is
+  **pending** physical acceptance.
 - **APK.** Still no native source changed. Physical AFTMM retest of this follow-up remains open.
 
 ## Previous pass: M03.4 — Xtream EPG diagnosed and repaired
