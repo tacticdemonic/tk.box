@@ -1,13 +1,98 @@
 # tk.box implementation status
 
-Updated October 22, 2026. **M03.4 repairs Xtream guide retrieval. The missing EPG was two
-application defects — a 16 MiB decompression ceiling and an unconditional XMLTV DTD rejection —
-not provider unreachability. Node tests, typecheck, the production build and the compiled server
-are locally verified, and the real provider feed now reaches the rendered guide. Hosted CI and an
-M03.4 physical retest remain open. M03.3 physical acceptance was reported by the user/Hermes; see
-its record.**
+Updated October 24, 2026. **M03.5 removes the guide read-path stall that blocked paging on a
+populated EPG, and its follow-up removes the cold-logo paging delay. The dominant read-path defect
+was not repeated guide decryption but `IS NOT NULL` on the guide blob, which made every
+source-metadata read walk 37 MB of overflow pages; a 50-row page went from ~50 s to ~185 ms on the
+same compiled server and dataset. The remaining device delay was browser connection queueing behind
+50 simultaneous logo fetches, now capped. M03.4 physical retest and the M03.5 physical retest both
+remain open. M03.3 physical acceptance was reported by the user/Hermes; see its record.**
 
-## Latest pass: M03.4 — Xtream EPG diagnosed and repaired
+## Pass: M03.5 — guide and logo read-path stalls
+
+- **Measured cause.** `IptvStore.source()` projected `encrypted_guide IS NOT NULL`. SQLite evaluates
+  that by reading the value, so every call walked the whole 37 MB guide: 20.8 ms per call, on a
+  projection the guide page made hundreds of times. `typeof(encrypted_guide)='text'` reads only the
+  header (0.01 ms) with identical semantics.
+- **Duplicate work removed.** Xtream channel metadata now comes from the published snapshot rather
+  than the catalogue that also carries the guide; per-channel metadata is cached by its own sealed
+  payload; programmes are indexed by guide id once per snapshot instead of being filtered per row;
+  an indexed guide miss no longer rebuilds the station map; and a clock-minute change re-joins
+  cached resolver evidence instead of re-resolving every mapping.
+- **Logos.** Each channel's guide icon is published as a small sealed, channel-bound row
+  (migrations 1005 and 1006, republished by the existing startup pass) so a logo request decrypts
+  and parses no programme guide and no plaintext provider URL is stored. Existing databases need
+  no reimport; a database that applied 1005 before 1006 drops its plaintext rows on the next
+  startup.
+- **Verified.** `npm run typecheck`, `npm run build`, **270 of 270** Node tests at `73d640c` in this
+  environment (including 11 deterministic work-count tests in `tests/guide-read-path.test.ts` and 15
+  review-fix tests), and a compiled-server benchmark. Warm 50-row page p95 262 ms, cold 480 ms,
+  `/health` p95 34 ms and `/api/v1/me` p95 93 ms during a logo burst. Baseline on the same harness
+  reproduced the field report at 54,458–74,830 ms. The physical deployment of that revision reported
+  **256 passed / 3 failed / 11 skipped**, and its three failures were `local-media` Windows
+  temporary-tree fixtures, not the EPG clock (see the separated test history in M03.5 §12.4).
+  Details and budgets: [M03.5](M03.5-GUIDE-READ-PERFORMANCE.md).
+- **APK.** No native source changed; the installed APK remains valid. M03.5 physical retest is
+  **not** performed.
+
+## Latest pass: M03.5 follow-up — cold-logo paging and the Details control
+
+- **Cause of the 15,875 ms cold-logo transition.** Not the guide handler and not server work: the
+  browser's connection pool. `ChannelLogo` used `loading="lazy"`, which the Fire TV WebView
+  (Chromium ~66) does not implement, so a 50-row page started 50 logo fetches at once and the next
+  guide request queued behind them — 6,215 ms queued against 448 ms of server work.
+- **Change.** `apps/web/src/logo-slots.ts` caps logo fetches at four at a time with a queue, an
+  idempotent release and a 15 s deadline that frees a slot; `ChannelLogo` renders the monogram
+  underneath the logo so the tile never moves and a failed or timed-out logo keeps a usable
+  fallback. Server code is unchanged: sealed icons, invalidation, cache accounting, "No guide data",
+  auth and provider safeguards all stand.
+- **Details was a verification error, plus one real defect.** The control is a native `<dialog>`
+  whose implicit role is `dialog` and which carries no `role` attribute, so `[role=dialog]` can
+  never match it; `dialog[open]` is the correct locator. Opening it with the keyboard showed the
+  right programme, stayed on `#live` and started no playback. The real defect was focus: closing a
+  dialog left focus on `<body>`, so `Modal` now returns it to the control that opened it.
+- **Review repair: the scheduler released the same job twice.** The 15 s deadline released the slot
+  internally and then called `giveUp`, which in `ChannelLogo` settled the same lease again, so one job
+  returned two slots: logo connections climbed to 6 with a 4-slot pool, and a drained pool admitted
+  sixteen at once. Each job now carries one lifecycle state shared by completion, deadline and
+  cancellation. Measured in the real app on the same dataset: connections are 4 at first page and 4
+  after every deadline (previously 4 → 6).
+- **Review repair: admission is bound to the source, and abandoned requests are cancelled.** A
+  changed `logoKey` could render before the effect that reset admission, and DOM removal was assumed
+  to abort a request — measured, `img.remove()` leaves the connection open while clearing `src`
+  aborts it, so timed-out work escaped the cap. `ChannelLogo` now records admission with the address
+  it was granted for and clears `src` on its own node when a source is replaced or expires; with four
+  real pending responses, unmount aborts 4 of 4.
+- **Review repair: admission belongs to an acquisition, not an address.** Binding the grant to the
+  `src` still let a tile reuse a cancelled acquisition: while a replacement queued, the target's old
+  grant kept `{src: A, shown: true}`, so returning to A rendered a fifth `<img>` with the pool full.
+  Reproduced with the real `ChannelLogo`/`FadeImage` components, React 19.3.1 and jsdom 27, no
+  scheduler calls and no load/error events: **five** unfinished images under a four-slot cap. Each
+  acquisition now takes a token, the grant is dropped during render when the enabled state or
+  address changes (so no stale image is committed and no effect has to undo one), and the token
+  scopes the lease, the rendered node and the callbacks, so an obsolete load, error or cleanup can
+  neither release a newer lease nor cancel a newer node. `tests/channel-logo.test.ts` (6) covers
+  A → queued B → A, same-URL disable/re-enable, ordinary replacement, obsolete callbacks, the
+  deadline and unmount; the two admission-reuse cases fail against the reviewed candidate, and the
+  other four are preservation guards that pass on both.
+- **`xtream-epg` clock repair.** The four failures were fixtures airing on 22 October 2026 meeting a
+  real-clock 24-hour lookback, not a product defect. The existing `now` option is injected at the
+  client and service boundaries; production retention and availability behaviour are untouched.
+- **Verified.** `npm run typecheck` and `npm run build` clean. Full suite **286 tests: 286 pass, 0
+  fail, 0 skipped**. Rendered-component evidence is separate from browser-network evidence: the new
+  jsdom test fails 2 of 6 against the reviewed candidate's component (the admission-reuse cases) and
+  passes 6/6 after the repair, and the real Chromium probe against the
+  compiled build behind a proxy that holds every logo response shows exactly 4 logo requests and
+  peak 4, 50 → 100 rows in 446 ms while all four are pending, exactly 4 new requests after releasing
+  four, 4/4 aborted on unmount, and Details/Back restoring focus to `US: News 0 FHD details`.
+  Assets: `index-DP3kg7rd.js`, `index-Dnyl-tHx.css`, `settings-W8GP_K-Y.js`, `hls-35SQRWgi.js`.
+  Evidence, the corrected test history and the self-contained Hermes steps:
+  [M03.5 §12](M03.5-GUIDE-READ-PERFORMANCE.md).
+- **Acceptance.** `73d640c` has completed **PASS WITH ISSUES** physical acceptance. This follow-up is
+  **pending** physical acceptance.
+- **APK.** Still no native source changed. Physical AFTMM retest of this follow-up remains open.
+
+## Previous pass: M03.4 — Xtream EPG diagnosed and repaired
 
 - **Cause.** The provider answered `200` in 522 ms with a valid gzip XMLTV feed, 2.87 MB compressed
   and 20.6 MiB inflated. The shared 16 MiB decompression ceiling made `gunzipSync` throw, the

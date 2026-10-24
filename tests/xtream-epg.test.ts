@@ -115,7 +115,7 @@ test('short EPG requests use the stream id while mapping to the guide id', async
     throw new Error('unexpected');
   };
   const client = new XtreamClient(credentials, transport);
-  const parsed = await client.shortEpg('62415', 'bbc1.uk', 'Europe/London', undefined);
+  const parsed = await client.shortEpg('62415', 'bbc1.uk', 'Europe/London', undefined, Date.UTC(2026, 9, 22, 12));
   assert.deepEqual(requested, ['62415']);
   assert.equal(parsed.programs.length, 1);
   // The listing is keyed by the guide identity, never by the stream id used to fetch it.
@@ -262,7 +262,7 @@ test('gzip and plain XMLTV are both accepted within the raised guide ceiling', a
       if (action === 'xmltv') return body;
       throw new Error('unexpected ' + action);
     };
-    const catalogue = await new XtreamClient(credentials, transport).catalogue({includeEpg: true});
+    const catalogue = await new XtreamClient(credentials, transport).catalogue({includeEpg: true, now: Date.UTC(2026, 9, 22, 12)});
     assert.equal(catalogue.guide?.state, 'available');
     assert.equal(catalogue.epg?.programs.length, 1);
   }
@@ -292,14 +292,17 @@ test('a later guide failure retains the last known guide and reports it as retai
       throw new Error('unexpected');
     };
     const service = new XtreamService(store, iptv, () => new XtreamClient(credentials, transport));
-    const first = await service.refresh('owner', account.id, {includeEpg: true});
+    // The fixtures air on 22 October 2026; the production 24-hour lookback drops them once the real
+    // clock passes. Pin the import clock so the test asserts retention, not today's date.
+    const now = Date.UTC(2026, 9, 22, 12);
+    const first = await service.refresh('owner', account.id, {includeEpg: true, now});
     assert.equal(first.guide?.state, 'available');
     const sourceId = first.sourceId;
     const before = iptv.guidePage('owner', 'all', Date.UTC(2026, 9, 22, 11), Date.UTC(2026, 9, 22, 14), 0, 30);
     assert.equal(before.channels[0]!.programs.filter(slot => slot.program).length, 1);
 
     guideFails = true;
-    const second = await service.refresh('owner', account.id, {includeEpg: true});
+    const second = await service.refresh('owner', account.id, {includeEpg: true, now});
     assert.equal(second.channels, 1, 'channels survive a guide-only failure');
     // Listings already published remain on screen.
     const after = iptv.guidePage('owner', 'all', Date.UTC(2026, 9, 22, 11), Date.UTC(2026, 9, 22, 14), 0, 30);
@@ -330,11 +333,12 @@ test('a successful retry clears the previous guide failure state', async () => {
       throw new Error('unexpected');
     };
     const service = new XtreamService(store, iptv, () => new XtreamClient(credentials, transport));
-    const failed = await service.refresh('owner', account.id, {includeEpg: true});
+    const now = Date.UTC(2026, 9, 22, 12);
+    const failed = await service.refresh('owner', account.id, {includeEpg: true, now});
     assert.equal(failed.guide?.state, 'failed');
     assert.equal(iptv.status(failed.sourceId).guideStatus?.state, 'failed');
     guideFails = false;
-    const recovered = await service.refresh('owner', account.id, {includeEpg: true});
+    const recovered = await service.refresh('owner', account.id, {includeEpg: true, now});
     assert.equal(recovered.guide?.state, 'available');
     const status = iptv.status(recovered.sourceId).guideStatus as GuideStatus;
     assert.equal(status.state, 'available');

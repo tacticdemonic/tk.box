@@ -1,5 +1,6 @@
-import {Fragment,useEffect,useState} from 'react';
+import {Fragment,useEffect,useRef,useState} from 'react';
 import {useApi,useDebounced,useInfinitePages,clock,link,duration,invalidate} from './hooks.js';
+import {createLogoSlots,type LogoLease} from './logo-slots.js';
 import {api} from './api.js';
 import {Empty,ErrorNotice,FadeImage,Loading,Icon,Modal,Row} from './components.js';
 import {readPreference} from './storage.js';
@@ -45,12 +46,51 @@ const validFilter=(value:string|null):value is Filter=>filters.some(([f])=>f===v
 function savedFilter(account:string):Filter {try{const value=readPreference(sessionStorage,`tk.box:guide:${account}`);return validFilter(value)?value:'all';}catch{return 'all';}}
 // Provider names often carry a region prefix ("US: CNN"); show it as a tag instead.
 export function stationName(name:string){const m=/^([A-Z]{2,3})s*[:|]s*(.+)$/.exec(name);return m?{region:m[1],label:m[2]!}:{label:name};}
+// A logo holds a browser connection until its fetch finishes and the TV WebView predates
+// loading="lazy"; see logo-slots.ts for why the number in flight is capped.
+const logoSlots=createLogoSlots(4,15000);
 export function ChannelLogo({channel,size=40}:{channel:{id:string;name:string;logo?:boolean;logoKey?:string};size?:number}) {
   // A custom channel's logoKey changes with the movie airing, giving a new address so the new logo loads.
   const src=`/api/v1/iptv/channels/${channel.id}/logo${channel.logoKey?`?v=${encodeURIComponent(channel.logoKey)}`:''}`;
-  const [failed,setFailed]=useState<string>(),label=stationName(channel.name).label;
+  // Admission belongs to one acquisition, not to an address. A changed address or enabled state
+  // drops the stale grant during this render, so no image is committed for it and a passive effect
+  // has nothing to correct; returning to an earlier URL cannot reuse a cancelled acquisition.
+  const identity=`${channel.logo?'1':'0'}|${src}`,[grant,setGrant]=useState<{token:number;shown:boolean}>(),[seen,setSeen]=useState(identity);
+  // Adjusting state during render is the documented reset: React re-renders before committing, so
+  // the stale grant never reaches the DOM and no passive effect has to undo an image.
+  if(seen!==identity){setSeen(identity);setGrant(undefined);}
+  // The token names the acquisition that owns a callback, so a late load, error or cleanup from an
+  // obsolete one can neither release the current lease nor cancel the current node.
+  const label=stationName(channel.name).label,serial=useRef(0),claim=useRef<{token:number;release:LogoLease}|null>(null),nodes=useRef(new Map<number,HTMLImageElement>());
+  // A cleanup must cancel *its own* acquisition's request, and React may already have attached the
+  // replacement's node by then, so the node is remembered by the acquisition that rendered it.
+  const attach=(token:number)=>(element:HTMLImageElement|null)=>{if(element)nodes.current.set(token,element);};
+  // Detaching an <img> does not abort its request (measured: the connection stays open). Clearing
+  // src does, even once detached, so an abandoned acquisition releases its connection instead of
+  // holding one the scheduler has already handed to the next logo.
+  const cancel=(token:number)=>{nodes.current.get(token)?.removeAttribute('src');nodes.current.delete(token);};
+  useEffect(()=>{
+    // Every acquisition takes a new token, so no grant or callback from an earlier one survives it.
+    const token=++serial.current;
+    if(!channel.logo)return;
+    let live=true,lease:LogoLease;
+    const drop=()=>{if(claim.current?.token===token)claim.current=null;};
+    // A deadline must cancel the request as well as retire the slot, or the timed-out fetch keeps
+    // its connection and the next four admissions double the real number in flight.
+    lease=logoSlots(()=>{if(live)setGrant({token,shown:true});},()=>{cancel(token);drop();if(live)setGrant({token,shown:false});});
+    claim.current={token,release:lease};
+    return ()=>{live=false;lease();drop();cancel(token);};
+  },[identity]);
+  // Only the acquisition that holds the current claim may free that slot or report its result; a
+  // late callback from an earlier acquisition, even for the same URL, settles nothing.
+  const settled=(token:number,shown:boolean)=>()=>{
+    if(claim.current?.token!==token)return;
+    setGrant({token,shown});
+    claim.current.release();claim.current=null;
+  };
   // A fixed landscape tile: most station logos are wide, so every logo shares one box and one alignment.
-  return <span className="channel-logo" style={{width:Math.round(size*1.6),height:size}} aria-hidden="true">{channel.logo&&failed!==src?<FadeImage key={src} src={src} alt="" loading="lazy" onError={()=>setFailed(src)}/>:<b style={{fontSize:size*.34}}>{label.slice(0,2).toUpperCase()}</b>}</span>;
+  // The monogram stays underneath while the logo waits or fails, so nothing moves when it arrives.
+  return <span className="channel-logo" style={{width:Math.round(size*1.6),height:size}} aria-hidden="true"><b style={{fontSize:size*.34}}>{label.slice(0,2).toUpperCase()}</b>{grant?.shown?<FadeImage ref={attach(grant.token)} key={src} src={src} alt="" decoding="async" onLoad={settled(grant.token,true)} onError={settled(grant.token,false)}/>:null}</span>;
 }
 const airingNow=(c:Station,now:number)=>c.programs.find(p=>p.program&&p.program.start<=now&&p.program.end>now)?.program??undefined;
 const minutesLeft=(p:Program,now:number)=>Math.max(1,Math.ceil((p.end-now)/60000));
