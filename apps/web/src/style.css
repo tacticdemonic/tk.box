@@ -660,8 +660,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
   .skeleton{animation-duration:1.6s!important;animation-iteration-count:infinite!important}
 }
 /* Live TV: channel logos and guide states */
-.channel-logo{display:grid;place-items:center;flex:none;border-radius:8px;background:var(--surface-3);overflow:hidden}
-.channel-logo img{width:100%;height:100%;object-fit:contain;padding:12%;background:#fff1}
+.channel-logo{position:relative;display:grid;place-items:center;flex:none;border-radius:8px;background:var(--surface-3);overflow:hidden}
+/* The monogram is the tile's floor: the logo fades in over it, so a slow or failed logo never leaves a hole. */
+/* Chromium 66 (the TV WebView) has no `inset` shorthand, so the offsets are written out. */
+.channel-logo img{position:absolute;top:0;right:0;bottom:0;left:0;width:100%;height:100%;object-fit:contain;padding:12%;background:#fff1}
 .channel-logo b{color:var(--accent);font-weight:750;letter-spacing:.02em}
 .station-button{display:flex;align-items:center;gap:10px}
 .station-button>span{min-width:0}

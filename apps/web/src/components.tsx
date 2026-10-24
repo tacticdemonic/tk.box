@@ -244,6 +244,10 @@ export function Pagination({page,onChange}:{page:CatalogPage;onChange:(offset:nu
 }
 export function Modal({title,onClose,children,variant}:{title:string;onClose:()=>void;children:ReactNode;variant?:'media'}) {
   const ref=useRef<HTMLDialogElement>(null),close=useRef(onClose);close.current=onClose;
-  useEffect(()=>{const dialog=ref.current!;dialog.showModal();document.documentElement.classList.add('modal-open');return()=>{dialog.close();document.documentElement.classList.remove('modal-open');};},[]);
+  const opener=useRef<HTMLElement|null>(null);
+  // showModal() moves focus into the dialog, and closing it leaves focus on <body>. Remember the
+  // control that opened it so Back and close put the remote back where the viewer was.
+  useEffect(()=>{const dialog=ref.current!;opener.current=document.activeElement instanceof HTMLElement?document.activeElement:null;dialog.showModal();document.documentElement.classList.add('modal-open');
+    return()=>{dialog.close();document.documentElement.classList.remove('modal-open');const previous=opener.current;opener.current=null;if(previous?.isConnected)previous.focus({preventScroll:true});};},[]);
   return <dialog ref={ref} className={variant==='media'?'media-dialog':''} aria-label={title} onCancel={e=>{e.preventDefault();close.current();}} onClick={e=>{if(e.target===ref.current)close.current();}}><div className="modal-content"><button className="icon-button modal-close" aria-label="Close" onClick={onClose}><Icon name="close"/></button>{children}</div></dialog>;
 }

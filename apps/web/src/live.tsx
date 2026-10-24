@@ -1,5 +1,6 @@
-import {Fragment,useEffect,useState} from 'react';
+import {Fragment,useEffect,useRef,useState} from 'react';
 import {useApi,useDebounced,useInfinitePages,clock,link,duration,invalidate} from './hooks.js';
+import {createLogoSlots} from './logo-slots.js';
 import {api} from './api.js';
 import {Empty,ErrorNotice,FadeImage,Loading,Icon,Modal,Row} from './components.js';
 import {readPreference} from './storage.js';
@@ -45,12 +46,26 @@ const validFilter=(value:string|null):value is Filter=>filters.some(([f])=>f===v
 function savedFilter(account:string):Filter {try{const value=readPreference(sessionStorage,`tk.box:guide:${account}`);return validFilter(value)?value:'all';}catch{return 'all';}}
 // Provider names often carry a region prefix ("US: CNN"); show it as a tag instead.
 export function stationName(name:string){const m=/^([A-Z]{2,3})s*[:|]s*(.+)$/.exec(name);return m?{region:m[1],label:m[2]!}:{label:name};}
+// A logo holds a browser connection until its fetch finishes and the TV WebView predates
+// loading="lazy"; see logo-slots.ts for why the number in flight is capped.
+const logoSlots=createLogoSlots(4,15000);
 export function ChannelLogo({channel,size=40}:{channel:{id:string;name:string;logo?:boolean;logoKey?:string};size?:number}) {
   // A custom channel's logoKey changes with the movie airing, giving a new address so the new logo loads.
   const src=`/api/v1/iptv/channels/${channel.id}/logo${channel.logoKey?`?v=${encodeURIComponent(channel.logoKey)}`:''}`;
-  const [failed,setFailed]=useState<string>(),label=stationName(channel.name).label;
+  const [failed,setFailed]=useState<string>(),[shown,setShown]=useState(false),label=stationName(channel.name).label,release=useRef<(()=>void)|undefined>(undefined);
+  const settle=()=>{release.current?.();release.current=undefined;};
+  useEffect(()=>{
+    setShown(false);settle();
+    if(!channel.logo)return;
+    // A logo that never answers gives its slot back, and unmounting the image is what makes the
+    // browser abort the request. The monogram it leaves behind is the usable fallback.
+    const abandon=()=>{setFailed(src);settle();};
+    release.current=logoSlots(()=>setShown(true),abandon);
+    return settle;
+  },[src,channel.logo]);
   // A fixed landscape tile: most station logos are wide, so every logo shares one box and one alignment.
-  return <span className="channel-logo" style={{width:Math.round(size*1.6),height:size}} aria-hidden="true">{channel.logo&&failed!==src?<FadeImage key={src} src={src} alt="" loading="lazy" onError={()=>setFailed(src)}/>:<b style={{fontSize:size*.34}}>{label.slice(0,2).toUpperCase()}</b>}</span>;
+  // The monogram stays underneath while the logo waits or fails, so nothing moves when it arrives.
+  return <span className="channel-logo" style={{width:Math.round(size*1.6),height:size}} aria-hidden="true"><b style={{fontSize:size*.34}}>{label.slice(0,2).toUpperCase()}</b>{channel.logo&&shown&&failed!==src?<FadeImage key={src} src={src} alt="" decoding="async" onLoad={settle} onError={()=>{setFailed(src);settle();}}/>:null}</span>;
 }
 const airingNow=(c:Station,now:number)=>c.programs.find(p=>p.program&&p.program.start<=now&&p.program.end>now)?.program??undefined;
 const minutesLeft=(p:Program,now:number)=>Math.max(1,Math.ceil((p.end-now)/60000));

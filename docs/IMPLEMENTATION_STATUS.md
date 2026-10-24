@@ -1,13 +1,14 @@
 # tk.box implementation status
 
-Updated October 22, 2026. **M03.5 removes the guide read-path stall that blocked paging on a
-populated EPG. The dominant defect was not repeated guide decryption but `IS NOT NULL` on the
-guide blob, which made every source-metadata read walk 37 MB of overflow pages. A 50-row page went
-from ~50 s to ~185 ms on the same compiled server and dataset. M03.4 physical retest and the M03.5
-physical retest both remain open. M03.3 physical acceptance was reported by the user/Hermes; see
-its record.**
+Updated October 24, 2026. **M03.5 removes the guide read-path stall that blocked paging on a
+populated EPG, and its follow-up removes the cold-logo paging delay. The dominant read-path defect
+was not repeated guide decryption but `IS NOT NULL` on the guide blob, which made every
+source-metadata read walk 37 MB of overflow pages; a 50-row page went from ~50 s to ~185 ms on the
+same compiled server and dataset. The remaining device delay was browser connection queueing behind
+50 simultaneous logo fetches, now capped. M03.4 physical retest and the M03.5 physical retest both
+remain open. M03.3 physical acceptance was reported by the user/Hermes; see its record.**
 
-## Latest pass: M03.5 — guide and logo read-path stalls
+## Pass: M03.5 — guide and logo read-path stalls
 
 - **Measured cause.** `IptvStore.source()` projected `encrypted_guide IS NOT NULL`. SQLite evaluates
   that by reading the value, so every call walked the whole 37 MB guide: 20.8 ms per call, on a
@@ -31,6 +32,29 @@ its record.**
   [M03.5](M03.5-GUIDE-READ-PERFORMANCE.md).
 - **APK.** No native source changed; the installed APK remains valid. M03.5 physical retest is
   **not** performed.
+
+## Latest pass: M03.5 follow-up — cold-logo paging and the Details control
+
+- **Cause of the 15,875 ms cold-logo transition.** Not the guide handler and not server work: the
+  browser's connection pool. `ChannelLogo` used `loading="lazy"`, which the Fire TV WebView
+  (Chromium ~66) does not implement, so a 50-row page started 50 logo fetches at once and the next
+  guide request queued behind them — 6,215 ms queued against 448 ms of server work.
+- **Change.** `apps/web/src/logo-slots.ts` caps logo fetches at four at a time with a queue, an
+  idempotent release and a 15 s deadline that frees a slot; `ChannelLogo` renders the monogram
+  underneath the logo so the tile never moves and a failed or timed-out logo keeps a usable
+  fallback. Server code is unchanged: sealed icons, invalidation, cache accounting, "No guide data",
+  auth and provider safeguards all stand.
+- **Details was a verification error, plus one real defect.** The control is a native `<dialog>`
+  whose implicit role is `dialog` and which carries no `role` attribute, so `[role=dialog]` can
+  never match it; `dialog[open]` is the correct locator. Opening it with the keyboard showed the
+  right programme, stayed on `#live` and started no playback. The real defect was focus: closing a
+  dialog left focus on `<body>`, so `Modal` now returns it to the control that opened it.
+- **Verified.** `npm run typecheck` and `npm run build` clean. Full suite **275 tests: 271 pass, 4
+  fail, 0 skipped**; the same four `xtream-epg` failures reproduce at `73d640c` with this work
+  stashed, so they are baseline. Real-browser measurement on a 5 s logo delay: usable rows in
+  328–418 ms with four logos still in flight. Evidence and the Hermes retest steps:
+  [M03.5 §12](M03.5-GUIDE-READ-PERFORMANCE.md).
+- **APK.** Still no native source changed. Physical AFTMM retest of this follow-up remains open.
 
 ## Previous pass: M03.4 — Xtream EPG diagnosed and repaired
 
