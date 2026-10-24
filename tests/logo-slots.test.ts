@@ -123,17 +123,21 @@ test('a batch that expires completely leaves the pool usable at full capacity', 
 });
 
 test('queued cancellation, normal completion and expiry share one correct count', async () => {
-  const pool = componentPool(2, 20);
-  const tiles = Array.from({ length: 6 }, (_, i) => pool.tile(`c${i}`));
+  // A fixed sleep raced the deadlines themselves under full-suite load, so the assertions wait for
+  // the state they describe instead of for a guessed duration.
+  const until = async (check: () => boolean) => { for (let i = 0; i < 200 && !check(); i++) await new Promise(done => setTimeout(done, 5)); };
+  const pool = componentPool(2, 60), tiles = Array.from({ length: 6 }, (_, i) => pool.tile(`c${i}`));
   assert.deepEqual(pool.started, ['c0', 'c1']);
   tiles[4]!();                       // queued: leaves the queue, spends no slot
   assert.deepEqual(pool.started, ['c0', 'c1'], 'cancelling a queued logo starts nothing');
   tiles[0]!();                       // normal completion: admits exactly one
   assert.deepEqual(pool.started, ['c0', 'c1', 'c2']);
-  await new Promise(done => setTimeout(done, 40));  // c1 and c2 expire
-  assert.deepEqual(pool.expired, ['c1', 'c2']);
+  await until(() => pool.expired.length >= 2);      // c1 and c2 expire
+  assert.deepEqual(pool.expired, ['c1', 'c2'], 'exactly the running jobs expired');
   // Each expiry returns exactly one slot, so both survivors of the queue start, in order.
   assert.deepEqual(pool.started, ['c0', 'c1', 'c2', 'c3', 'c5'], 'the cancelled queued logo (c4) never ran');
+  // c3 and c5 are now running under their own deadline; settle them so the assertions are about
+  // this sequence and not about whether their 60 ms elapsed first.
   tiles[1]!(); tiles[2]!(); tiles[3]!(); tiles[5]!();  // cleanup after expiry is harmless
   assert.equal(pool.live.size, 0);
   assert.deepEqual(pool.started, ['c0', 'c1', 'c2', 'c3', 'c5'], 'cleanup admits nothing extra');
