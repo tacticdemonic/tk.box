@@ -296,6 +296,15 @@ export class IptvStore {
     // Windows matched before sports were recorded fall back to the channel's own name, not the generic icon.
     return (SPORTS as readonly string[]).includes(row.sport??'')?row.sport as Sport:sportOf(this.provider(this.channel(id)).name);
   }
+  // The saved logo of the league whose game a visible event channel carries, if one was downloaded.
+  leagueLogo(id:string) {
+    return this.db.prepare('SELECT l.type,l.bytes FROM sports_windows w JOIN iptv_channels c ON c.id=w.channel_id AND c.event=1 JOIN sports_league_logos l ON l.league_key=w.league_key WHERE w.channel_id=? AND l.bytes IS NOT NULL').get(id) as {type:string;bytes:Buffer}|undefined;
+  }
+  // Both teams' logo addresses of the game a visible event channel carries, when its schedule named them.
+  matchupLogos(id:string) {
+    const row=this.db.prepare('SELECT e.logos FROM sports_windows w JOIN iptv_channels c ON c.id=w.channel_id AND c.event=1 JOIN sports_events e ON e.id=w.event_id WHERE w.channel_id=? AND e.logos IS NOT NULL').get(id) as {logos:string}|undefined;
+    return row?JSON.parse(row.logos) as [string,string]:undefined;
+  }
   visible() {return this.feeds().map(({rank:_,online:__,label:___,event:____,...feed})=>feed);}
   // One lineup row per station within a source, like identity. The default feed is the best quality (FHD, then HD), primary before
   // backup, then a feed confirmed working; the row keeps the earliest lineup position of its feeds.
@@ -309,7 +318,7 @@ export class IptvStore {
     return [...groups.values()].map(group=>{
       const position=Math.min(...group.map(f=>f.position)),feeds=group.sort((a,b)=>b.rank-a.rank||Number(b.online)-Number(a.online)||a.position-b.position||a.number-b.number);
       const {rank:_,online:__,label:___,event:____,...primary}=feeds[0]!,event=feeds.find(f=>f.event)?.event;
-      return {row:{...primary,position,feeds:feeds.map(f=>({id:f.id,name:f.label??f.name,number:f.number,...(f.quality?{quality:f.quality}:{})}))},event:event&&order(event)};
+      return {row:{...primary,position,feeds:feeds.map(f=>({id:f.id,name:f.label??f.name,number:f.number,...(f.quality?{quality:f.quality}:{})})),...(event?{event:true as const}:{})},event:event&&order(event)};
     }).sort((a,b)=>{
       const bySource=sources.get(a.row.sourceId)!-sources.get(b.row.sourceId)!;if(bySource)return bySource;
       if(!!a.event!==!!b.event)return (a.event?-1:1)*(top?1:-1);
@@ -534,24 +543,34 @@ export class IptvStore {
     const programs=w.visible_from<w.start?[{...event,start:w.visible_from,end:w.start,subtitle:'Starting soon',status:'starting_soon' as const},event]:[event];
     return guideWindow(programs,'sports',start,end).map(row=>row.program?row:{...row,blank:true as const});
   }
-  // Custom channels lead the guide as their own group, then IPTV sources in the administrator's order.
-  guidePage(account:string,filter:'all'|'iptv'|'custom'|'favorites',start:number,end:number,offset:number,limit:number,q='',channelId?:string,custom?:CustomChannelStore) {
+  // Favorites lead the guide as their own group, pulled out of their sources; then custom channels, then IPTV sources
+  // in the administrator's order. Each row names its group so the client can head each one (across pages too).
+  // A filter other than the fixed ones names an IPTV source: that source's channels alone. Categories are every IPTV source
+  // with channels, in guide order whatever the filter, for the guide's filter chips. A kind keeps live event rows alone, or
+  // everything else (Home shows them as separate rows).
+  guidePage(account:string,filter:string,start:number,end:number,offset:number,limit:number,q='',channelId?:string,custom?:CustomChannelStore,kind?:'channels'|'events') {
     const favorites=new Set((this.db.prepare('SELECT channel_id FROM iptv_favorites WHERE account_id=?').all(account) as {channel_id:string}[]).map(c=>c.channel_id));
-    const search=q.trim().toLocaleLowerCase();
-    const customs=filter==='iptv'||!custom?[]:custom.stations(account,filter==='favorites',search,channelId);
-    const channels=filter==='custom'?[]:this.stacks().filter(c=>(filter!=='favorites'||c.feeds.some(f=>favorites.has(f.id)))&&(!channelId||c.feeds.some(f=>f.id===channelId))&&(!search||c.name.toLocaleLowerCase().includes(search)||c.feeds.some(f=>f.name.toLocaleLowerCase().includes(search)||String(f.number).includes(search)))),cache=new Map<string,M3uSnapshot|XmlSnapshot|undefined>();
-    // Every source with a matching channel, in guide order, so the client can head each group (across pages too).
-    const counts=new Map<string,number>();for(const c of channels)counts.set(c.sourceId,(counts.get(c.sourceId)??0)+1);
-    const sources=[...(customs.length?[{id:'custom',name:'Plex Channels',count:customs.length}]:[]),...[...counts].map(([id,count])=>({id,name:this.source(id).name,count}))];
-    const total=customs.length+channels.length;
-    const customRows=customs.slice(offset,offset+limit).map(c=>({...c,programs:custom!.programs(c.id,start,end)}));
-    return {start,end,offset,limit,total,hasMore:offset+limit<total,sources,channels:[...customRows,...channels.slice(Math.max(0,offset-customs.length),Math.max(0,offset+limit-customs.length)).map(channel=>{
+    const search=q.trim().toLocaleLowerCase(),source=['all','custom','favorites'].includes(filter)?undefined:filter,stacks=this.stacks();
+    const categories=[...new Set(stacks.map(c=>c.sourceId))].map(id=>({id,name:this.source(id).name}));
+    const customs=source||!custom||kind==='events'?[]:custom.stations(account,filter==='favorites',search,channelId);
+    const channels=filter==='custom'?[]:stacks.filter(c=>(!source||c.sourceId===source)&&(!kind||!!c.event===(kind==='events'))&&(filter!=='favorites'||c.feeds.some(f=>favorites.has(f.id)))&&(!channelId||c.feeds.some(f=>f.id===channelId))&&(!search||c.name.toLocaleLowerCase().includes(search)||c.feeds.some(f=>f.name.toLocaleLowerCase().includes(search)||String(f.number).includes(search)))),cache=new Map<string,M3uSnapshot|XmlSnapshot|undefined>();
+    // The Favorites filter is all favorites already, and a source filter is one source, so both leave favorites in place.
+    const pull=filter!=='favorites'&&!source;
+    const rows=[...customs.map(c=>({kind:'custom' as const,c,favorite:c.favorite,group:'custom'})),...channels.map(c=>{const favorite=c.feeds.some(f=>favorites.has(f.id));return {kind:'iptv' as const,c,favorite,group:c.sourceId};})]
+      .map(r=>pull&&r.favorite?{...r,group:'favorites'}:r);
+    const ordered=[...rows.filter(r=>r.group==='favorites'),...rows.filter(r=>r.group!=='favorites')];
+    const counts=new Map<string,number>();for(const r of ordered)counts.set(r.group,(counts.get(r.group)??0)+1);
+    const sources=[...counts].map(([id,count])=>({id,name:id==='favorites'?'Favorites':id==='custom'?'Plex Channels':this.source(id).name,count}));
+    const total=ordered.length;
+    return {start,end,offset,limit,total,hasMore:offset+limit<total,sources,categories,channels:ordered.slice(offset,offset+limit).map(r=>{
+      if(r.kind==='custom')return {...r.c,group:r.group,programs:custom!.programs(r.c.id,start,end)};
+      const channel=r.c;
       // Feeds of one station share a schedule: use the first feed with a guide match.
       let data:ReturnType<IptvStore['guideData']>|undefined;
       for(const feed of channel.feeds){const feedId=this.feedFor(feed.id),candidate=feedId?this.guideData(feed.id,feedId,cache):undefined;data??=candidate;if(candidate?.mapping){data=candidate;break;}}
       // Any channel may match the logo library, so the logo route decides; the UI falls back to a monogram.
       const {hasLogo:_,...rest}=channel,logo=true;
-      return {...rest,logo,type:'iptv' as const,favorite:channel.feeds.some(f=>favorites.has(f.id)),programs:this.eventRows(channel.id,start,end)??guideWindow(data?.xml?.programs??[],data?.mapping?.xmlId,start,end,channel.name)};
-    })]};
+      return {...rest,group:r.group,logo,type:'iptv' as const,favorite:r.favorite,programs:this.eventRows(channel.id,start,end)??guideWindow(data?.xml?.programs??[],data?.mapping?.xmlId,start,end,channel.name)};
+    })};
   }
 }

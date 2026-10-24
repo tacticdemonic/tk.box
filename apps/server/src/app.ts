@@ -9,7 +9,7 @@ import { z, ZodError } from 'zod';
 import type { Config } from './config.js';
 import type { Db } from './persistence/database.js';
 import { SettingsStore } from './persistence/database.js';
-import { PlexAdapter, audioStreams, mediaTracks } from './providers/plex.js';
+import { PlexAdapter, audioStreams, mediaMarkers, mediaTracks } from './providers/plex.js';
 import { LocalMedia, byteRange, type LocalPart } from './providers/local-media.js';
 import { IdentityService } from './services/identity.js';
 import { PlaybackService } from './services/playback.js';
@@ -23,6 +23,9 @@ import { IptvStore } from './persistence/iptv-store.js';
 import { SourceRefresh } from './services/source-refresh.js';
 import { registerIptv } from './iptv-api.js';
 import { registerCatalog } from './catalog-api.js';
+import { ClientEvents, registerEvents } from './events-api.js';
+import { registerExplore } from './explore-api.js';
+import { ExploreStore } from './persistence/explore-store.js';
 import { LiveTv } from './services/live-tv.js';
 import { HealthStore } from './persistence/channel-health-store.js';
 import { ChannelHealth } from './services/channel-health.js';
@@ -30,6 +33,8 @@ import { registerChannelHealth } from './health-api.js';
 import { IptvSettingsStore, iptvSettings } from './persistence/iptv-settings.js';
 import { ProviderConnections } from './streaming/provider-connections.js';
 import { SportsStore } from './persistence/sports-store.js';
+import { ServiceKeys, serviceKeysInput } from './persistence/service-keys.js';
+import { PlexBackground } from './services/plex-background.js';
 import { SportsSchedule } from './services/sports-schedule.js';
 import { DEFAULT_ESPN, DEFAULT_TSDB } from './providers/sports-feeds.js';
 import { registerSports } from './sports-api.js';
@@ -38,6 +43,16 @@ import { registerCustomChannels } from './custom-api.js';
 import { CustomTv } from './services/custom-tv.js';
 import { PartProxy } from './providers/part-proxy.js';
 import { EpisodeSync } from './services/episode-sync.js';
+import { ArtworkStore } from './persistence/artwork-store.js';
+import { ArtworkEngine } from './services/artwork-engine.js';
+import { ArtworkWorker } from './services/artwork-worker.js';
+import { ArtworkSchedule } from './services/artwork-schedule.js';
+import { registerArtwork } from './artwork-api.js';
+import { CleanupStore } from './persistence/cleanup-store.js';
+import { CleanupEngine, type CleanupServices } from './services/cleanup-engine.js';
+import { registerCleanup } from './cleanup-api.js';
+import { Activity } from './services/activity.js';
+import { registerActivity } from './activity-api.js';
 
 export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexAdapter, logging = true, cookieNamespace = 'tk.box') {
   const app = Fastify({ logger: logging ? {level: 'info'} : false, logController: new LogController({disableRequestLogging: true}), bodyLimit: 65536, trustProxy: config.trustedProxies.length ? config.trustedProxies : false });
@@ -60,9 +75,12 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   ];
   const streams = new Set<{id: string; hash: string; abort: AbortController}>();
   const stopStreams = (matches: (s: {id: string; hash: string}) => boolean) => {for (const s of streams) if (matches(s)) s.abort.abort();};
+  // Admin › Activity: every stream being watched, reported by the routes below that start, deliver and stop them.
+  const activity = new Activity(), client = (req: {ip: string; headers: {'user-agent'?: string}}) => ({ip: req.ip, userAgent: req.headers['user-agent']?.slice(0, 400)});
   app.addHook('onRequest', async (req, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff').header('Referrer-Policy', 'no-referrer').header('Cache-Control', 'no-store');
-    reply.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self'; connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+    // blob: images are ones the page made itself (the artwork layout editor's previews); data: stays blocked.
+    reply.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' blob:; connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'");
     if (config.secureCookies) reply.header('Strict-Transport-Security', 'max-age=31536000');
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       requireThat(req.headers.origin === config.browserOrigin, 'CSRF_REJECTED', 'Request origin is not permitted.', 403);
@@ -90,7 +108,9 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   const iptv = new IptvStore(db,vault);
   const refresh = new SourceRefresh(iptv), custom = new CustomChannelStore(db);
   registerIptv(app,iptv,refresh,auth,admin,undefined,undefined,custom,async (req,id,kind) => plex.artwork((await auth(req)).grant,id,kind));
-  const episodes = new EpisodeSync(custom, plex, () => identity.adminGrant(config.PLEX_OWNER_ACCOUNT_ID ? [config.PLEX_OWNER_ACCOUNT_ID] : []), (message, detail) => app.log.info(detail, message));
+  // Background work reads Plex with the owner's Plex token from Admin › Connections.
+  const serviceKeys = new ServiceKeys(db, vault), background = new PlexBackground(serviceKeys, plex, (message, detail) => app.log.warn(detail, message));
+  const episodes = new EpisodeSync(custom, plex, () => background.grant(), (message, detail) => app.log.info(detail, message));
   registerCustomChannels(app,custom,plex,admin,episodes);
   app.addHook('onReady', async () => { episodes.start(); });
   const live = new LiveTv(iptv, budget, config.CACHE_DIR, config.FFMPEG_PATH, config.FFPROBE_PATH, (message, detail) => app.log.warn(detail, message));
@@ -109,17 +129,27 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   registerChannelHealth(app, iptv, healthStore, health, admin);
   // Sports events: event-driven sources show a channel only while the event it names is on.
   const list = (value: string | undefined, fallback: string[]) => { const items = (value ?? '').split(',').map(s => s.trim()).filter(Boolean); return items.length ? items : fallback; };
+  // Without a saved TheSportsDB key, its free public key ('123') is used.
   const sportsStore = new SportsStore(db, id => iptv.relist(id)), sports = new SportsSchedule(iptv, sportsStore, healthStore, () => health.pump(),
-    {espn: list(config.SPORTS_ESPN_LEAGUES, DEFAULT_ESPN), tsdb: list(config.SPORTS_TSDB_LEAGUES, DEFAULT_TSDB), tsdbKey: config.THESPORTSDB_API_KEY ?? '123', zone: config.SPORTS_NAME_TIMEZONE ?? 'America/New_York', nameHours: 3, tickMs: 60000},
+    {espn: list(config.SPORTS_ESPN_LEAGUES, DEFAULT_ESPN), tsdb: list(config.SPORTS_TSDB_LEAGUES, DEFAULT_TSDB), tsdbKey: () => serviceKeys.get('thesportsdb') ?? '123', zone: config.SPORTS_NAME_TIMEZONE ?? 'America/New_York', nameHours: 3, tickMs: 60000},
     (message, detail) => app.log.info(detail, message));
   registerSports(app, iptv, sportsStore, sports, admin);
+  // Admin › Connections: keys no feature's own settings hold. A new TheSportsDB key is used from the next download on,
+  // a new Plex admin token from the next background task.
+  app.get('/api/v1/admin/keys', async req => { await admin(req); return serviceKeys.view(); });
+  // A Plex admin token is saved only once Plex vouches for it as the server owner's.
+  app.put('/api/v1/admin/keys', async req => {
+    const {grant} = await admin(req), input = serviceKeysInput.parse(req.body);
+    if (input.plex) await background.check(input.plex).catch((e: AppError) => { throw e.code === 'PLEX_TOKEN_NOT_OWNER' || e.code === 'PLEX_UNAVAILABLE' ? e : new AppError('PLEX_TOKEN_REJECTED', 'Plex didn’t accept that token.', 400); });
+    const saved = serviceKeys.update(grant.accountId, input); sports.invalidate(); background.invalidate(); return saved;
+  });
   refresh.published = () => sports.invalidate();
   app.addHook('onReady', async () => { void sports.tick(); });
   // Custom channels share the live session routes; their sessions belong to CustomTv.
   const parts = new PartProxy(plex), customTv = new CustomTv(custom, plex, localMedia, parts, budget, config.CACHE_DIR, () => settings.get().pauseRetentionMinutes * 60000, config.SEGMENT_CACHE_MAX_BYTES,
     config.FFMPEG_PATH, (message, detail) => app.log.warn(detail, message));
   // Pause, Resume and Go Live exist only on custom channels; IPTV stays strictly live.
-  const timeshift = <T>(id: string, run: () => T) => { requireThat(customTv.has(id), 'NOT_SUPPORTED', 'Only Plex channels can be paused.', 409); return run(); };
+  const timeshift = <T>(id: string, run: () => T) => { requireThat(customTv.has(id), 'NOT_SUPPORTED', 'Only Plex channels can be paused.', 409); activity.touch(id); return run(); };
   app.get<{Params: {id: string}}>('/api/v1/live/sessions/:id/state', async req => { const {hash} = await auth(req); return timeshift(req.params.id, () => customTv.state(req.params.id, hash)); });
   app.post<{Params: {id: string}}>('/api/v1/live/sessions/:id/pause', async req => {
     const {hash} = await auth(req), input = z.object({displayedUtc: z.number().finite()}).strict().parse(req.body);
@@ -139,18 +169,50 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
     return reply.type('text/vtt; charset=utf-8').send(await subtitles.webvtt(grant, item, req.params.stream));
   });
   app.post('/api/v1/live/sessions', {config: {rateLimit: {max: 30, timeWindow: 60000}}}, async req => {
-    const input = z.object({channelId: z.string().uuid()}).strict().parse(req.body), {hash, grant} = await auth(req);
-    return custom.exists(input.channelId) ? customTv.start(hash, grant, input.channelId) : live.start(hash, input.channelId);
+    const input = z.object({channelId: z.string().uuid()}).strict().parse(req.body), {hash, grant} = await auth(req), own = custom.exists(input.channelId);
+    const started = await (own ? customTv.start(hash, grant, input.channelId) : live.start(hash, input.channelId));
+    activity.open({id: started.id, kind: own ? 'custom' : 'live', hash, accountId: grant.accountId, user: grant.name, delivery: started.delivery, ...client(req),
+      channelId: input.channelId, channel: {name: started.channel.name, number: started.channel.number}, source: started.source});
+    return started;
   });
   // Playlists reauthorize fully, like VOD; segments use the local session check.
   app.get<{Params: {id: string; file: string}}>('/api/v1/live/sessions/:id/:file', {config: {rateLimit: {max: 1200, timeWindow: 60000}}}, async (req, reply) => {
     const service = customTv.has(req.params.id) ? customTv : undefined;
+    activity.touch(req.params.id);
     if (req.params.file === 'index.m3u8') { const {hash, grant} = await auth(req); return reply.type('application/vnd.apple.mpegurl').send(await (service ? service.playlist(req.params.id, hash, grant) : live.playlist(req.params.id, hash))); }
     const segment = await (service ?? live).segment(req.params.id, identity.session(req.cookies[sessionCookie]), req.params.file);
+    activity.touch(req.params.id, segment.size);
     return reply.type('video/mp2t').header('content-length', String(segment.size)).send(segment.body);
   });
-  app.delete<{Params: {id: string}}>('/api/v1/live/sessions/:id', async req => { const {hash} = await auth(req); live.stop(req.params.id, hash); customTv.stop(req.params.id, hash); return {status: 'stopped'}; });
+  app.delete<{Params: {id: string}}>('/api/v1/live/sessions/:id', async req => { const {hash} = await auth(req); live.stop(req.params.id, hash); customTv.stop(req.params.id, hash); if (activity.get(req.params.id)?.hash === hash) activity.close(req.params.id); return {status: 'stopped'}; });
   registerCatalog(app,plex,auth);
+  // Open pages hear when artwork or cleanup jobs change the library, and reload what they show.
+  const events = new ClientEvents();
+  registerEvents(app, events, auth);
+  const exploreStore = new ExploreStore(db, vault);
+  registerExplore(app, plex, exploreStore, auth, admin, hash => identity.accountToken(hash));
+  // Artwork: the engine runs as a separate Python process, apart from every playback path.
+  const artworkStore = new ArtworkStore(db, vault, resolve('apps/artwork/defaults.json'));
+  const artwork = new ArtworkEngine(artworkStore, {python: config.PYTHON_PATH, script: resolve('apps/artwork/overlayrr.py'), collectionsScript: resolve('apps/artwork/plex_collections.py'), dataDir: config.DATA_DIR, cacheDir: config.CACHE_DIR, plexUrl: config.PLEX_URL},
+    (message, detail) => app.log.info(detail, message), () => exploreStore.view().traktClientId || undefined);
+  const artworkWorker = new ArtworkWorker(artwork, (message, detail) => app.log.warn(detail, message));
+  const artworkSchedule = new ArtworkSchedule(artworkStore, artwork, plex, () => background.grant(), (message, detail) => app.log.warn(detail, message));
+  registerArtwork(app, artworkStore, artwork, artworkWorker, artworkSchedule, admin);
+  artwork.finished = () => events.publish('library');
+  app.addHook('onReady', async () => { artworkSchedule.start(); });
+  app.addHook('onClose', async () => { artworkSchedule.close(); artworkWorker.close(); artwork.close(); });
+  // Clean Up: the purge script runs as a separate Python process too. Seerr is Explore's connection, Radarr is Collections'.
+  const cleanupStore = new CleanupStore(db, vault);
+  const cleanupServices = (): CleanupServices => {
+    const {radarr, radarrKey} = artworkStore.collectionsConfig(), own = cleanupStore.connections();
+    return {seerr: exploreStore.seerr(), radarr: {url: radarr.url, key: radarrKey}, tautulli: {url: own.tautulliUrl, key: own.tautulliKey}, sonarr: {url: own.sonarrUrl, key: own.sonarrKey}};
+  };
+  const cleanup = new CleanupEngine(cleanupStore, {python: config.PYTHON_PATH, script: resolve('apps/cleanup/purge_requests.py'), poster: resolve('apps/cleanup/leaving-soon.png'), dataDir: config.DATA_DIR, plexUrl: config.PLEX_URL},
+    cleanupServices, () => background.grant(), (message, detail) => app.log.info(detail, message));
+  registerCleanup(app, cleanupStore, cleanup, cleanupServices, admin);
+  cleanup.finished = () => events.publish('library');
+  app.addHook('onReady', async () => { cleanup.start(); });
+  app.addHook('onClose', async () => { cleanup.close(); });
   app.get('/health', async () => ({status: 'ok'}));
   app.get('/api/v1/setup', async () => ({plexConfigured: config.plexConfigured, milestone: 0}));
   app.post('/api/v1/auth/plex/start', { config: {rateLimit: {max: 10, timeWindow: 60000}} }, async (_req, reply) => {
@@ -166,7 +228,7 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   });
   app.post('/api/v1/auth/logout', async (req, reply) => {
     const token = req.cookies[sessionCookie];
-    if (token) {const {digest} = await import('./security/vault.js'); const hash = digest(token); stopStreams(s => s.hash === hash); transcodes.stopWhere(t => t.hash === hash); live.stopWhere(v => v.hash === hash); customTv.stopWhere(v => v.hash === hash);}
+    if (token) {const {digest} = await import('./security/vault.js'); const hash = digest(token); stopStreams(s => s.hash === hash); transcodes.stopWhere(t => t.hash === hash); live.stopWhere(v => v.hash === hash); customTv.stopWhere(v => v.hash === hash); activity.closeWhere(s => s.hash === hash);}
     identity.logout(token); reply.clearCookie(sessionCookie, cookieOpts); return {status: 'signed_out'};
   });
   app.get('/api/v1/me', async req => { const {grant} = await auth(req); return {accountId: grant.accountId, role: grant.role,libraries:grant.libraries.filter(l=>['movie','show'].includes(l.type))}; });
@@ -180,7 +242,7 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
     // startAtMs with audioStreamId or quality restarts a title at the current position with another track or quality.
     const input = z.object({mode: z.literal('plex_vod'), ratingKey: z.string().regex(/^\d+$/), capabilities: caps,startFrom:z.enum(['resume','beginning']).default('resume'),
       startAtMs: z.number().int().nonnegative().optional(), audioStreamId: z.string().regex(/^\d+$/).max(20).optional(), quality: quality.default('auto')}).strict().parse(req.body);
-    const {hash, grant} = await auth(req), item = await plex.metadata(grant, input.ratingKey), media = item.Media[0];
+    const {hash, grant} = await auth(req), item = await plex.metadata(grant, input.ratingKey, {markers: true}), media = item.Media[0];
     requireThat(media, 'SOURCE_INCOMPATIBLE', 'No playable media.', 422);
     const video = media.Part[0]?.Stream?.find(s => s.streamType === 1), {audio, fileDefault, plexSelected} = audioStreams(item);
     const requested = input.audioStreamId === undefined ? undefined : audio.find(s => s.id === input.audioStreamId);
@@ -190,14 +252,18 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
     const sourceVideo = {codec: media.videoCodec, width: media.width, height: media.height, container: media.container, audioCodec: target?.codec ?? media.audioCodec, bitDepth: video?.bitDepth, bitrateKbps: media.bitrate};
     const route = chooseRoute(sourceVideo, input.capabilities, input.quality, false, !otherTrack);
     const startOffsetMs = Math.max(0, Math.min(input.startAtMs ?? (input.startFrom==='beginning' ? 0 : item.viewOffset ?? 0), item.duration));
-    // Track and source details let the player offer subtitles and describe the stream.
+    // Track and source details let the player offer subtitles and describe the stream; markers let it skip intros and credits.
     const playing = route.kind === 'direct' ? fileDefault : target;
-    const details = {tracks: mediaTracks(item, playing?.id), source: {videoCodec: media.videoCodec, audioCodec: playing?.codec ?? media.audioCodec, width: media.width, height: media.height, container: media.container, bitrateKbps: media.bitrate},
+    const details = {tracks: mediaTracks(item, playing?.id), markers: mediaMarkers(item), source: {videoCodec: media.videoCodec, audioCodec: playing?.codec ?? media.audioCodec, width: media.width, height: media.height, container: media.container, bitrateKbps: media.bitrate},
       quality: input.quality, qualityOptions: qualityOptions(sourceVideo, input.capabilities, false, !otherTrack)};
-    if (route.kind === 'direct') return {...playback.createVod(hash, input.ratingKey, startOffsetMs), ...details};
+    const watching = (created: {id: string; delivery: 'direct' | 'remux' | 'transcode'}) => activity.open({id: created.id, kind: 'vod', hash, accountId: grant.accountId, user: grant.name, delivery: created.delivery, ...client(req),
+      mediaId: item.ratingKey, positionMs: startOffsetMs, durationMs: item.duration, quality: input.quality, source: details.source,
+      ...(route.kind === 'cpu' ? {target: {maxHeight: route.maxHeight, maxBitrateKbps: route.maxBitrateKbps}} : {})});
+    if (route.kind === 'direct') { const created = playback.createVod(hash, input.ratingKey, startOffsetMs); watching(created); return {...created, ...details}; }
     if (requested && requested.id !== plexSelected?.id) await plex.selectAudioStream(grant, item, requested.id);
     const created = playback.createVod(hash, input.ratingKey, startOffsetMs, route.kind === 'remux' ? 'remux' : 'transcode');
     try {await transcodes.start(created.id, hash, grant, item, route, requested || otherTrack ? {id: target!.id, codec: target!.codec} : undefined);} catch (e) {playback.stop(created.id, hash); throw e;}
+    watching(created);
     return {...created, ...details};
   });
   // Plex transcoder HLS proxy. Playlists reauthorize fully; segments use the
@@ -208,8 +274,9 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
     playback.owned(req.params.id, hash);
     const abort = new AbortController(); reply.raw.once('close', () => abort.abort());
     const result = await transcodes.fetch(req.params.id, hash, rel, req.url.split('?')[1] ?? '', abort.signal);
-    if (result.kind === 'playlist') return reply.type('application/vnd.apple.mpegurl').send(result.body);
+    if (result.kind === 'playlist') { activity.touch(req.params.id, result.body.length); return reply.type('application/vnd.apple.mpegurl').send(result.body); }
     const {response} = result;
+    activity.touch(req.params.id, Number(response.headers.get('content-length')) || 0);
     reply.code(response.status);
     for (const h of ['content-type', 'content-length']) if (response.headers.has(h)) reply.header(h, response.headers.get(h)!);
     return reply.send(response.body ? Readable.fromWeb(response.body as import('node:stream/web').ReadableStream) : null);
@@ -219,6 +286,7 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
     requireThat(session.mode === 'plex_vod', 'INVALID_MODE', 'This endpoint only serves on-demand media.', 403);
     if (req.headers.range) requireThat(/^bytes=\d*-\d*$/.test(req.headers.range), 'INVALID_RANGE', 'Only a single byte range is supported.');
     const item = await plex.metadata(grant, session.rating_key), running = {id: session.id, hash, abort: new AbortController()};
+    activity.touch(session.id);
     requireThat([...streams].filter(s => s.hash === hash).length < 20, 'STREAM_LIMIT', 'Too many open media requests.', 429);
     streams.add(running);
     const timer = setInterval(() => {void auth(req).then(a => plex.metadata(a.grant, session.rating_key)).then(() => playback.owned(session.id, hash)).catch(() => running.abort.abort());}, 15000); timer.unref();
@@ -254,9 +322,16 @@ export async function buildApp(config: Config, db: Db, vault: Vault, plex: PlexA
   });
   app.patch<{Params: {id: string}}>('/api/v1/playback/sessions/:id/progress', async req => {
     const input = z.object({timeMs: z.number().int().nonnegative(), state: z.enum(['playing', 'paused', 'stopped'])}).strict().parse(req.body);
-    const {hash, grant} = await auth(req); await playback.progress(req.params.id, hash, grant, input.timeMs, input.state); transcodes.touch(req.params.id, hash, grant); return {status: 'synchronized'};
+    const {hash, grant} = await auth(req); await playback.progress(req.params.id, hash, grant, input.timeMs, input.state); activity.progress(req.params.id, hash, input.timeMs, input.state); transcodes.touch(req.params.id, hash, grant); return {status: 'synchronized'};
   });
-  app.delete<{Params: {id: string}}>('/api/v1/playback/sessions/:id', async req => { const {hash} = await auth(req); playback.stop(req.params.id, hash); if (transcodes.has(req.params.id, hash)) transcodes.stop(req.params.id); stopStreams(s => s.id === req.params.id && s.hash === hash); return {status: 'stopped'}; });
+  app.delete<{Params: {id: string}}>('/api/v1/playback/sessions/:id', async req => { const {hash} = await auth(req); playback.stop(req.params.id, hash); if (transcodes.has(req.params.id, hash)) transcodes.stop(req.params.id); stopStreams(s => s.id === req.params.id && s.hash === hash); activity.close(req.params.id); return {status: 'stopped'}; });
+  // Ending a stream from Admin › Activity stops its delivery the way the viewer's own Stop would.
+  registerActivity(app, activity, plex, admin, {live, customTv, iptv, transcodes}, s => {
+    if (s.kind !== 'vod') { live.stop(s.id, s.hash); customTv.stop(s.id, s.hash); return; }
+    try {playback.stop(s.id, s.hash);} catch {/* already ended */}
+    if (transcodes.has(s.id, s.hash)) transcodes.stop(s.id);
+    stopStreams(x => x.id === s.id && x.hash === s.hash);
+  });
   app.get('/api/v1/admin/settings/playback', async req => { await admin(req); return {...settings.get(), activeVideoEncoders: budget.count, customBuffer: customTv.usage()}; });
   app.patch('/api/v1/admin/settings/playback', async req => {
     const {grant} = await admin(req), input = playbackSettings.extend({expectedRevision: z.number().int().nonnegative()}).strict().parse(req.body);
