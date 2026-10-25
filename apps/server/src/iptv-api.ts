@@ -6,7 +6,7 @@ import { sourceEndpoint } from './providers/source-fetch.js';
 import { AppError } from './errors.js';
 import { ChannelLogos } from './providers/channel-logos.js';
 import { LogoLibrary } from './providers/logo-library.js';
-import { sportIcon } from './providers/sport-icons.js';
+import { sportIcon, matchupLogo } from './providers/sport-icons.js';
 import type { CustomChannelStore } from './persistence/custom-channels.js';
 
 type Access=(req:FastifyRequest)=>Promise<{grant:{accountId:string}}>;
@@ -67,8 +67,8 @@ export function registerIptv(app:FastifyInstance,store:IptvStore,refresh:SourceR
   });
   app.get('/api/v1/iptv/channels',async req=>{const {grant}=await auth(req);return {channels:store.stacks(),favorites:store.favorites(grant.accountId).map(c=>c.id)};});
   app.get('/api/v1/guide',async req=>{
-    const {grant}=await auth(req),input=z.object({start:z.coerce.number().int(),end:z.coerce.number().int(),filter:z.enum(['all','iptv','custom','favorites']).default('all'),q:z.string().trim().max(120).default(''),channel:z.string().uuid().optional(),offset:z.coerce.number().int().min(0).max(1000000).default(0),limit:z.coerce.number().int().min(1).max(60).default(30)}).strict().refine(v=>v.end>v.start&&v.end-v.start<=48*3600000).parse(req.query);
-    return store.guidePage(grant.accountId,input.filter,input.start,input.end,input.offset,input.limit,input.q,input.channel,custom);
+    const {grant}=await auth(req),input=z.object({start:z.coerce.number().int(),end:z.coerce.number().int(),filter:z.union([z.enum(['all','custom','favorites']),z.string().uuid()]).default('all'),q:z.string().trim().max(120).default(''),channel:z.string().uuid().optional(),offset:z.coerce.number().int().min(0).max(1000000).default(0),limit:z.coerce.number().int().min(1).max(60).default(30),kind:z.enum(['channels','events']).optional()}).strict().refine(v=>v.end>v.start&&v.end-v.start<=48*3600000).parse(req.query);
+    return store.guidePage(grant.accountId,input.filter,input.start,input.end,input.offset,input.limit,input.q,input.channel,custom,input.kind);
   });
   // Guide routes are shared by every channel kind; custom channel IDs are answered by the custom store.
   app.get('/api/v1/iptv/channels/:id/logo',async(req,reply)=>{
@@ -84,11 +84,16 @@ export function registerIptv(app:FastifyInstance,store:IptvStore,refresh:SourceR
       return reply.type(image.type).header('Cache-Control',`private, max-age=${url||keyed?3600:600}`).send(image.bytes);
     }
     const hints=store.logo(channelParams(req.params));
+    // An event channel whose game names both teams shows the matchup, over the provider's single logo. Short-lived like the league logo.
+    const teams=store.matchupLogos(channelParams(req.params)),matchup=teams&&await Promise.all(teams.map(async u=>logos.get(u))).catch(()=>undefined);
+    if(matchup)return reply.type('image/svg+xml').header('Cache-Control','private, max-age=600').send(matchupLogo(matchup[0]!,matchup[1]!));
     // Standardized library logo first, then the playlist logo, then the guide's channel icon.
     const urls=[await library.match(hints.name,hints.tvgId).catch(()=>undefined),...hints.urls].filter((u):u is string=>!!u);
     let image:{type:string;bytes:Buffer}|undefined;
     for(const url of urls){image=await logos.get(url).catch(()=>undefined);if(image)break;}
-    // An event channel with no logo of its own shows its sport. Short-lived: the slot's next event may be another sport.
+    // An event channel with no logo of its own shows its game's league, else its sport. Short-lived: the slot's next event may be another league.
+    const league=image?undefined:store.leagueLogo(channelParams(req.params));
+    if(league)return reply.type(league.type).header('Cache-Control','private, max-age=600').send(league.bytes);
     const sport=image?undefined:store.sportFor(channelParams(req.params));
     if(sport)return reply.type('image/svg+xml').header('Cache-Control','private, max-age=600').send(sportIcon(sport));
     if(!image)throw new AppError('LOGO_UNAVAILABLE','Logo unavailable.',404);

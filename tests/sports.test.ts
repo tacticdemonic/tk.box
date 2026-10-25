@@ -8,7 +8,7 @@ import { SportsStore, type SportsSettings } from '../apps/server/src/persistence
 import { SportsSchedule } from '../apps/server/src/services/sports-schedule.js';
 import { Vault } from '../apps/server/src/security/vault.js';
 import { channelWindow, eventScore, nameTime, cleanTitle, type SportsEvent } from '../apps/server/src/services/sports-match.js';
-import { espnEvents, tsdbEvents } from '../apps/server/src/providers/sports-feeds.js';
+import { espnEvents, tsdbEvents, espnLeagueLogo, tsdbLeagueLogo } from '../apps/server/src/providers/sports-feeds.js';
 
 const HOUR = 3600_000, now = Date.parse('2026-10-18T17:30:00Z');
 // Shapes as returned by ESPN's scoreboard and TheSportsDB's free v1 API on 2026-10-18.
@@ -69,7 +69,7 @@ test('an event-driven source shows only channels whose event is on, numbers them
   iptv.ingest('owner', s.id, 0, Buffer.from('#EXTM3U\n' + names.map((n, i) => `#EXTINF:-1 tvg-id="ev${i}" group-title="Sports",${n}\nhttps://streams.invalid/${i}`).join('\n')));
   store.setPolicy('owner', s.id, { enabled: true, leadMinutes: 30 });
   store.upsert(events, now);
-  const schedule = new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: '123', zone: 'America/New_York', nameHours: 3, tickMs: 3600_000 });
+  const schedule = new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: () => '123', zone: 'America/New_York', nameHours: 3, tickMs: 3600_000 });
   schedule.match(now); schedule.close();
   const byName = new Map(iptv.adminChannels(s.id).map(c => [c.name, c]));
   assert.deepEqual(names.map(n => byName.get(n)!.number !== null), [true, false, false, false, false], 'only the live game is numbered; later events wait until starting soon');
@@ -95,7 +95,7 @@ test('viewer visibility and checks follow the window in real time', () => {
   store.setPolicy('owner', s.id, { enabled: true, leadMinutes: 30 });
   const shift = (e: SportsEvent, start: number): SportsEvent => ({ ...e, start, end: start + 3 * HOUR, state: 'pre' });
   store.upsert([shift(nfl[0]!, t - HOUR), shift(nfl[1]!, t + 5 * HOUR)], t);
-  new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 }).match(t);
+  new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: () => '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 }).match(t);
   const stacks = iptv.stacks();
   assert.deepEqual(stacks.map(c => c.name), ['Texans vs Jaguars'], 'the later game stays hidden until 30 minutes before');
   const program = iptv.guidePage('owner', 'all', t - HOUR, t + HOUR, 0, 10).channels[0]!.programs.find(p => p.program)!.program!;
@@ -147,7 +147,7 @@ test('feeds of one event combine into one selectable row, with or without a sche
   iptv.ingest('owner', s.id, 0, Buffer.from('#EXTM3U\n' + names.map((n, i) => `#EXTINF:-1 tvg-id="f${i}",${n}\nhttps://streams.invalid/${i}`).join('\n')));
   store.setPolicy('owner', s.id, { enabled: true, leadMinutes: 30 });
   store.upsert([{ ...nfl[0]!, start: t - HOUR, end: t + 2 * HOUR }], t);
-  new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 }).match(t);
+  new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: () => '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 }).match(t);
   const rows = iptv.stacks().map(r => ({ name: r.name, feeds: r.feeds.map(f => f.name).sort() }));
   assert.equal(rows.length, 3, 'one row per event');
   assert.deepEqual(rows.map(r => r.feeds.length).sort(), [1, 2, 3]);
@@ -163,6 +163,31 @@ test('feeds of one event combine into one selectable row, with or without a sche
   assert.equal(guide.programs.find(p => p.program)?.program?.title, 'Houston Texans at Jacksonville Jaguars');
 });
 
+test('a watched event stays on, with every feed of its event, until 15 minutes after its last viewer', () => {
+  const db = openDatabase(':memory:'), iptv = new IptvStore(db, new Vault(randomBytes(32))), store = new SportsStore(db, id => iptv.relist(id)), health = new HealthStore(db), t = Date.now();
+  const s = iptv.create('owner', { kind: 'm3u', name: 'Sports' });
+  const names = ['NFL 02: Jaguars vs Texans', 'NFL | 02 Texans at Jaguars', 'NFL 02: Houston Texans @ Jacksonville Jaguars | Away Stream'];
+  iptv.ingest('owner', s.id, 0, Buffer.from('#EXTM3U\n' + names.map((n, i) => `#EXTINF:-1 tvg-id="f${i}",${n}\nhttps://streams.invalid/${i}`).join('\n')));
+  store.setPolicy('owner', s.id, { enabled: true, leadMinutes: 30 });
+  store.upsert([{ ...nfl[0]!, start: t - HOUR, end: t + 2 * HOUR }], t);
+  new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: () => '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 }).match(t);
+  const [feed] = iptv.stacks()[0]!.feeds, scheduled = store.window(feed!.id)!.visible_until;
+  // While the event is scheduled, a hold never shortens its window.
+  store.hold(feed!.id, t);
+  assert.equal(store.window(feed!.id)!.visible_until, scheduled);
+  // The schedule no longer matches the event (it ran past its listing), but the viewer's feed and its siblings stay on.
+  store.replaceWindows(s.id, 30, new Map(), t); iptv.syncNumbers(s.id, t);
+  const rows = iptv.stacks();
+  assert.equal(rows.length, 1, 'the feeds still share one row');
+  assert.equal(rows[0]!.feeds.length, 3);
+  assert.ok(rows[0]!.feeds.every(f => store.window(f.id)!.visible_until === t + 15 * 60_000));
+  assert.equal(iptv.tune(feed!.id).id, feed!.id);
+  // 15 minutes after the last viewer, the hold ends and the channels are removed as usual.
+  store.replaceWindows(s.id, 30, new Map(), t + 15 * 60_000); iptv.syncNumbers(s.id, t + 15 * 60_000);
+  assert.equal(store.windows(s.id).size, 0);
+  assert.equal(iptv.stacks().length, 0);
+});
+
 test('the guide leads into an event with "starting soon" and is blank after it, for event matches only', () => {
   const db = openDatabase(':memory:'), iptv = new IptvStore(db, new Vault(randomBytes(32))), store = new SportsStore(db, id => iptv.relist(id)), health = new HealthStore(db), t = Date.now();
   db.prepare('INSERT INTO users VALUES(?,1)').run('viewer');
@@ -171,7 +196,7 @@ test('the guide leads into an event with "starting soon" and is blank after it, 
   store.setPolicy('owner', s.id, { enabled: true, leadMinutes: 30 });
   const kickoff = t + 10 * 60_000;
   store.upsert([{ ...nfl[0]!, start: kickoff, end: kickoff + 3 * HOUR, state: 'pre' }], t);
-  new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 }).match(t);
+  new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: () => '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 }).match(t);
   const rows = iptv.guidePage('viewer', 'all', t - HOUR, t + 5 * HOUR, 0, 10).channels[0]!.programs;
   const lead = rows.find(r => r.program?.status === 'starting_soon')!;
   assert.deepEqual([lead.start, lead.end, lead.program!.title, lead.program!.subtitle], [kickoff - 30 * 60_000, kickoff, 'Houston Texans at Jacksonville Jaguars', 'Starting soon']);
@@ -192,7 +217,7 @@ test('a sports source is checked and numbered only while live or starting soon, 
   assert.equal(health.queueSource(s.id, t), 0, 'checking "all" checks only live and starting-soon channels');
   const shift = (e: SportsEvent, start: number): SportsEvent => ({ ...e, start, end: start + 3 * HOUR, state: 'pre' });
   store.upsert([shift(nfl[0]!, t - HOUR), shift(nfl[1]!, t + 20 * 60_000)], t);
-  const schedule = new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 });
+  const schedule = new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: () => '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 });
   schedule.match(t);
   const ids = new Map(iptv.adminChannels(s.id).map(c => [c.name, c.id]));
   const approved = () => iptv.adminChannels(s.id).filter(c => c.number !== null).map(c => c.name).sort();
@@ -254,7 +279,7 @@ test('event channels without a logo get an icon for their sport', async () => {
   iptv.ingest('owner', s.id, 0, Buffer.from('#EXTM3U\n#EXTINF:-1 tvg-id="a",NFL 02: Texans vs Jaguars\nhttps://streams.invalid/a'));
   store.setPolicy('owner', s.id, { enabled: true, leadMinutes: 30 });
   store.upsert([{ ...nfl[0]!, start: t - HOUR, end: t + 2 * HOUR }], t);
-  new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 }).match(t);
+  new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: () => '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 }).match(t);
   assert.equal(iptv.sportFor(iptv.stacks()[0]!.id), 'football');
 });
 
@@ -270,7 +295,7 @@ function liveSports() {
   iptv.ingest('owner', s.id, 0, playlist());
   store.setPolicy('owner', s.id, { enabled: true, leadMinutes: 30 });
   store.upsert([live(nfl[0]!), live(ufc[0]!), ...epl], t);
-  const schedule = new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 });
+  const schedule = new SportsSchedule(iptv, store, health, () => {}, { espn: [], tsdb: [], tsdbKey: () => '123', zone: 'UTC', nameHours: 3, tickMs: 3600_000 });
   schedule.close();
   const save = (patch: Partial<SportsSettings>) => { const { revision, ...current } = store.settings(); store.setSettings('owner', revision, { ...current, ...patch }); schedule.match(t); };
   return { iptv, store, save, source: s.id, playlist };
@@ -305,4 +330,31 @@ test('live sports: event rows follow sport and league priority, sit above or bel
   save({ numberStart: 700 });
   assert.equal(iptv.renumberEvents(), 4);
   assert.deepEqual(iptv.stacks().map(c => c.number), [1, 700, 701, 702, 703], 'a new block renumbers live event channels in guide order');
+});
+
+test('league logos prefer the dark version and are downloaded again when their address changes', () => {
+  assert.equal(espnLeagueLogo({ leagues: [{ logos: [{ href: 'https://a.espncdn.com/i/teamlogos/leagues/500/nfl.png', rel: ['full', 'default'] }, { href: 'https://a.espncdn.com/i/teamlogos/leagues/500-dark/nfl.png', rel: ['full', 'dark'] }] }] }), 'https://a.espncdn.com/i/teamlogos/leagues/500-dark/nfl.png');
+  assert.equal(espnLeagueLogo({ leagues: [{ logos: [{ href: 'http://insecure/nfl.png' }] }] }), undefined);
+  assert.equal(tsdbLeagueLogo({ leagues: [{ strBadge: null, strLogo: 'https://r2.thesportsdb.com/images/media/league/logo/wwe.png' }] }), 'https://r2.thesportsdb.com/images/media/league/logo/wwe.png');
+  const store = new SportsStore(openDatabase(':memory:')), image = { type: 'image/png', bytes: Buffer.from('png') };
+  store.setLogoUrl('football/nfl', 'https://a/1.png');
+  assert.deepEqual(store.logosMissing(), [{ key: 'football/nfl', url: 'https://a/1.png' }]);
+  store.saveLogo('football/nfl', 'https://a/1.png', image);
+  store.setLogoUrl('football/nfl', 'https://a/1.png');
+  assert.deepEqual(store.logosMissing(), []);
+  store.setLogoUrl('football/nfl', 'https://a/2.png');
+  assert.deepEqual(store.logosMissing(), [{ key: 'football/nfl', url: 'https://a/2.png' }]);
+});
+
+test('matchup logos follow the title: away then home on ESPN, home then away on TheSportsDB', () => {
+  const [game] = espnEvents('football/nfl', { events: [{ id: '1', name: 'Houston Texans at Jacksonville Jaguars', date: '2026-10-18T17:00Z', competitions: [{ competitors: [
+    { homeAway: 'home', team: { displayName: 'Jacksonville Jaguars', logo: 'https://a.espncdn.com/jax.png' } },
+    { homeAway: 'away', team: { displayName: 'Houston Texans', logo: 'https://a.espncdn.com/hou.png' } }] }] }] });
+  assert.deepEqual(game!.logos, ['https://a.espncdn.com/hou.png', 'https://a.espncdn.com/jax.png']);
+  const [missing] = espnEvents('football/nfl', { events: [{ id: '2', name: 'A at B', date: '2026-10-18T17:00Z', competitions: [{ competitors: [
+    { homeAway: 'home', team: { displayName: 'Bees', logo: 'https://a.espncdn.com/b.png' } }, { homeAway: 'away', team: { displayName: 'Aces' } }] }] }] });
+  assert.deepEqual(missing!.logos, []);
+  const [match] = tsdbEvents({ events: [{ idEvent: '3', strEvent: 'Arsenal vs Chelsea', strSport: 'Soccer', strLeague: 'EPL', strTimestamp: '2026-10-18T15:00:00', strHomeTeam: 'Arsenal', strAwayTeam: 'Chelsea',
+    strHomeTeamBadge: 'https://r2.thesportsdb.com/ars.png', strAwayTeamBadge: 'https://r2.thesportsdb.com/che.png' }] });
+  assert.deepEqual(match!.logos, ['https://r2.thesportsdb.com/ars.png', 'https://r2.thesportsdb.com/che.png']);
 });

@@ -149,6 +149,43 @@ export function openDatabase(path: string) {
       db.exec('ALTER TABLE custom_channels ADD COLUMN plex_logo TEXT');
       db.prepare('INSERT INTO migrations VALUES(15)').run();
     }
+    // League logos, kept on the server so event channels show them without reaching ESPN or TheSportsDB.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=16').get()) {
+      db.exec('CREATE TABLE sports_league_logos(league_key TEXT PRIMARY KEY, url TEXT, type TEXT, bytes BLOB, checked_at INTEGER NOT NULL)');
+      db.prepare('INSERT INTO migrations VALUES(16)').run();
+    }
+    // Artwork (Admin › Artwork): the engine's settings and layouts, which tk.box writes out as its config for each run,
+    // and the history of its jobs. Provider keys inside the settings are sealed.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=17').get()) {
+      db.exec(`CREATE TABLE artwork_settings(id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, value TEXT NOT NULL);
+        CREATE TABLE artwork_layouts(name TEXT PRIMARY KEY, revision INTEGER NOT NULL, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+        CREATE TABLE artwork_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, args TEXT NOT NULL, actor TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed','canceled')), created_at INTEGER NOT NULL,
+          started_at INTEGER, finished_at INTEGER, exit_code INTEGER, output TEXT NOT NULL DEFAULT '');`);
+      db.prepare('INSERT INTO migrations VALUES(17)').run();
+    }
+    // Artwork collections (custom and seasonal definitions, franchise sync and Radarr), and small values the artwork
+    // schedules keep between runs (last runs, the newly-added watermark).
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=18').get()) {
+      db.exec(`CREATE TABLE artwork_collections(id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, value TEXT NOT NULL);
+        CREATE TABLE artwork_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
+      db.prepare('INSERT INTO migrations VALUES(18)').run();
+    }
+    // Both teams' logo addresses per event (JSON), for an event channel's matchup logo.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=19').get()) {
+      db.exec('ALTER TABLE sports_events ADD COLUMN logos TEXT');
+      db.prepare('INSERT INTO migrations VALUES(19)').run();
+    }
+    // Streams reach public addresses only, unless an administrator allows a source's local-network streams.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=20').get()) {
+      db.exec('ALTER TABLE iptv_sources ADD COLUMN allow_private_streams INTEGER NOT NULL DEFAULT 0');
+      db.prepare('INSERT INTO migrations VALUES(20)').run();
+    }
+    // Event channels being watched past their window, and until when they stay on (SportsStore.hold).
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=21').get()) {
+      db.exec('CREATE TABLE sports_holds(channel_id TEXT PRIMARY KEY, until INTEGER NOT NULL)');
+      db.prepare('INSERT INTO migrations VALUES(21)').run();
+    }
   })();
   return db;
 }
