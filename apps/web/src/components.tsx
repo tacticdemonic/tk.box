@@ -25,13 +25,37 @@ const paths:Record<string,ReactNode>={
   up:<path d="m6 15 6-6 6 6" strokeWidth="2.4"/>,down:<path d="m6 9 6 6 6-6" strokeWidth="2.4"/>,
   grip:<>{[9,15].flatMap(x=>[5,12,19].map(y=><circle key={`${x}-${y}`} cx={x} cy={y} r="1.6" fill="currentColor" stroke="none"/>))}</>,
   restart:<><path d="M4 12a8 8 0 1 0 2.3-5.7L4 8.5"/><path d="M4 3.5v5h5"/></>,plus:<path d="M12 5v14M5 12h14"/>,
+  'skip-back':<><path d="M18 5.5v13a.8.8 0 0 1-1.2.7L7.5 12.7a.8.8 0 0 1 0-1.4l9.3-6.5a.8.8 0 0 1 1.2.7z" fill="currentColor" stroke="none"/><path d="M5.5 5v14" strokeWidth="2.2"/></>,
+  'skip-next':<><path d="M6 5.5v13a.8.8 0 0 0 1.2.7l9.3-6.5a.8.8 0 0 0 0-1.4L7.2 4.8A.8.8 0 0 0 6 5.5z" fill="currentColor" stroke="none"/><path d="M18.5 5v14" strokeWidth="2.2"/></>,
+  queue:<path d="M3 6h13M3 12h13M3 18h8m4-2.5v5l4.5-2.5z"/>,
   collection:<><rect x="3" y="8" width="14" height="13" rx="2"/><path d="M7 4h12a2 2 0 0 1 2 2v11"/></>,tag:<><path d="M3 12V4h8l10 10-8 8z"/><circle cx="7.5" cy="8.5" r="1.3"/></>,unwatched:<><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></>,
+  explore:<><circle cx="12" cy="12" r="9.5"/><path d="m15.5 8.5-2 5-5 2 2-5z"/></>,trending:<path d="m3 17 6-6 4 4 8-8m-5 0h5v5"/>,
+  clock:<><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></>,
+  shield:<path d="M12 3 4.5 6v5.5c0 4.6 3.2 8.4 7.5 9.5 4.3-1.1 7.5-4.9 7.5-9.5V6z"/>,
+  image:<><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.8"/><path d="m21 16-5-5-9 9"/></>,
+  calendar:<><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4m8-4v4"/></>,
+  upload:<path d="M12 15V4m-4 4 4-4 4 4M5 15v4h14v-4"/>,download:<path d="M12 4v11m-4-4 4 4 4-4M5 15v4h14v-4"/>,
+  trash:<path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7V4h6v3"/>,
+  key:<><circle cx="8" cy="15" r="4.5"/><path d="m11.2 11.8 8.8-8.8m-3.5 3.5 2.5 2.5m-5-0.5 2 2"/></>,
+  eye:<><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/></>,
+  'eye-off':<><path d="M10.6 5.6A9.6 9.6 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a17 17 0 0 1-2.6 3.4M6.6 6.6C3.9 8.3 2.5 12 2.5 12S6 18.5 12 18.5a9 9 0 0 0 4.9-1.4"/><path d="m3 3 18 18M9.9 9.9a3 3 0 0 0 4.2 4.2"/></>,
+  text:<path d="M5 6V4h14v2M12 4v16m-3 0h6"/>,frame:<><rect x="3" y="3" width="18" height="18" rx="3"/><rect x="7" y="7" width="10" height="10" rx="1"/></>,
+  matte:<><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 15h18M3 18.5h18"/></>,flag:<path d="M5 21V4m0 0h12l-2.5 4.5L17 13H5"/>,
+  sparkle:<path d="M12 3c.8 4.6 2.4 6.2 7 7-4.6.8-6.2 2.4-7 7-.8-4.6-2.4-6.2-7-7 4.6-.8 6.2-2.4 7-7zM19 16c.3 1.6.9 2.2 2.5 2.5-1.6.3-2.2.9-2.5 2.5-.3-1.6-.9-2.2-2.5-2.5 1.6-.3 2.2-.9 2.5-2.5z"/>,
+  logo:<><path d="M4 16 8 6l4 10m-6.5-3.5h5"/><path d="M14 6h3.5a2.5 2.5 0 0 1 0 5H14zm0 5h4a2.5 2.5 0 0 1 0 5h-4z"/></>,
+  hd:<><rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="M7 9v6m0-3h4m0-3v6m3-6v6h1.5a3 3 0 0 0 0-6z"/></>,
 };
-paths.settings=paths.gear;
+paths.settings=<><path d="M4 7h8.5M17.5 7H20M4 17h2.5M11.5 17H20"/><circle cx="15" cy="7" r="2.5"/><circle cx="9" cy="17" r="2.5"/></>;
 export function Icon({name,size=20}:{name:string;size?:number}) {
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]??paths.movies}</svg>;
 }
 export function ErrorNotice({message,retry,dismiss}:{message:string;retry?:()=>void;dismiss?:()=>void}) {return <div className="notice error" role="alert"><span>{message}</span>{retry&&<button onClick={retry}>Try again</button>}{dismiss&&<button className="icon-button" aria-label="Dismiss error" onClick={dismiss}><Icon name="close" size={16}/></button>}</div>;}
+// Cast and crew names, each opening the person's IMDb page. The server looks them up when clicked, in the title's
+// credits when its TMDB id is known.
+export function People({names,kind,tmdb}:{names:string[];kind?:'movie'|'show';tmdb?:number}) {
+  const href=(name:string)=>`/api/v1/explore/person?${new URLSearchParams({name,...(kind&&tmdb?{kind,tmdb:String(tmdb)}:{})})}`;
+  return <>{names.map((name,i)=><span key={name}>{i>0&&', '}<a className="person-link" href={href(name)} target="_blank" rel="noreferrer">{name}</a></span>)}</>;
+}
 export function Empty({title,children}:{title:string;children?:ReactNode}) {return <div className="empty"><h3>{title}</h3>{children&&<p>{children}</p>}</div>;}
 export function Loading({cards=false}:{cards?:boolean}) {return cards?<div className="poster-grid" aria-label="Loading titles" role="status">{Array.from({length:8},(_,i)=><div key={i} className="skeleton poster-skeleton"/>)}</div>:<div className="loading" role="status"><span className="spinner"/><span className="sr-only">Loading…</span></div>;}
 export const subtitle=(item:CatalogItem)=>item.type==='episode'?`${item.showTitle??''} · S${item.seasonNumber??'?'}:E${item.episodeNumber??'?'}`:item.type==='season'?`${item.episodeCount??'—'} episodes`:item.seasonCount?`${item.seasonCount} seasons · ${item.episodeCount??'—'} episodes`:String(item.year??(item.type==='show'?'TV series':'Movie'));
@@ -43,9 +67,12 @@ function LoadedImage({className='',onLoad,...props}:ImgHTMLAttributes<HTMLImageE
   useLayoutEffect(()=>{if(ref.current?.complete&&ref.current.naturalWidth>0)setLoaded(true);},[]);
   return <img {...props} ref={ref} className={`art-image${loaded?' art-image-loaded':''}${className?` ${className}`:''}`} onLoad={event=>{setLoaded(true);onLoad?.(event);}}/>;
 }
-export const Artwork=({src,alt='',fallback,className}:{src?:string;alt?:string;fallback:ReactNode;className?:string})=>{
-  const [failed,setFailed]=useState(false);
-  return src&&!failed?<FadeImage className={className} src={src} onError={()=>setFailed(true)} loading="lazy" decoding="async" alt={alt}/>:<span className="art-fallback">{fallback}</span>;
+// `hidpi` offers tk.box's double-size poster to high-density screens (cards are at most about 220px wide);
+// `priority` loads above-the-fold art first instead of lazily.
+const doubled=(src:string)=>src.startsWith('/api/v1/catalog/')?`${src}${src.includes('?')?'&':'?'}scale=2`:undefined;
+export const Artwork=({src,alt='',fallback,className,hidpi=false,priority=false}:{src?:string;alt?:string;fallback:ReactNode;className?:string;hidpi?:boolean;priority?:boolean})=>{
+  const [failed,setFailed]=useState(false),large=hidpi&&src?doubled(src):undefined;
+  return src&&!failed?<FadeImage className={className} src={src} {...large?{srcSet:`${src} 360w, ${large} 720w`,sizes:'220px'}:{}} onError={()=>setFailed(true)} loading={priority?'eager':'lazy'} fetchPriority={priority?'high':'auto'} decoding="async" alt={alt}/>:<span className="art-fallback">{fallback}</span>;
 };
 const Progress=({item}:{item:CatalogItem})=>item.viewOffsetMs>0&&item.durationMs?<span className="card-progress"><span style={{width:`${Math.min(100,item.viewOffsetMs/item.durationMs*100)}%`}}/></span>:null;
 // Card text is split into separate links so the show, season and episode each open on their own.
@@ -68,12 +95,23 @@ function CardText({item,onOpen,detail,titleClass,metaClass}:{item:CatalogItem;on
 export type PlayFn=(item:CatalogItem,from?:'resume'|'beginning')=>void;
 // Where a menu opens decides its entries: Continue Watching can remove a title, details already show Play.
 export type MenuContext='card'|'continue'|'upnext'|'detail'|'episode';
-type MenuEntry={label:string;icon:string;run:()=>void};
+export type MenuEntry={label:string;icon:string;run:()=>void};
 type MenuPosition={x:number;y:number;flipY:number;alignRight:boolean};
+// Admins edit artwork from any title's menu; main.tsx registers the editor once it knows the viewer is one.
+let artworkEditor:((ratingKey:string)=>void)|undefined;
+export const setArtworkEditor=(open?:(ratingKey:string)=>void)=>{artworkEditor=open;};
+export const editArtwork=(ratingKey:string)=>artworkEditor?.(ratingKey);
+export const artworkEntry=(ratingKey?:string):MenuEntry[]=>artworkEditor&&ratingKey?[{label:'Edit artwork',icon:'image',run:()=>editArtwork(ratingKey)}]:[];
+// Admins keep a Leaving Soon title longer from its menu; main.tsx registers the lookup (cleanup-holds.ts).
+let holdMenu:((item:CatalogItem)=>MenuEntry[])|undefined;
+export const setHoldMenu=(entries?:(item:CatalogItem)=>MenuEntry[])=>{holdMenu=entries;};
+// Artwork is kept per movie, show or collection; seasons and episodes edit their show's.
+export const artworkKey=(item:CatalogItem)=>item.type==='episode'?item.showId:item.type==='season'?item.showId??item.parentId:item.id;
 function menuGroups(item:CatalogItem,context:MenuContext,onOpen:(id:string)=>void,onPlay?:PlayFn):MenuEntry[][] {
   const playable=item.type==='movie'||item.type==='episode',resumable=playable&&item.viewOffsetMs>0,play:MenuEntry[]=[],state:MenuEntry[]=[],go:MenuEntry[]=[];
-  if(onPlay&&context!=='detail'){play.push({label:resumable?'Resume':'Play',icon:'play',run:()=>onPlay(item)});if(resumable)play.push({label:'Play from beginning',icon:'restart',run:()=>onPlay(item,'beginning')});}
-  if(!fullyWatched(item))state.push({label:'Mark as watched',icon:'check',run:()=>void updateWatchState(item,'watched')});
+  if(onPlay&&context!=='detail'){play.push({label:resumable?'Resume':'Play',icon:'play',run:()=>onPlay(item,resumable?'resume':undefined)});if(resumable)play.push({label:'Play from beginning',icon:'restart',run:()=>onPlay(item,'beginning')});}
+  // A rewatch still counts as watched in Plex, but its resume point can be finished off.
+  if(!fullyWatched(item)||resumable)state.push({label:'Mark as watched',icon:'check',run:()=>void updateWatchState(item,'watched')});
   if(partlyWatched(item))state.push({label:'Mark as unwatched',icon:'unwatched',run:()=>void updateWatchState(item,'unwatched')});
   if(playable&&(context==='continue'||(context==='detail'&&resumable)))state.push({label:'Remove from Continue Watching',icon:'close',run:()=>void updateWatchState(item,'removeContinue')});
   if(playable&&context==='upnext')state.push({label:'Remove from Recommended For You',icon:'close',run:()=>void updateWatchState(item,'removeContinue')});
@@ -81,7 +119,7 @@ function menuGroups(item:CatalogItem,context:MenuContext,onOpen:(id:string)=>voi
   if(show)go.push({label:'Go to show',icon:'shows',run:()=>onOpen(show)});
   if(item.type==='episode'&&item.parentId)go.push({label:'Go to season',icon:'list',run:()=>onOpen(item.parentId!)});
   if(context!=='detail')go.push({label:'More info',icon:'info',run:()=>onOpen(item.id)});
-  return [play,state,go].filter(group=>group.length);
+  return [play,state,go,holdMenu?.(item)??[],context==='detail'?[]:artworkEntry(artworkKey(item))].filter(group=>group.length);
 }
 // Rendered in the top layer (Popover API), so scrolling rows and dialogs never clip it.
 function MediaMenu({title,groups,at,onClose}:{title:string;groups:MenuEntry[][];at:MenuPosition;onClose:(restoreFocus:boolean)=>void}) {
@@ -111,18 +149,23 @@ function MediaMenu({title,groups,at,onClose}:{title:string;groups:MenuEntry[][];
 }
 // The "⋯" button and right-click (or the keyboard context-menu key) open the same menu.
 export function useMediaMenu(item:CatalogItem,context:MenuContext,onOpen:(id:string)=>void,onPlay?:PlayFn,buttonClass='card-more') {
+  const title=item.type==='episode'?`${item.showTitle??''} S${item.seasonNumber??'?'}:E${item.episodeNumber??'?'} ${item.title}`.trim():item.title;
+  return useMenu(title,()=>menuGroups(item,context,onOpen,onPlay),buttonClass);
+}
+// Groups are built when the menu opens. Without a "⋯" button the keyboard menu key opens it at the element.
+export function useMenu(title:string,groups:()=>MenuEntry[][],buttonClass='card-more') {
   const [at,setAt]=useState<MenuPosition>(),returnTo=useRef<HTMLElement|null>(null),closedAt=useRef(0),button=useRef<HTMLButtonElement>(null);
   const open=(position:MenuPosition)=>{returnTo.current=document.activeElement as HTMLElement|null;setAt(position);};
   const fromElement=(element:HTMLElement)=>{const r=element.getBoundingClientRect();open({x:r.right,y:r.bottom+4,flipY:r.top-4,alignRight:true});};
   const onContextMenu=(event:MouseEvent)=>{
     event.preventDefault();
     if(event.clientX||event.clientY)open({x:event.clientX,y:event.clientY,flipY:event.clientY,alignRight:false});
-    else if(button.current)fromElement(button.current);
+    else fromElement(button.current??event.currentTarget as HTMLElement);
   };
-  const title=item.type==='episode'?`${item.showTitle??''} S${item.seasonNumber??'?'}:E${item.episodeNumber??'?'} ${item.title}`.trim():item.title,card=buttonClass==='card-more';
+  const card=buttonClass==='card-more';
   // A click on the button that light-dismissed the open menu must not reopen it.
   const trigger=<button ref={button} type="button" className={buttonClass} tabIndex={card?-1:undefined} aria-label={`More options for ${title}`} aria-haspopup="menu" aria-expanded={!!at} onClick={e=>{if(!at&&Date.now()-closedAt.current>200)fromElement(e.currentTarget);}}><Icon name="more" size={card?18:22}/></button>;
-  const menu=at&&<MediaMenu title={`Options for ${title}`} groups={menuGroups(item,context,onOpen,onPlay)} at={at} onClose={restore=>{closedAt.current=Date.now();setAt(undefined);if(restore)returnTo.current?.focus({preventScroll:true});}}/>;
+  const menu=at&&<MediaMenu title={`Options for ${title}`} groups={groups()} at={at} onClose={restore=>{closedAt.current=Date.now();setAt(undefined);if(restore)returnTo.current?.focus({preventScroll:true});}}/>;
   return {trigger,menu,onContextMenu,open:!!at};
 }
 // Memoized: virtualized grids re-render rows while scrolling, but card props rarely change.
@@ -130,22 +173,25 @@ export function useMediaMenu(item:CatalogItem,context:MenuContext,onOpen:(id:str
 // The centered play button sits beside (not inside) the art button, so clicking the rest of the art still opens details.
 const PlayOverlay=({item,onPlay}:{item:CatalogItem;onPlay?:PlayFn})=>
   onPlay?<button className="card-play" tabIndex={-1} aria-label={`Play ${item.title}`} onClick={()=>onPlay(item)}><Icon name="play" size={22}/></button>:null;
-export const Poster=memo(function Poster({item:source,onOpen,onPlay}:{item:CatalogItem;onOpen:(id:string)=>void;onPlay?:PlayFn}) {
+// `compact` is the list layout's small thumbnail, which never needs the double-size poster.
+export const Poster=memo(function Poster({item:source,onOpen,onPlay,compact=false}:{item:CatalogItem;onOpen:(id:string)=>void;onPlay?:PlayFn;compact?:boolean}) {
   const item=useWithOverride(source),title=seriesTitle(item),actions=useMediaMenu(item,'card',onOpen,onPlay);
   const detail=item.type==='episode'?`S${item.seasonNumber??'?'}:E${item.episodeNumber??'?'} · ${item.title}`:item.type==='season'&&item.showTitle?`${item.title} · ${item.episodeCount??'—'} episodes`:subtitle(item);
   return <div className={`poster-card${actions.open?' menu-open':''}`} onContextMenu={actions.onContextMenu}>
-    <div className="card-frame"><button className="poster-art" onClick={()=>onOpen(item.id)} aria-label={`${title}, ${detail}`}><Artwork src={item.showPosterUrl??item.posterUrl} fallback={<><Icon name={item.type==='movie'?'movies':'shows'}/><span>{title}</span></>}/>{fullyWatched(item)&&<span className="watched-badge" title="Watched"><Icon name="check" size={12}/></span>}<Progress item={item}/></button><PlayOverlay item={item} onPlay={onPlay}/>{actions.trigger}</div>
+    <div className="card-frame"><button className="poster-art" onClick={()=>onOpen(item.id)} aria-label={`${title}, ${detail}`}><Artwork hidpi={!compact} src={item.showPosterUrl??item.posterUrl} fallback={<><Icon name={item.type==='movie'?'movies':'shows'}/><span>{title}</span></>}/>{fullyWatched(item)&&<span className="watched-badge" title="Watched"><Icon name="check" size={12}/></span>}<Progress item={item}/></button><PlayOverlay item={item} onPlay={onPlay}/>{actions.trigger}</div>
     <CardText item={item} onOpen={onOpen} detail={detail} titleClass="poster-title" metaClass="poster-meta"/>
     {actions.menu}
   </div>;
 });
 // Landscape card used by Continue Watching and Recommended: backdrop art, progress and time remaining.
-export const WideCard=memo(function WideCard({item:source,context='continue',onOpen,onPlay}:{item:CatalogItem;context?:'continue'|'upnext';onOpen:(id:string)=>void;onPlay?:PlayFn}) {
+export const WideCard=memo(function WideCard({item:source,context='continue',onOpen,onPlay,priority=false}:{item:CatalogItem;context?:'continue'|'upnext';onOpen:(id:string)=>void;onPlay?:PlayFn;priority?:boolean}) {
   const item=useWithOverride(source),actions=useMediaMenu(item,context,onOpen,onPlay);
   const left=item.durationMs&&item.viewOffsetMs?item.durationMs-item.viewOffsetMs:undefined;
   return <div className={`wide-card${actions.open?' menu-open':''}`} onContextMenu={actions.onContextMenu}>
     <div className="card-frame"><button className="wide-art" onClick={()=>onOpen(item.id)} aria-label={`Open ${item.title}`}>
-      <Artwork src={item.type==='episode'?item.posterUrl??item.backdropUrl:item.backdropUrl??item.posterUrl} fallback={<Icon name={item.type==='movie'?'movies':'shows'}/>}/>
+      <Artwork priority={priority} src={item.type==='episode'?item.posterUrl??item.backdropUrl:item.backdropUrl??item.posterUrl} fallback={<Icon name={item.type==='movie'?'movies':'shows'}/>}/>
+      {/* Movie backdrops are usually textless, so the clearLogo names the title; a missing one just hides. */}
+      {item.type==='movie'&&item.backdropUrl&&item.logoUrl&&<img className="wide-logo" src={item.logoUrl} alt="" loading="lazy" decoding="async" onError={e=>{e.currentTarget.hidden=true;}}/>}
       <Progress item={item}/>
     </button><PlayOverlay item={item} onPlay={onPlay}/>{actions.trigger}</div>
     <div className="wide-info"><CardText item={item} onOpen={onOpen} detail={left?`${duration(left)} left`:subtitle(item)} titleClass="wide-title" metaClass="wide-meta"/></div>
@@ -162,9 +208,9 @@ export function ActionNotice() {
 export function Row({title,href,children,className='',drift=0}:{title:ReactNode;href?:string;children:ReactNode;className?:string;drift?:number}) {
   const ref=useRef<HTMLDivElement>(null),track=useRef<HTMLDivElement>(null),[edges,setEdges]=useState({start:true,end:false}),[loops,setLoops]=useState(false);
   // Only re-renders when an edge changes.
-  const update=()=>{const el=ref.current;if(!el)return;const start=el.scrollLeft<8,end=el.scrollLeft+el.clientWidth>=el.scrollWidth-8;setEdges(e=>e.start===start&&e.end===end?e:{start,end});};
+  const update=()=>{const el=ref.current;if(!el)return;const start=el.scrollLeft<8,end=el.scrollLeft+el.clientWidth>=el.scrollWidth-8;atStart.current=start;setEdges(e=>e.start===start&&e.end===end?e:{start,end});};
   useEffect(()=>{update();const el=ref.current;if(!el)return;const resize=new ResizeObserver(update);resize.observe(el);return()=>resize.disconnect();},[]);
-  const looping=drift>0&&loops,endless=useEndless(ref,track,looping,drift);
+  const looping=drift>0&&loops,endless=useEndless(ref,track,looping,drift),atStart=useBump(ref,track,!looping,children);
   // Loop only when the cards overflow; a short row stays still and is not repeated.
   useEffect(()=>{
     if(!drift){setLoops(false);return;}const el=ref.current;if(!el)return;
@@ -172,25 +218,90 @@ export function Row({title,href,children,className='',drift=0}:{title:ReactNode;
     const check=()=>{const style=getComputedStyle(el),pad=parseFloat(style.paddingLeft)+parseFloat(style.paddingRight),gap=parseFloat(style.columnGap)||0;setLoops((endless.copies()?endless.setWidth():el.scrollWidth-pad+gap)>el.clientWidth);};
     check();const resize=new ResizeObserver(check);resize.observe(el);return()=>resize.disconnect();
   });
-  const scroll=(direction:number)=>ref.current?.scrollBy({left:direction*ref.current.clientWidth*.85,behavior:'smooth'});
+  const glide=useGlide(ref,track);
+  const scroll=(direction:number)=>{const el=ref.current;if(el)glide(direction*el.clientWidth*.85,looping);};
   return <section className={`row ${className}`}>
     <div className="row-heading"><h2>{href?<a href={href}>{title}<span className="row-more">See all <Icon name="next" size={14}/></span></a>:title}</h2></div>
     <div className="row-viewport" {...endless.handlers}>
       {(looping||!edges.start)&&<button className="row-arrow left" tabIndex={-1} aria-hidden="true" onClick={()=>scroll(-1)}><Icon name="back" size={28}/></button>}
-      <div className={`row-scroll ${looping?'row-endless':''}`} ref={ref} onScroll={update}>{looping?<div className="row-track" ref={track}>
+      <div className={`row-scroll ${looping?'row-endless':''}`} ref={ref} onScroll={update}><div className="row-track" ref={track}>
         {/* Identical sets: the view rests in the second and jumps back by one set width, which looks seamless. The drift can
-            carry it up to one more set past wherever it rests, so two copies follow. */}
-        <div className="row-set" inert aria-hidden="true">{children}</div><div className="row-set">{children}</div><div className="row-set" inert aria-hidden="true">{children}</div><div className="row-set" inert aria-hidden="true">{children}</div>
-      </div>:children}</div>
+            carry it up to one more set past wherever it rests (one back when reversed), so two copies follow. */}
+        {looping?<><RowCopy>{children}</RowCopy><div className="row-set">{children}</div><RowCopy>{children}</RowCopy><RowCopy>{children}</RowCopy></>:children}
+      </div></div>
       {(looping||!edges.end)&&<button className="row-arrow right" tabIndex={-1} aria-hidden="true" onClick={()=>scroll(1)}><Icon name="next" size={28}/></button>}
     </div>
   </section>;
+}
+// New cards at the front of a row resting at its start slide in and bump the rest along, each card animating from where
+// it was (FLIP). Without this the browser re-snaps to the card that was first, leaving the new ones off screen to the left.
+// A row scrolled away from its start keeps the cards in view where they are. Snap is off while the cards move.
+function useBump(ref:{current:HTMLDivElement|null},track:{current:HTMLDivElement|null},enabled:boolean,children:ReactNode) {
+  const seen=useRef(new Map<Element,number>()),atStart=useRef(true);
+  const measure=()=>{const tr=track.current;seen.current=new Map(tr?Array.from(tr.children,c=>[c,(c as HTMLElement).offsetLeft]):[]);};
+  useEffect(()=>{const tr=track.current;if(!tr)return;const resize=new ResizeObserver(measure);resize.observe(tr);return()=>resize.disconnect();},[]);
+  useLayoutEffect(()=>{
+    const before=seen.current;measure();const el=ref.current,tr=track.current;
+    if(!el||!tr||!enabled||!before.size||!atStart.current)return;
+    const cards=Array.from(tr.children) as HTMLElement[];if(cards.every(c=>before.has(c)))return;
+    el.style.scrollSnapType='none';el.scrollLeft=0;
+    const timing={duration:480,easing:'cubic-bezier(.4,0,.2,1)'};
+    const runs=cards.map(c=>{
+      const from=before.get(c);
+      if(from===undefined)return c.animate([{opacity:0,transform:'scale(.9)'},{opacity:1,transform:'none'}],timing).finished;
+      return from!==c.offsetLeft?c.animate([{transform:`translateX(${from-c.offsetLeft}px)`},{transform:'none'}],timing).finished:undefined;
+    });
+    void Promise.allSettled(runs).then(()=>{el.style.scrollSnapType='';});
+  },[children]);
+  return atStart;
+}
+// Animates a row's arrow scroll. The browser's own smooth scroll turns instant whenever Windows animation effects are
+// off, so like the drift it does not follow the reduced-motion preference. Like the drift, it is a transform animation on
+// the track, which is already its own layer, so the browser runs it on the compositor; the distance moves into the scroll
+// position in one step when it ends. Snap is off while the track moves, or the browser would re-snap to the moving cards
+// and the move would count twice. A plain row's move ends on a card's start, so turning snap back on does not nudge it.
+function useGlide(ref:{current:HTMLDivElement|null},track:{current:HTMLDivElement|null}) {
+  const run=useRef<{animation:Animation;distance:number}|null>(null);
+  // Moves what the glide has covered so far into the scroll position, in the same frame its transform comes off.
+  const commit=(done:boolean)=>{
+    const current=run.current,el=ref.current;run.current=null;if(!current)return;
+    const moved=(current.animation.effect?.getComputedTiming().progress??1)*current.distance;
+    current.animation.cancel();if(!el)return;el.scrollLeft+=moved;if(done)el.style.scrollSnapType='';
+  };
+  useEffect(()=>()=>run.current?.animation.cancel(),[]);
+  return (distance:number,endless:boolean)=>{
+    commit(false);const el=ref.current,tr=track.current;if(!el||!tr)return;
+    const from=el.scrollLeft;let to=from+distance;
+    if(!endless){
+      const max=el.scrollWidth-el.clientWidth,left=el.getBoundingClientRect().left,pad=parseFloat(getComputedStyle(el).scrollPaddingLeft)||0;
+      const starts=Array.from(tr.children,c=>from+c.getBoundingClientRect().left-left-pad);
+      to=starts.reduce((best,x)=>Math.abs(x-to)<Math.abs(best-to)?x:best,starts[0]??to);
+      to=Math.max(0,Math.min(max,to));
+    }
+    const shift=to-from;if(Math.abs(shift)<1){el.style.scrollSnapType='';return;}
+    el.style.scrollSnapType='none';
+    const animation=tr.animate([{transform:'translateX(0)'},{transform:`translateX(${-shift}px)`}],{duration:520,easing:'cubic-bezier(.4,0,.2,1)',fill:'forwards'});
+    const current={animation,distance:shift};run.current=current;
+    animation.finished.then(()=>{if(run.current===current)commit(true);},()=>{});
+  };
+}
+// A copy of an endless row's cards. A row is wider than the screen, so part of what is on screen is often a copy:
+// it stays clickable, but screen readers and the Tab key skip it, even as its cards change what they show.
+function RowCopy({children}:{children:ReactNode}) {
+  const ref=useRef<HTMLDivElement>(null);
+  useLayoutEffect(()=>{
+    const el=ref.current;if(!el)return;
+    const skip=()=>el.querySelectorAll<HTMLElement>('a[href],button,input,select,textarea,[tabindex]:not([tabindex="-1"])').forEach(f=>f.tabIndex=-1);
+    skip();const watch=new MutationObserver(skip);watch.observe(el,{childList:true,subtree:true});return()=>watch.disconnect();
+  },[]);
+  return <div className="row-set" ref={ref} aria-hidden="true">{children}</div>;
 }
 // Drifts an endless row sideways at `speed` px/s. It holds still while the pointer is over the row, keyboard focus
 // is inside it, or it is off screen; scrolling by hand still works while it is held. It ignores the system's reduced-motion
 // preference on purpose: Settings › Home turns it off, and Windows reports reduced motion whenever animation effects are off.
 // The drift is one transform animation on the track, which the browser runs on the compositor: it stays smooth and
 // sub-pixel while the page is busy, and costs no script or layout per frame. Hand scrolling moves the scroll position as usual.
+// A row right below another drifting row drifts the other way, so back-to-back rows move in opposite directions.
 function useEndless(ref:{current:HTMLDivElement|null},track:{current:HTMLDivElement|null},on:boolean,speed:number) {
   const held=useRef({hover:false,focus:false}),sync=useRef<()=>void>(()=>{});
   const sets=()=>Array.from(track.current?.children??[]).filter(c=>c.classList.contains('row-set')).map(c=>c.firstElementChild as HTMLElement|null);
@@ -201,7 +312,10 @@ function useEndless(ref:{current:HTMLDivElement|null},track:{current:HTMLDivElem
   useEffect(()=>{
     const el=ref.current,tr=track.current;if(!on||!el||!tr)return;
     let animation:Animation|undefined,width=0,visible=true;
-    const offset=()=>(animation?.effect?.getComputedTiming().progress??0)*width;
+    const rows=Array.from(el.closest('.rows')?.querySelectorAll<HTMLElement>('.row-scroll')??[]),reverse=rows[rows.indexOf(el)-1]?.dataset.drift==='forward';
+    el.dataset.drift=reverse?'reverse':'forward';
+    // How far the drift has carried the view to the right of the scroll position (left, below zero, when reversed).
+    const offset=()=>(animation?.effect?.getComputedTiming().progress??0)*width*(reverse?-1:1);
     // Moves what the drift has covered into the scroll position, so hand scrolling starts from what is on screen.
     const bake=()=>{if(!animation)return;const moved=offset();animation.pause();animation.currentTime=0;el.scrollLeft=wrap(Math.round(el.scrollLeft+moved));};
     sync.current=()=>{
@@ -216,7 +330,7 @@ function useEndless(ref:{current:HTMLDivElement|null},track:{current:HTMLDivElem
       if(width<=el.clientWidth)return;
       if(el.scrollLeft<width||el.scrollLeft>=width*2)el.scrollLeft=wrap(el.scrollLeft||width);
       const duration=width/speed*1000;
-      animation=tr.animate([{transform:'translateX(0)'},{transform:`translateX(${-width}px)`}],{duration,iterations:Infinity});
+      animation=tr.animate([{transform:'translateX(0)'},{transform:`translateX(${reverse?width:-width}px)`}],{duration,iterations:Infinity});
       animation.currentTime=progress*duration;sync.current();
     };
     build();
@@ -225,7 +339,7 @@ function useEndless(ref:{current:HTMLDivElement|null},track:{current:HTMLDivElem
     // A hand scroll that runs into an outer set is moved back to the matching spot in the middle one.
     const settle=()=>{const x=wrap(el.scrollLeft);if(Math.abs(x-el.scrollLeft)>1)el.scrollLeft=x;};
     el.addEventListener('scrollend',settle);
-    return()=>{animation?.cancel();resize.disconnect();seen.disconnect();el.removeEventListener('scrollend',settle);sync.current=()=>{};};
+    return()=>{animation?.cancel();delete el.dataset.drift;resize.disconnect();seen.disconnect();el.removeEventListener('scrollend',settle);sync.current=()=>{};};
   },[on,speed]);
   const handlers={
     onPointerEnter:(e:ReactPointerEvent<HTMLElement>)=>{if(e.pointerType==='mouse'){held.current.hover=true;sync.current();}},
@@ -242,8 +356,17 @@ export function Pagination({page,onChange}:{page:CatalogPage;onChange:(offset:nu
   if(!page.offset&&!page.hasMore)return null;
   return <div className="pagination"><span>{page.total!==undefined?`${page.total.toLocaleString()} titles`:''}{page.items.length?` · ${page.offset+1}–${page.offset+page.items.length}`:''}</span><div><button disabled={!page.offset} onClick={()=>onChange(Math.max(0,page.offset-page.limit))}>Previous</button><button disabled={!page.hasMore} onClick={()=>onChange(page.offset+page.limit)}>Next</button></div></div>;
 }
-export function Modal({title,onClose,children,variant}:{title:string;onClose:()=>void;children:ReactNode;variant?:'media'}) {
+const MODAL_CLOSE_MS=160;
+// scrollKey: content that changes in place (one title's details to another's) starts at the top again.
+export function Modal({title,onClose,children,variant,scrollKey}:{title:string;onClose:()=>void;children:ReactNode;variant?:'media'|'wide';scrollKey?:string}) {
   const ref=useRef<HTMLDialogElement>(null),close=useRef(onClose);close.current=onClose;
   useEffect(()=>{const dialog=ref.current!;dialog.showModal();document.documentElement.classList.add('modal-open');return()=>{dialog.close();document.documentElement.classList.remove('modal-open');};},[]);
-  return <dialog ref={ref} className={variant==='media'?'media-dialog':''} aria-label={title} onCancel={e=>{e.preventDefault();close.current();}} onClick={e=>{if(e.target===ref.current)close.current();}}><div className="modal-content"><button className="icon-button modal-close" aria-label="Close" onClick={onClose}><Icon name="close"/></button>{children}</div></dialog>;
+  useEffect(()=>{ref.current!.scrollTop=0;},[scrollKey]);
+  // Fades out before the owner unmounts it. An owner that refuses (busy) gets the dialog back once the fade is over.
+  const dismiss=()=>{
+    const dialog=ref.current!;if(dialog.classList.contains('closing'))return;
+    dialog.classList.add('closing');
+    setTimeout(()=>{close.current();setTimeout(()=>{if(dialog.isConnected)dialog.classList.remove('closing');},250);},MODAL_CLOSE_MS);
+  };
+  return <dialog ref={ref} className={variant==='media'?'media-dialog':variant==='wide'?'wide-dialog':''} aria-label={title} onCancel={e=>{e.preventDefault();dismiss();}} onClick={e=>{if(e.target===ref.current)dismiss();}}><div className="modal-content"><button className="icon-button modal-close" aria-label="Close" onClick={dismiss}><Icon name="close"/></button>{children}</div></dialog>;
 }
