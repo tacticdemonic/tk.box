@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { Db } from './database.js';
 import { Vault, digest } from '../security/vault.js';
 import { requireThat } from '../errors.js';
+import { nextRun, scheduleEvery, type Schedule } from '../../../../packages/contracts/src/schedule.js';
 import { validateEndpoint, sourceEndpoint, type SourceEndpoint } from '../providers/source-fetch.js';
 import { readSportsSettings, eventRank } from './sports-store.js';
 import { listed, listingState, listingPolicy, readListingPolicy, alwaysOnMatch, type Listing, type ListingState } from './listing.js';
@@ -14,15 +15,21 @@ import type { CustomChannelStore } from './custom-channels.js';
 import { parseM3u, parseXmltv, resolveGuideMapping, approveMapping, mappingCandidates, guideWindow, type GuideMapping, type M3uChannel, type M3uSnapshot, type Program, type XmlSnapshot } from '../providers/iptv.js';
 
 type Kind='m3u'|'xmltv';
-type SourceRow={id:string;kind:Kind;name:string;revision:number;interval_hours:number;encrypted_endpoint:string|null;encrypted_snapshot:string|null;encrypted_candidate:string|null;candidate_digest:string|null;last_attempt:number|null;last_success:number|null;next_due:number|null;last_error:string|null;retry_after:number|null};
+type SourceRow={id:string;kind:Kind;name:string;revision:number;interval_hours:number;encrypted_endpoint:string|null;encrypted_snapshot:string|null;encrypted_candidate:string|null;candidate_digest:string|null;last_attempt:number|null;last_success:number|null;next_due:number|null;last_error:string|null;retry_after:number|null;allow_private_streams:number;schedule:string|null};
 type ChannelRow={id:string;source_id:string;identity:string;encrypted_provider:string;listing:Listing;event:number;guide_exempt:number;present:number;conflict:number;first_seen:number;last_seen:number;missing_since:number|null;display_name:string|null;stack_key:string|null;number:number|null;position:number|null};
 type Feed={id:string;sourceId:string;name:string;number:number;position:number;hasLogo:boolean;stack:string;quality?:string;rank:number;online:boolean;label?:string;event?:{sport:string|null;league:string|null;start:number}};
 // Viewer visibility: listed by the source's rules (listing.ts) and holding a lineup number.
 const viewable=listed;
 const hours=z.number().int().min(1).max(168);
+export const refreshSchedule=scheduleEvery(60);
 export const sourceCreate=z.object({kind:z.enum(['m3u','xmltv']),name:z.string().trim().min(1).max(120),endpoint:sourceEndpoint.optional()}).strict();
 export const sourceOrder=z.object({ids:z.array(z.string().uuid()).max(64)}).strict();
-export const sourcePolicy=z.object({expectedRevision:z.number().int().nonnegative(),intervalHours:hours}).strict();
+// allowPrivateStreams lets FFmpeg reach this source's streams on the local network (a LAN tuner); otherwise only public addresses.
+// A remote source refreshes on its schedule, at most hourly; intervalHours is every so many hours. Neither keeps the current one.
+export const sourcePolicy=z.object({expectedRevision:z.number().int().nonnegative(),intervalHours:hours.optional(),schedule:refreshSchedule.optional(),allowPrivateStreams:z.boolean().optional()}).strict();
+const refreshOf=(row:SourceRow):Schedule=>row.schedule?JSON.parse(row.schedule) as Schedule:{kind:'every',minutes:row.interval_hours*60};
+// When a remote source next refreshes after `now`; an uploaded one never does.
+const nextDue=(row:SourceRow,now:number)=>row.encrypted_endpoint?nextRun(refreshOf(row),now)??null:null;
 const listingValue=z.enum(['auto','always','hidden']);
 export const channelEdit=z.object({expectedRevision:z.number().int().nonnegative(),listing:listingValue.optional(),displayName:z.string().trim().min(1).max(200).nullable().optional(),number:z.number().int().min(1).max(999999).optional(),position:z.number().int().min(0).max(999999).optional(),acceptIdentity:z.boolean().optional(),stack:z.string().trim().max(120).nullable().optional()}).strict();
 export const listingEdit=listingPolicy.extend({expectedRevision:z.number().int().nonnegative()}).strict();
@@ -42,7 +49,7 @@ export class IptvStore {
   private audit(actor:string,event:string,id:string,now:number) {this.db.prepare('INSERT INTO audit(actor,event,at,detail) VALUES(?,?,?,?)').run(actor,event,now,JSON.stringify({id}));}
   private check(row:SourceRow,expected:number) {requireThat(row.revision===expected,'REVISION_CONFLICT','Source changed. Reload and retry.',409);}
   private snapshot<T>(row:SourceRow):T|undefined {return row.encrypted_snapshot ? JSON.parse(this.vault.open(row.encrypted_snapshot,`iptv:snapshot:${row.id}`)) as T : undefined;}
-  status(id:string) {const r=this.source(id),feed=this.db.prepare('SELECT feed_id FROM iptv_source_feeds WHERE source_id=?').get(id) as {feed_id:string}|undefined;return {id:r.id,kind:r.kind,name:r.name,revision:r.revision,intervalHours:r.interval_hours,remote:!!r.encrypted_endpoint,lastAttempt:r.last_attempt,lastSuccess:r.last_success,nextDue:r.next_due,lastError:r.last_error,retryAfter:r.retry_after,candidateDigest:r.candidate_digest,feedId:feed?.feed_id};}
+  status(id:string) {const r=this.source(id),feed=this.db.prepare('SELECT feed_id FROM iptv_source_feeds WHERE source_id=?').get(id) as {feed_id:string}|undefined;return {id:r.id,kind:r.kind,name:r.name,revision:r.revision,intervalHours:r.interval_hours,schedule:refreshOf(r),remote:!!r.encrypted_endpoint,lastAttempt:r.last_attempt,lastSuccess:r.last_success,nextDue:r.next_due,lastError:r.last_error,retryAfter:r.retry_after,candidateDigest:r.candidate_digest,allowPrivateStreams:!!r.allow_private_streams,feedId:feed?.feed_id};}
   private sourceOrder() {return (this.db.prepare('SELECT id FROM iptv_sources ORDER BY sort_order,rowid').all() as {id:string}[]).map(r=>r.id);}
   list() {return this.sourceOrder().map(id=>this.status(id));}
   // The guide lists each playlist's channels together, in this order.
@@ -106,7 +113,10 @@ export class IptvStore {
   policy(actor:string,id:string,input:z.input<typeof sourcePolicy>,now=Date.now()) {
     const v=sourcePolicy.parse(input);
     this.db.transaction(()=>{const row=this.source(id);this.check(row,v.expectedRevision);
-      this.db.prepare('UPDATE iptv_sources SET revision=revision+1,interval_hours=?,next_due=? WHERE id=?').run(v.intervalHours,row.encrypted_endpoint?Math.max(now+v.intervalHours*3600000,row.retry_after??0):null,id);this.audit(actor,'iptv_source_policy_changed',id,now);
+      // interval_hours stays the nearest whole hours of an every-N schedule, for anything reading it.
+      const schedule=v.schedule??(v.intervalHours?{kind:'every',minutes:v.intervalHours*60} as const:refreshOf(row)),changed=JSON.stringify(schedule)!==JSON.stringify(refreshOf(row));
+      const interval=schedule.kind==='every'?Math.min(168,Math.max(1,Math.round(schedule.minutes/60))):row.interval_hours,updated={...row,schedule:JSON.stringify(schedule)};
+      this.db.prepare('UPDATE iptv_sources SET revision=revision+1,interval_hours=?,schedule=?,next_due=?,allow_private_streams=? WHERE id=?').run(interval,updated.schedule,changed||v.intervalHours?(row.encrypted_endpoint?Math.max(nextDue(updated,now)!,row.retry_after??0):null):row.next_due,v.allowPrivateStreams===undefined?row.allow_private_streams:Number(v.allowPrivateStreams),id);this.audit(actor,'iptv_source_policy_changed',id,now);
     })();return this.status(id);
   }
   due(now=Date.now()) {return (this.db.prepare('SELECT id FROM iptv_sources WHERE encrypted_endpoint IS NOT NULL AND next_due<=? AND (retry_after IS NULL OR retry_after<=?) ORDER BY next_due,id LIMIT 4').all(now,now) as {id:string}[]).map(r=>r.id);}
@@ -114,7 +124,7 @@ export class IptvStore {
   failed(id:string,expected:number,retryAfter:number|undefined,now=Date.now()) {
     // A settings edit during fetch wins. Never overwrite its newly selected cadence.
     const row=this.source(id);if(row.revision!==expected)return;
-    this.db.prepare('UPDATE iptv_sources SET last_error=?,retry_after=?,next_due=? WHERE id=?').run(retryAfter?'SOURCE_RATE_LIMITED':'SOURCE_REFRESH_FAILED',retryAfter??null,Math.max(now+row.interval_hours*3600000,retryAfter??0),id);
+    this.db.prepare('UPDATE iptv_sources SET last_error=?,retry_after=?,next_due=? WHERE id=?').run(retryAfter?'SOURCE_RATE_LIMITED':'SOURCE_REFRESH_FAILED',retryAfter??null,Math.max(nextDue(row,now)??now,retryAfter??0),id);
   }
   ingest(actor:string,id:string,expected:number,bytes:Buffer,now=Date.now()) {
     const row=this.source(id);this.check(row,expected);
@@ -128,7 +138,7 @@ export class IptvStore {
         // Hold a majority disappearance until the exact candidate is reviewed.
         if(old.length>=2 && old.filter(c=>!plan.present.has(c.id)).length>old.length/2) {
           const text=JSON.stringify(parsed),fingerprint=digest(text);
-          this.db.prepare('UPDATE iptv_sources SET revision=revision+1,encrypted_candidate=?,candidate_digest=?,last_attempt=?,last_error=?,next_due=? WHERE id=?').run(this.vault.seal(text,`iptv:candidate:${id}`),fingerprint,now,'SNAPSHOT_REVIEW_REQUIRED',current.encrypted_endpoint?now+current.interval_hours*3600000:null,id);
+          this.db.prepare('UPDATE iptv_sources SET revision=revision+1,encrypted_candidate=?,candidate_digest=?,last_attempt=?,last_error=?,next_due=? WHERE id=?').run(this.vault.seal(text,`iptv:candidate:${id}`),fingerprint,now,'SNAPSHOT_REVIEW_REQUIRED',nextDue(current,now),id);
           this.audit(actor,'iptv_snapshot_held',id,now);return {status:'review_required' as const,source:this.status(id)};
         }
       }
@@ -147,7 +157,7 @@ export class IptvStore {
   }
   private publish(actor:string,row:SourceRow,parsed:M3uSnapshot|XmlSnapshot,now:number) {
     if(row.kind==='m3u')this.reconcile(row,parsed as M3uSnapshot,now);
-    this.db.prepare('UPDATE iptv_sources SET revision=revision+1,encrypted_snapshot=?,encrypted_candidate=NULL,candidate_digest=NULL,last_attempt=?,last_success=?,last_error=NULL,retry_after=NULL,next_due=? WHERE id=?').run(this.vault.seal(JSON.stringify(parsed),`iptv:snapshot:${row.id}`),now,now,row.encrypted_endpoint?now+row.interval_hours*3600000:null,row.id);
+    this.db.prepare('UPDATE iptv_sources SET revision=revision+1,encrypted_snapshot=?,encrypted_candidate=NULL,candidate_digest=NULL,last_attempt=?,last_success=?,last_error=NULL,retry_after=NULL,next_due=? WHERE id=?').run(this.vault.seal(JSON.stringify(parsed),`iptv:snapshot:${row.id}`),now,now,nextDue(row,now),row.id);
     this.audit(actor,'iptv_snapshot_published',row.id,now);
     // New channels and new listings change what is listed.
     if(row.kind==='m3u')this.relist(row.id);
@@ -296,11 +306,20 @@ export class IptvStore {
     // Windows matched before sports were recorded fall back to the channel's own name, not the generic icon.
     return (SPORTS as readonly string[]).includes(row.sport??'')?row.sport as Sport:sportOf(this.provider(this.channel(id)).name);
   }
+  // The saved logo of the league whose game a visible event channel carries, if one was downloaded.
+  leagueLogo(id:string) {
+    return this.db.prepare('SELECT l.type,l.bytes FROM sports_windows w JOIN iptv_channels c ON c.id=w.channel_id AND c.event=1 JOIN sports_league_logos l ON l.league_key=w.league_key WHERE w.channel_id=? AND l.bytes IS NOT NULL').get(id) as {type:string;bytes:Buffer}|undefined;
+  }
+  // Both teams' logo addresses of the game a visible event channel carries, when its schedule named them.
+  matchupLogos(id:string) {
+    const row=this.db.prepare('SELECT e.logos FROM sports_windows w JOIN iptv_channels c ON c.id=w.channel_id AND c.event=1 JOIN sports_events e ON e.id=w.event_id WHERE w.channel_id=? AND e.logos IS NOT NULL').get(id) as {logos:string}|undefined;
+    return row?JSON.parse(row.logos) as [string,string]:undefined;
+  }
   visible() {return this.feeds().map(({rank:_,online:__,label:___,event:____,...feed})=>feed);}
   // One lineup row per station within a source, like identity. The default feed is the best quality (FHD, then HD), primary before
   // backup, then a feed confirmed working; the row keeps the earliest lineup position of its feeds.
   // Rows are grouped by source in the administrator's order. Within a source, live event rows form one block, above or
-  // below the rest (Live Sports settings), ordered by sport, league, then start.
+  // below the rest (Live Events settings), ordered by sport, league, then start.
   stacks() {
     const settings=readSportsSettings(this.db),rankOf=eventRank(settings),top=settings.placement==='top',sources=new Map(this.sourceOrder().map((id,i)=>[id,i]));
     const order=(e:NonNullable<Feed['event']>)=>[...rankOf(e.sport,e.league),e.start];
@@ -309,7 +328,7 @@ export class IptvStore {
     return [...groups.values()].map(group=>{
       const position=Math.min(...group.map(f=>f.position)),feeds=group.sort((a,b)=>b.rank-a.rank||Number(b.online)-Number(a.online)||a.position-b.position||a.number-b.number);
       const {rank:_,online:__,label:___,event:____,...primary}=feeds[0]!,event=feeds.find(f=>f.event)?.event;
-      return {row:{...primary,position,feeds:feeds.map(f=>({id:f.id,name:f.label??f.name,number:f.number,...(f.quality?{quality:f.quality}:{})}))},event:event&&order(event)};
+      return {row:{...primary,position,feeds:feeds.map(f=>({id:f.id,name:f.label??f.name,number:f.number,...(f.quality?{quality:f.quality}:{})})),...(event?{event:true as const}:{})},event:event&&order(event)};
     }).sort((a,b)=>{
       const bySource=sources.get(a.row.sourceId)!-sources.get(b.row.sourceId)!;if(bySource)return bySource;
       if(!!a.event!==!!b.event)return (a.event?-1:1)*(top?1:-1);
@@ -318,7 +337,7 @@ export class IptvStore {
     }).map(s=>s.row);
   }
   // Server-side only: the decrypted upstream URI must never reach an API response.
-  tune(id:string) {requireThat(this.isVisible(id),'CHANNEL_NOT_FOUND','Channel not found.',404);const c=this.channel(id),p=this.provider(c);return {id:c.id,sourceId:c.source_id,name:this.nameOf(c,p,!!c.event),number:c.number!,streamUrl:p.streamUrl};}
+  tune(id:string) {requireThat(this.isVisible(id),'CHANNEL_NOT_FOUND','Channel not found.',404);const c=this.channel(id),p=this.provider(c);return {id:c.id,sourceId:c.source_id,name:this.nameOf(c,p,!!c.event),number:c.number!,streamUrl:p.streamUrl,allowPrivate:!!this.source(c.source_id).allow_private_streams};}
   // Playlist logo first, then the mapped guide channel's icon. Server-side only, like stream URIs.
   logo(id:string) {
     requireThat(this.isVisible(id),'CHANNEL_NOT_FOUND','Channel not found.',404);const c=this.channel(id),p=this.provider(c);
@@ -328,7 +347,7 @@ export class IptvStore {
   }
   isVisible(id:string) {return !!this.db.prepare(`SELECT 1 FROM iptv_channels c JOIN lineup_numbers n ON n.channel_id=c.id WHERE c.id=? AND ${viewable}`).get(id);}
   // Health checks also cover unlisted and health-hidden channels, so this skips the visibility rule. Server-side only.
-  streamFor(id:string) {const c=this.channel(id);requireThat(c.present&&!c.conflict&&c.listing!=='hidden','CHANNEL_NOT_FOUND','Channel not found.',404);return {id:c.id,sourceId:c.source_id,streamUrl:this.provider(c).streamUrl};}
+  streamFor(id:string) {const c=this.channel(id);requireThat(c.present&&!c.conflict&&c.listing!=='hidden','CHANNEL_NOT_FOUND','Channel not found.',404);return {id:c.id,sourceId:c.source_id,streamUrl:this.provider(c).streamUrl,allowPrivate:!!this.source(c.source_id).allow_private_streams};}
   // Sets the listing override of several channels of one source at once.
   setListing(actor:string,sourceId:string,input:z.input<typeof bulkListing>,now=Date.now()) {
     const v=bulkListing.parse(input);
@@ -423,7 +442,7 @@ export class IptvStore {
       return {numbered:permanent.length+admit.length,released:revoke.length};
     })();
   }
-  // Event channels take the lowest free number in the Live Sports block, when one is set. A channel that kept its
+  // Event channels take the lowest free number in the Live Events block, when one is set. A channel that kept its
   // number (a viewer favorited it) keeps it.
   private eventNumber(id:string) {
     const start=readSportsSettings(this.db).numberStart;
@@ -460,11 +479,11 @@ export class IptvStore {
       this.db.prepare('UPDATE iptv_sources SET revision=revision+1 WHERE id=?').run(sourceId);this.audit(actor,'iptv_feed_linked',sourceId,now);this.coverage(sourceId);
     })();return this.status(sourceId);
   }
-  saveGuide(actor:string,sourceId:string,expected:number,input:{endpoint?:SourceEndpoint;intervalHours:number},now=Date.now()) {
+  saveGuide(actor:string,sourceId:string,expected:number,input:{endpoint?:SourceEndpoint;intervalHours?:number;schedule?:Schedule},now=Date.now()) {
     return this.db.transaction(()=>{
       const source=this.source(sourceId);this.check(source,expected);
       requireThat(source.kind==='m3u','MAPPING_SCOPE','Add a program guide to an M3U source.');
-      const interval=hours.parse(input.intervalHours),endpoint=input.endpoint?validateEndpoint(input.endpoint):undefined;
+      const interval=hours.optional().parse(input.intervalHours),schedule=refreshSchedule.optional().parse(input.schedule),endpoint=input.endpoint?validateEndpoint(input.endpoint):undefined;
       const oldId=this.status(sourceId).feedId,old=oldId?this.source(oldId):undefined;
       requireThat(old||endpoint,'GUIDE_ENDPOINT_REQUIRED','Enter an EPG URL.');
       // Legacy feeds can be shared. Copy their saved data before editing so other playlists are unaffected.
@@ -482,7 +501,7 @@ export class IptvStore {
         }
       } else if(endpoint)this.replaceEndpoint(actor,old.id,old.revision,endpoint,now);
       const feed=this.status(feedId!);
-      this.policy(actor,feed.id,{expectedRevision:feed.revision,intervalHours:interval},now);
+      this.policy(actor,feed.id,{expectedRevision:feed.revision,intervalHours:interval,schedule},now);
       this.bindFeed(actor,sourceId,feed.id,expected,now);
       return {source:this.status(sourceId),guide:this.status(feed.id)};
     })();
@@ -534,24 +553,34 @@ export class IptvStore {
     const programs=w.visible_from<w.start?[{...event,start:w.visible_from,end:w.start,subtitle:'Starting soon',status:'starting_soon' as const},event]:[event];
     return guideWindow(programs,'sports',start,end).map(row=>row.program?row:{...row,blank:true as const});
   }
-  // Custom channels lead the guide as their own group, then IPTV sources in the administrator's order.
-  guidePage(account:string,filter:'all'|'iptv'|'custom'|'favorites',start:number,end:number,offset:number,limit:number,q='',channelId?:string,custom?:CustomChannelStore) {
+  // Favorites lead the guide as their own group, pulled out of their sources; then custom channels, then IPTV sources
+  // in the administrator's order. Each row names its group so the client can head each one (across pages too).
+  // A filter other than the fixed ones names an IPTV source: that source's channels alone. Categories are every IPTV source
+  // with channels, in guide order whatever the filter, for the guide's filter chips. A kind keeps live event rows alone, or
+  // everything else (Home shows them as separate rows).
+  guidePage(account:string,filter:string,start:number,end:number,offset:number,limit:number,q='',channelId?:string,custom?:CustomChannelStore,kind?:'channels'|'events') {
     const favorites=new Set((this.db.prepare('SELECT channel_id FROM iptv_favorites WHERE account_id=?').all(account) as {channel_id:string}[]).map(c=>c.channel_id));
-    const search=q.trim().toLocaleLowerCase();
-    const customs=filter==='iptv'||!custom?[]:custom.stations(account,filter==='favorites',search,channelId);
-    const channels=filter==='custom'?[]:this.stacks().filter(c=>(filter!=='favorites'||c.feeds.some(f=>favorites.has(f.id)))&&(!channelId||c.feeds.some(f=>f.id===channelId))&&(!search||c.name.toLocaleLowerCase().includes(search)||c.feeds.some(f=>f.name.toLocaleLowerCase().includes(search)||String(f.number).includes(search)))),cache=new Map<string,M3uSnapshot|XmlSnapshot|undefined>();
-    // Every source with a matching channel, in guide order, so the client can head each group (across pages too).
-    const counts=new Map<string,number>();for(const c of channels)counts.set(c.sourceId,(counts.get(c.sourceId)??0)+1);
-    const sources=[...(customs.length?[{id:'custom',name:'Plex Channels',count:customs.length}]:[]),...[...counts].map(([id,count])=>({id,name:this.source(id).name,count}))];
-    const total=customs.length+channels.length;
-    const customRows=customs.slice(offset,offset+limit).map(c=>({...c,programs:custom!.programs(c.id,start,end)}));
-    return {start,end,offset,limit,total,hasMore:offset+limit<total,sources,channels:[...customRows,...channels.slice(Math.max(0,offset-customs.length),Math.max(0,offset+limit-customs.length)).map(channel=>{
+    const search=q.trim().toLocaleLowerCase(),source=['all','custom','favorites'].includes(filter)?undefined:filter,stacks=this.stacks();
+    const categories=[...new Set(stacks.map(c=>c.sourceId))].map(id=>({id,name:this.source(id).name}));
+    const customs=source||!custom||kind==='events'?[]:custom.stations(account,filter==='favorites',search,channelId);
+    const channels=filter==='custom'?[]:stacks.filter(c=>(!source||c.sourceId===source)&&(!kind||!!c.event===(kind==='events'))&&(filter!=='favorites'||c.feeds.some(f=>favorites.has(f.id)))&&(!channelId||c.feeds.some(f=>f.id===channelId))&&(!search||c.name.toLocaleLowerCase().includes(search)||c.feeds.some(f=>f.name.toLocaleLowerCase().includes(search)||String(f.number).includes(search)))),cache=new Map<string,M3uSnapshot|XmlSnapshot|undefined>();
+    // The Favorites filter is all favorites already, and a source filter is one source, so both leave favorites in place.
+    const pull=filter!=='favorites'&&!source;
+    const rows=[...customs.map(c=>({kind:'custom' as const,c,favorite:c.favorite,group:'custom'})),...channels.map(c=>{const favorite=c.feeds.some(f=>favorites.has(f.id));return {kind:'iptv' as const,c,favorite,group:c.sourceId};})]
+      .map(r=>pull&&r.favorite?{...r,group:'favorites'}:r);
+    const ordered=[...rows.filter(r=>r.group==='favorites'),...rows.filter(r=>r.group!=='favorites')];
+    const counts=new Map<string,number>();for(const r of ordered)counts.set(r.group,(counts.get(r.group)??0)+1);
+    const sources=[...counts].map(([id,count])=>({id,name:id==='favorites'?'Favorites':id==='custom'?'Plex Channels':this.source(id).name,count}));
+    const total=ordered.length;
+    return {start,end,offset,limit,total,hasMore:offset+limit<total,sources,categories,channels:ordered.slice(offset,offset+limit).map(r=>{
+      if(r.kind==='custom')return {...r.c,group:r.group,programs:custom!.programs(r.c.id,start,end)};
+      const channel=r.c;
       // Feeds of one station share a schedule: use the first feed with a guide match.
       let data:ReturnType<IptvStore['guideData']>|undefined;
       for(const feed of channel.feeds){const feedId=this.feedFor(feed.id),candidate=feedId?this.guideData(feed.id,feedId,cache):undefined;data??=candidate;if(candidate?.mapping){data=candidate;break;}}
       // Any channel may match the logo library, so the logo route decides; the UI falls back to a monogram.
       const {hasLogo:_,...rest}=channel,logo=true;
-      return {...rest,logo,type:'iptv' as const,favorite:channel.feeds.some(f=>favorites.has(f.id)),programs:this.eventRows(channel.id,start,end)??guideWindow(data?.xml?.programs??[],data?.mapping?.xmlId,start,end,channel.name)};
-    })]};
+      return {...rest,group:r.group,logo,type:'iptv' as const,favorite:r.favorite,programs:this.eventRows(channel.id,start,end)??guideWindow(data?.xml?.programs??[],data?.mapping?.xmlId,start,end,channel.name)};
+    })};
   }
 }
