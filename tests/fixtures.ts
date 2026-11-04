@@ -1,5 +1,5 @@
 import { loadConfig } from '../apps/server/src/config.js';
-export const config = () => loadConfig({PLEX_MACHINE_ID: 'machine', PLEX_OWNER_ACCOUNT_ID: '1', PLEX_REQUIRED_LIBRARY_IDS: '10,20'});
+export const config = () => loadConfig({PLEX_MACHINE_ID: 'machine', PLEX_OWNER_ACCOUNT_ID: '1', PLEX_REQUIRED_LIBRARY_IDS: '10,20', PLEX_RECHECK_SECONDS: '0'});
 export const metadata = {ratingKey: '42', librarySectionID: 10, title: 'Fixture movie', duration: 600000, type: 'movie', Media: [{container: 'mp4', videoCodec: 'h264', audioCodec: 'aac', width: 1920, height: 1080, Part: [{key: '/library/parts/7/123/file.mp4'}]}]};
 export function fakePlex(options: {accountId?: number; authorized?: boolean; missingLibrary?: boolean; file?: string} = {}) {
   const calls: {path: string; token: string | null; method: string}[] = [];
@@ -11,6 +11,8 @@ export function fakePlex(options: {accountId?: number; authorized?: boolean; mis
     if (u.pathname === '/api/v2/pins') data = {id: 5, code: 'fixture-code', expiresIn: 600};
     else if (u.pathname === '/api/v2/pins/5') data = {id: 5, code: 'fixture-code', expiresIn: 600, authToken: 'fixture-account-token'};
     else if (u.pathname === '/api/v2/user') data = {id: accountId};
+    else if (u.pathname === '/api/v2/friends') data = [{id: 2, title: 'Viewer', username: 'viewer'}];
+    else if (u.pathname === '/api/v2/home/users') data = {users: [{id: 1, title: 'Owner'}, {id: 3, title: 'Kid', home: true}]};
     else if (u.pathname === '/api/v2/resources') data = options.authorized === false ? [] : [{clientIdentifier: 'machine', provides: 'server', owned: accountId === 1, accessToken: 'fixture-viewer-server-token'}];
     else if (u.pathname === '/identity') data = {MediaContainer: {machineIdentifier: 'machine'}};
     else if (u.pathname === '/library/sections') data = {MediaContainer: {Directory: [{key: '10', title: 'Movies', type: 'movie'}, ...(options.missingLibrary ? [] : [{key: '20', title: 'TV', type: 'show'}])]}};
