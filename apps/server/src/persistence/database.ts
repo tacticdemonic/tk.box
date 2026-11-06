@@ -68,7 +68,7 @@ export function openDatabase(path: string) {
     // The sport an event channel carries, for its fallback icon.
     if (!(db.prepare('PRAGMA table_info(sports_windows)').all() as {name: string}[]).some(c => c.name === 'sport')) db.exec('ALTER TABLE sports_windows ADD COLUMN sport TEXT');
     db.prepare('INSERT OR IGNORE INTO migrations VALUES(7)').run();
-    // Live Sports settings: which leagues are shown and in what order, and the event channel number block.
+    // Live Events settings: which leagues are shown and in what order, and the event channel number block.
     // Events and windows keep a stable league key; rows fetched before this get one on the next download.
     for (const table of ['sports_events', 'sports_windows'])
       if (!(db.prepare(`PRAGMA table_info(${table})`).all() as {name: string}[]).some(c => c.name === 'league_key')) db.exec(`ALTER TABLE ${table} ADD COLUMN league_key TEXT`);
@@ -148,6 +148,48 @@ export function openDatabase(path: string) {
     if (!db.prepare('SELECT 1 FROM migrations WHERE version=15').get()) {
       db.exec('ALTER TABLE custom_channels ADD COLUMN plex_logo TEXT');
       db.prepare('INSERT INTO migrations VALUES(15)').run();
+    }
+    // League logos, kept on the server so event channels show them without reaching ESPN or TheSportsDB.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=16').get()) {
+      db.exec('CREATE TABLE sports_league_logos(league_key TEXT PRIMARY KEY, url TEXT, type TEXT, bytes BLOB, checked_at INTEGER NOT NULL)');
+      db.prepare('INSERT INTO migrations VALUES(16)').run();
+    }
+    // Artwork (Admin › Artwork): the engine's settings and layouts, which tk.box writes out as its config for each run,
+    // and the history of its jobs. Provider keys inside the settings are sealed.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=17').get()) {
+      db.exec(`CREATE TABLE artwork_settings(id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, value TEXT NOT NULL);
+        CREATE TABLE artwork_layouts(name TEXT PRIMARY KEY, revision INTEGER NOT NULL, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+        CREATE TABLE artwork_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, args TEXT NOT NULL, actor TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed','canceled')), created_at INTEGER NOT NULL,
+          started_at INTEGER, finished_at INTEGER, exit_code INTEGER, output TEXT NOT NULL DEFAULT '');`);
+      db.prepare('INSERT INTO migrations VALUES(17)').run();
+    }
+    // Artwork collections (custom and seasonal definitions, franchise sync and Radarr), and small values the artwork
+    // schedules keep between runs (last runs, the newly-added watermark).
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=18').get()) {
+      db.exec(`CREATE TABLE artwork_collections(id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, value TEXT NOT NULL);
+        CREATE TABLE artwork_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
+      db.prepare('INSERT INTO migrations VALUES(18)').run();
+    }
+    // Both teams' logo addresses per event (JSON), for an event channel's matchup logo.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=19').get()) {
+      db.exec('ALTER TABLE sports_events ADD COLUMN logos TEXT');
+      db.prepare('INSERT INTO migrations VALUES(19)').run();
+    }
+    // Streams reach public addresses only, unless an administrator allows a source's local-network streams.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=20').get()) {
+      db.exec('ALTER TABLE iptv_sources ADD COLUMN allow_private_streams INTEGER NOT NULL DEFAULT 0');
+      db.prepare('INSERT INTO migrations VALUES(20)').run();
+    }
+    // Event channels being watched past their window, and until when they stay on (SportsStore.hold).
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=21').get()) {
+      db.exec('CREATE TABLE sports_holds(channel_id TEXT PRIMARY KEY, until INTEGER NOT NULL)');
+      db.prepare('INSERT INTO migrations VALUES(21)').run();
+    }
+    // Refreshes and channel checks on a schedule (JSON, packages/contracts/src/schedule.ts); NULL is every interval_hours.
+    if (!db.prepare('SELECT 1 FROM migrations WHERE version=22').get()) {
+      db.exec('ALTER TABLE iptv_sources ADD COLUMN schedule TEXT; ALTER TABLE iptv_health_policies ADD COLUMN schedule TEXT');
+      db.prepare('INSERT INTO migrations VALUES(22)').run();
     }
   })();
   return db;

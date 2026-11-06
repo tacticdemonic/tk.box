@@ -7,6 +7,8 @@ export type SportsEvent = {
   start: number; end: number; state: 'pre' | 'in' | 'post'; timeKnown: boolean;
   // Alias lists for each side (teams or fighters), already normalized.
   sides: string[][]; abbreviations: string[];
+  // Both teams' logo addresses in title order ("Away at Home", "Home vs Away"), when the schedule names them.
+  logos?: string[];
 };
 export type Window = { eventId: string | null; title: string; league: string; start: number; end: number; state: SportsEvent['state'] | null; matchedBy: 'event' | 'epg_event' | 'name_time' | 'epg'; sport?: Sport; leagueKey?: string };
 export type ChannelInput = { id: string; name: string; group: string; programs: { start: number; end: number; title: string; subtitle?: string }[] };
@@ -18,25 +20,30 @@ const SPLIT = /\s+(?:vs\.?|v\.?|versus|at|@)\s+/i;
 // "No event", "Off air", "Next game: …" and replays are what providers show between live events.
 export const PLACEHOLDER = /\b(no (live )?(event|game|match|programming)s?|off ?air|sign ?off|tba|tbd|to be (announced|determined)|coming soon|not scheduled|no information|event (has )?ended|stay tuned|(next|upcoming) (game|event|match|fight)s?|replays?|re-?airs?|reruns?|encore|highlights)\b/i;
 
-// Last significant word of each side of "A vs. B": surnames for fighters, nicknames for teams.
-function versusPair(title: string) {
+// Significant words of each side of "A vs. B".
+function versusSides(title: string) {
   const parts = title.replace(/^[^:]*:\s*/, m => /\bvs?\.?\b|@/i.test(m) ? m : '').split(SPLIT);
   if (parts.length !== 2) return undefined;
-  const last = (s: string) => norm(s.replace(/\(.*?\)|\[.*?\]/g, '')).trim().split(' ').filter(w => w.length > 2 && !STOP.has(w) && !/^\d+$/.test(w)).pop();
-  const a = last(parts[0]!), b = last(parts[1]!);
+  return parts.map(s => norm(s.replace(/\(.*?\)|\[.*?\]/g, '')).trim().split(' ').filter(w => w.length > 2 && !STOP.has(w) && !/^\d+$/.test(w)));
+}
+// Last significant word of each side: surnames for fighters, nicknames for teams.
+function versusPair(title: string) {
+  const [a, b] = (versusSides(title) ?? []).map(side => side.at(-1));
   return a && b && a !== b ? [a, b] as const : undefined;
 }
 const sportWords: Record<string, string[]> = { football: ['football', 'nfl', 'ncaaf', 'cfb'], basketball: ['basketball', 'nba', 'wnba', 'ncaab'], baseball: ['baseball', 'mlb'], hockey: ['hockey', 'nhl'], soccer: ['soccer', 'football', 'futbol'], mma: ['mma', 'ufc'], boxing: ['boxing', 'fight'], wrestling: ['wwe', 'aew', 'wrestling'], golf: ['golf', 'pga', 'lpga'], racing: ['racing', 'f1', 'formula', 'nascar', 'indycar'] };
 const contextWords = (e: SportsEvent) => [...norm(e.league).trim().split(' '), ...(sportWords[e.sport] ?? [e.sport])].filter(w => w.length > 1);
 
 // A rematch scores every channel against every event, so what depends on the event alone is worked out once.
-const facts = new WeakMap<SportsEvent, { pair: ReturnType<typeof versusPair>; numbered?: string; words: string[]; context: string[]; abbreviations?: RegExp }>();
+const facts = new WeakMap<SportsEvent, { pair: ReturnType<typeof versusPair>; names?: string[][]; numbered?: string; words: string[]; context: string[]; abbreviations?: RegExp }>();
 function eventFacts(e: SportsEvent) {
   let f = facts.get(e);
   if (f) return f;
   const title = norm(e.title), context = contextWords(e), numbered = title.match(/ ([a-z]{2,}) (\d{2,4}) /);
   const [a, b] = e.abbreviations.map(x => x.toLowerCase());
-  f = { pair: versusPair(e.title), ...(numbered ? { numbered: `${numbered[1]} ${numbered[2]}` } : {}), context,
+  const pair = versusPair(e.title);
+  // Fighters only: a club's first word ("Manchester") names other clubs.
+  f = { pair, ...(pair && (e.sport === 'boxing' || e.sport === 'mma') ? { names: versusSides(e.title)! } : {}), ...(numbered ? { numbered: `${numbered[1]} ${numbered[2]}` } : {}), context,
     words: title.trim().split(' ').filter(w => w.length > 2 && !STOP.has(w) && !/^\d+$/.test(w) && !context.includes(w)),
     ...(e.abbreviations.length === 2 ? { abbreviations: new RegExp(` (?:${a} (?:vs?|at) ${b}|${b} (?:vs?|at) ${a}) `) } : {}) };
   facts.set(e, f);
@@ -48,11 +55,14 @@ const normText = (text: string) => text === lastText ? lastNorm : (lastText = te
 
 // How strongly a text names an event: 0 none, higher is more specific.
 export function eventScore(text: string, e: SportsEvent) {
-  const t = normText(text), { pair, numbered, words, context, abbreviations } = eventFacts(e);
+  const t = normText(text), { pair, names, numbered, words, context, abbreviations } = eventFacts(e);
   let score = 0;
   if (e.sides.length === 2 && e.sides.every(side => side.some(alias => has(t, alias)))) score = 4;
   else if (abbreviations?.test(t)) score = 3;
   if (!score && pair && has(t, pair[0]) && has(t, pair[1])) score = 3;
+  // A fighter known by a first name or ring name ("Canelo vs. Mbilli" for "Canelo Álvarez vs Christian Mbilli"):
+  // one surname plus any name of the other side.
+  else if (!score && pair && names && (has(t, pair[0]) || has(t, pair[1])) && names.every(side => side.some(w => has(t, w)))) score = 2.5;
   // Numbered cards: "UFC 333", "Bellator 312".
   if (!score && numbered && has(t, numbered)) score = 3;
   // Titled shows and tournaments ("WWE Raw", "Butterfield Bermuda Championship"): every distinctive
@@ -167,9 +177,11 @@ export function channelWindow(c: ChannelInput, events: SportsEvent[], now: numbe
   const text = `${c.name} ${c.group}`, candidates: Window[] = [], zone = options.zones?.get(family(c.name)) ?? options.zone;
   const named = bestEvent(c.name, events, now, zone) ?? (c.group ? bestEvent(text, events, now, zone) : undefined);
   if (named) {
-    // A date-only listing (common for boxing) takes its time from the channel name when it has one.
-    const written = named.timeKnown ? undefined : nameTime(c.name, now, zone);
-    const start = written?.hour !== undefined ? zonedTime(...ymd(named.start, written.zone), written.hour, written.minute, written.zone) : named.start;
+    // A date-only listing (common for boxing) takes its time from the channel name when it has one. A channel that
+    // starts up to four hours before a timed event (prelims and undercards under the main event's time) starts then.
+    const written = nameTime(c.name, now, zone);
+    const at = written?.hour === undefined ? undefined : written.at !== undefined && named.timeKnown ? written.at : zonedTime(...ymd(named.start, written.zone), written.hour, written.minute, written.zone);
+    const start = at === undefined ? named.start : !named.timeKnown ? at : at < named.start && named.start - at <= 4 * HOUR ? at : named.start;
     candidates.push({ ...fromEvent(named, 'event'), start, end: Math.max(named.end, start + (named.end - named.start)) });
   }
   for (const p of c.programs) {
@@ -179,13 +191,29 @@ export function channelWindow(c: ChannelInput, events: SportsEvent[], now: numbe
     if (e) candidates.push(fromEvent(e, 'epg_event'));
     else if (liveListing(listing, p, events)) candidates.push({ eventId: null, title: p.title, league: '', start: p.start, end: p.end, state: null, matchedBy: 'epg' });
   }
-  if (!named) {
+  if (!named && REDZONE.test(norm(c.name))) candidates.push(...redZone(events));
+  else if (!named) {
     const written = nameTime(c.name, now, zone);
     if (written?.at !== undefined && !written.dateOnly && !PLACEHOLDER.test(c.name))
       candidates.push({ eventId: null, title: cleanTitle(c.name), league: '', start: written.at, end: written.at + options.nameHours * HOUR, state: null, matchedBy: 'name_time' });
   }
   const chosen = candidates.filter(w => w.end > now && (options.allow?.(w) ?? true)).sort((a, b) => a.start - b.start || order(a) - order(b))[0];
   return chosen && { ...chosen, sport: sportOf(`${c.name} ${c.group} ${chosen.league} ${chosen.title}`, chosen.sport) };
+}
+// NFL RedZone whips around the Sunday afternoon games, so a channel named for it airs from the first kickoff of
+// a Sunday's 1 PM and 4 PM ET slate until its last game ends; the morning international game and night games are
+// not part of it. One window per Sunday; the current one wins, else the next.
+const REDZONE = / (nfl )?red ?zone /;
+function redZone(events: SportsEvent[]): Window[] {
+  const slates = new Map<string, { start: number; end: number }>();
+  for (const e of events) {
+    if (e.leagueKey !== 'football/nfl' || !e.timeKnown) continue;
+    const et = zonedDate(e.start, 'America/New_York'), hour = (e.start - zonedTime(et.year, et.month, et.day, 0, 0, 'America/New_York')) / HOUR;
+    if (new Date(Date.UTC(et.year, et.month - 1, et.day)).getUTCDay() !== 0 || hour < 12 || hour >= 18) continue;
+    const key = `${et.year}-${et.month}-${et.day}`, slate = slates.get(key);
+    slates.set(key, slate ? { start: Math.min(slate.start, e.start), end: Math.max(slate.end, e.end) } : { start: e.start, end: e.end });
+  }
+  return [...slates.values()].map(s => ({ eventId: null, title: 'NFL RedZone', league: 'NFL', leagueKey: 'football/nfl', start: s.start, end: s.end, state: null, matchedBy: 'event', sport: 'football' }));
 }
 // A listing that names no known event still counts when it is a matchup ("Bayern vs Dortmund") or a league
 // show while that league is playing ("NFL Red Zone" on a Sunday). A team channel's listing ("NBA: Oklahoma City
@@ -228,6 +256,7 @@ export function sportOf(text: string, scheduled?: string): Sport {
 // 2026 16:30" → "Borussia Monchengladbach vs. TSG Hoffenheim". Names without a matchup keep the cleaned title.
 const MATCHUP = /\s(vs\.?|v|versus|at|@)\s/i;
 export function eventChannelName(raw: string) {
+  if (REDZONE.test(norm(raw))) return 'NFL RedZone';
   for (const text of [cleanTitle(raw), raw.replace(new RegExp(WHEN.source, 'gi'), ' ')]) {
     const part = text.split(/\s*\|\s*|:\s+/).map(s => s.trim()).find(s => MATCHUP.test(` ${s} `));
     if (part) return part.replace(/^\d{1,4}\S{0,3}\s+/, '').replace(/\s{2,}/g, ' ').trim();
