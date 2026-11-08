@@ -9,15 +9,17 @@ import { runProcess } from '../streaming/ffmpeg.js';
 import { assertVideoEncode, type EncoderBudget } from '../streaming/policy.js';
 import { ProviderConnections, type ConnectionLease } from '../streaming/provider-connections.js';
 import type { IptvStore } from '../persistence/iptv-store.js';
+import { ffmpegEnv, protocols, type StreamGuard } from '../streaming/stream-guard.js';
 
 export type LiveDelivery = 'remux' | 'transcode';
 export type LiveSource = { videoCodec?: string; audioCodec?: string; width?: number; height?: number };
 type Relay = {
-  key: string; channelId: string; sourceId: string; url: string; dir: string; viewers: Set<string>; child?: ChildProcess; exited: boolean;
+  key: string; channelId: string; sourceId: string; url: string; allowPrivate: boolean; proxy?: string; dir: string; viewers: Set<string>; child?: ChildProcess; exited: boolean;
   encode: boolean; release: () => void; restarts: number; live: boolean; stopped: boolean; ready: Promise<void>; source?: LiveSource; stderr: string;
   lease?: ConnectionLease; cancel: AbortController;
 };
-export type LiveObserver = { tuned?: (channelId: string) => void; tuneFailed?: (channelId: string) => void };
+// `watching` reports, every sweep, each channel with viewers and its viewers' latest request.
+export type LiveObserver = { tuned?: (channelId: string) => void; tuneFailed?: (channelId: string) => void; watching?: (channelId: string, seen: number) => void };
 type Viewer = { id: string; hash: string; channelId: string; seen: number };
 const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const probeSchema = z.object({ streams: z.array(z.object({ codec_type: z.string(), codec_name: z.string().optional(), width: z.number().optional(), height: z.number().optional(), pix_fmt: z.string().optional() })) });
@@ -39,6 +41,9 @@ export class LiveTv {
   private timer: NodeJS.Timeout;
   observer: LiveObserver = {};
   connections = new ProviderConnections(() => Number.POSITIVE_INFINITY);
+  tuneRetries = 3; tuneRetryMs = 3000;
+  // Streams are read through the guard (public addresses only) unless their source allows local-network streams.
+  guard?: StreamGuard;
   constructor(private store: IptvStore, private budget: EncoderBudget, cacheDir: string, private ffmpeg = 'ffmpeg', private ffprobe = 'ffprobe',
     private log: (message: string, detail: Record<string, unknown>) => void = () => {}, private options = { maxRelays: 8, maxPerViewer: 4, idleMs: 45000, readyMs: 30000 }) {
     this.root = join(cacheDir, 'live', `${process.pid}-${opaque().slice(0, 8)}`);
@@ -52,13 +57,14 @@ export class LiveTv {
     if (!relay) {
       requireThat(this.relays.size < this.options.maxRelays, 'LIVE_CAPACITY_REACHED', 'Too many channels are being watched right now. Please try again shortly.', 503);
       const key = opaque().slice(0, 16);
-      relay = { key, channelId, sourceId: channel.sourceId, url: channel.streamUrl, dir: join(this.root, key), viewers: new Set(), exited: true, encode: false, release: () => {}, restarts: 0, live: false, stopped: false, ready: Promise.resolve(), stderr: '', cancel: new AbortController() };
+      relay = { key, channelId, sourceId: channel.sourceId, url: channel.streamUrl, allowPrivate: channel.allowPrivate, dir: join(this.root, key), viewers: new Set(), exited: true, encode: false, release: () => {}, restarts: 0, live: false, stopped: false, ready: Promise.resolve(), stderr: '', cancel: new AbortController() };
       this.relays.set(channelId, relay);
       const created = relay;
       created.ready = this.prepare(created);
       created.ready.then(() => this.observer.tuned?.(channelId), error => {
-        this.destroy(created);
-        if (error instanceof AppError && ['LIVE_TUNE_FAILED', 'LIVE_TUNE_TIMEOUT'].includes(error.code)) this.observer.tuneFailed?.(channelId);
+        // A refusal right after a connection was let go says little about the channel; do not recheck it.
+        const recent = created.lease?.recent; this.destroy(created);
+        if (!recent && error instanceof AppError && ['LIVE_TUNE_FAILED', 'LIVE_TUNE_TIMEOUT'].includes(error.code)) this.observer.tuneFailed?.(channelId);
       });
     }
     const viewer: Viewer = { id: opaque(), hash, channelId, seen: Date.now() };
@@ -104,13 +110,24 @@ export class LiveTv {
   close() { clearInterval(this.timer); for (const relay of [...this.relays.values()]) this.destroy(relay); void rm(this.root, { recursive: true, force: true, maxRetries: 5 }).catch(() => {}); }
   get count() { return this.relays.size; }
   isLive(channelId: string) { return !!this.relays.get(channelId)?.live; }
-  sweep(now = Date.now()) { for (const v of [...this.viewers.values()]) if (now - v.seen > this.options.idleMs) this.stop(v.id, v.hash); }
+  // Administrator activity: how a viewer's channel is being delivered right now.
+  watching(id: string) {
+    const viewer = this.viewers.get(id), relay = viewer && this.relays.get(viewer.channelId);
+    return relay && { delivery: (relay.encode ? 'transcode' : 'remux') as LiveDelivery, source: relay.source ?? {}, restarts: relay.restarts };
+  }
+  sweep(now = Date.now()) {
+    for (const v of [...this.viewers.values()]) if (now - v.seen > this.options.idleMs) this.stop(v.id, v.hash);
+    const seen = new Map<string, number>();
+    for (const v of this.viewers.values()) seen.set(v.channelId, Math.max(seen.get(v.channelId) ?? 0, v.seen));
+    for (const [channelId, at] of seen) this.observer.watching?.(channelId, at);
+  }
 
   private async prepare(relay: Relay) {
     relay.lease = await this.connections.viewer(relay.cancel.signal);
     if (relay.stopped) { relay.lease.release(); throw new AppError('MEDIA_CANCELLED', 'Live session was stopped.', 409); }
     await mkdir(relay.dir, { recursive: true, mode: 0o700 });
-    this.spawn(relay, false); await this.waitReady(relay);
+    relay.proxy = relay.allowPrivate ? undefined : await this.guard?.url();
+    await this.tune(relay);
     const source = await this.probe(relay), video = source.videoCodec;
     relay.source = { videoCodec: video, audioCodec: source.audioCodec, width: source.width, height: source.height };
     if (video && !(video === 'h264' && browserVideo.has(source.pixFmt ?? 'yuv420p'))) {
@@ -122,8 +139,22 @@ export class LiveTv {
     }
     relay.live = true;
   }
+  // Right after a check was cancelled for this viewer (or any stream let go), the provider may still
+  // count the old stream and refuse this one. Retry for a few seconds before calling the channel failed.
+  private async tune(relay: Relay) {
+    for (let attempt = 1; ; attempt++) {
+      this.spawn(relay, false);
+      try { return await this.waitReady(relay); } catch (error) {
+        if (!relay.lease?.recent || attempt > this.tuneRetries || !(error instanceof AppError && error.code === 'LIVE_TUNE_FAILED')) throw error;
+      }
+      this.log('live tune retry', { channelId: relay.channelId, attempt });
+      await sleep(this.tuneRetryMs);
+      if (relay.stopped) throw new AppError('MEDIA_CANCELLED', 'Live session was stopped.', 409);
+      relay.stderr = ''; await rm(relay.dir, { recursive: true, force: true, maxRetries: 5 }); await mkdir(relay.dir, { recursive: true, mode: 0o700 });
+    }
+  }
   private args(relay: Relay, append: boolean) {
-    const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-protocol_whitelist', 'http,https,tcp,tls,crypto', '-user_agent', userAgent];
+    const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-protocol_whitelist', protocols(relay.proxy), '-user_agent', userAgent];
     // Raw MPEG-TS reconnects in place. HLS is read in real time: a provider "channel" that is
     // really a finished VOD playlist would otherwise be consumed at full speed past the window.
     if (/\.m3u8?$/i.test(new URL(relay.url).pathname)) args.push('-re');
@@ -138,7 +169,7 @@ export class LiveTv {
     return args;
   }
   private spawn(relay: Relay, append: boolean) {
-    const child = spawn(this.ffmpeg, this.args(relay, append), { shell: false, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn(this.ffmpeg, this.args(relay, append), { shell: false, windowsHide: true, env: ffmpegEnv(relay.proxy), stdio: ['ignore', 'ignore', 'pipe'] });
     relay.child = child; relay.exited = false;
     child.stderr!.on('data', (b: Buffer) => { relay.stderr = (relay.stderr + b.toString()).slice(-2000); });
     child.on('error', () => { relay.exited = true; relay.stderr += '\nFFmpeg could not be started.'; });
